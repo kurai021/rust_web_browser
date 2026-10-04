@@ -1,0 +1,110 @@
+   Compiling shell v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/shell)
+   Compiling html v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/html)
+   Compiling browser v0.1.0 (/home/richard/Projects/navegador_rust/browser)
+   Compiling profile v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/profile)
+   Compiling adblock v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/adblock)
+   Compiling dom_bindings v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/dom_bindings)
+   Compiling paint v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/paint)
+   Compiling css v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/css)
+   Compiling net v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/net)
+   Compiling test_utils v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/test_utils)
+   Compiling web_api v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/web_api)
+   Compiling layout v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/layout)
+   Compiling js v0.1.0 (/home/richard/Projects/navegador_rust/browser/crates/js)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running unittests src/lib.rs (target/debug/deps/adblock-0560187603838d2d)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/browser-92fe7833692e3654)
+
+running 6 tests
+test tests::double_url_is_error ... ok
+test tests::headless_test_stub ... ok
+test tests::no_args_opens_about_blank ... ok
+test tests::positional_url_and_flags ... ok
+test tests::profile_without_value_is_error ... ok
+test tests::unknown_flag_is_error ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/css-b300bb4fc99d2651)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/dom_bindings-ac77c20f2d09b49e)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/html-996c7d9ba4fb7645)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/js-b7fc2bbaf2acce77)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/layout-fc851dac8f979e43)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/net-07f26abc3a2101eb)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/paint-027a9ea5df33fbb9)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/profile-2e610ea5924b11a0)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/shell-4aea6b8794bd33b4)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/test_utils-b0f6d3b2132c9bf3)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/web_api-06e698b36d011e22)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

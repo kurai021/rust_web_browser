@@ -1,0 +1,150 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/adblock-0560187603838d2d)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/browser-eaeb948d083bad14)
+
+running 8 tests
+test tests::double_url_is_error ... ok
+test tests::bare_host_classifies_to_https_url ... ok
+test tests::no_args_opens_about_blank ... ok
+test tests::headless_test_stub ... ok
+test tests::positional_url_and_flags ... ok
+test tests::profile_without_value_is_error ... ok
+test tests::unknown_flag_is_error ... ok
+test tests::words_classify_to_search ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/css-b300bb4fc99d2651)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/dom_bindings-ac77c20f2d09b49e)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/html-996c7d9ba4fb7645)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/js-b7fc2bbaf2acce77)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/layout-fc851dac8f979e43)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/net-3ffa686ec3bc293d)
+
+running 18 tests
+test error::tests::dns_hint_detection ... ok
+test error::tests::finds_expired_in_chain ... ok
+test error::tests::finds_unknown_issuer_in_chain ... ok
+test error::tests::no_tls_error_without_tls_markers ... ok
+test error::tests::finds_wrong_host_in_chain ... ok
+test hsts::tests::expired_entries_do_not_apply ... ok
+test hsts::tests::include_subdomains_covers_children ... ok
+test hsts::tests::malformed_headers_are_ignored ... ok
+test hsts::tests::max_age_zero_removes ... ok
+test hsts::tests::records_and_matches_exact_host ... ok
+test hsts::tests::missing_or_corrupt_file_gives_empty_store ... ok
+test hsts::tests::save_and_load_roundtrip ... ok
+test url::tests::accepts_http_and_https ... ok
+test url::tests::classifies_absolute_urls ... ok
+test url::tests::plain_words_are_searches ... ok
+test url::tests::rejects_ftp_and_other_schemes ... ok
+test url::tests::rejects_garbage ... ok
+test url::tests::upgrades_bare_hosts_to_https ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fetch_local.rs (target/debug/deps/fetch_local-f3da657f225bac9a)
+
+running 9 tests
+test closed_port_is_a_connect_error ... ok
+test gzip_is_decoded ... ok
+test get_ok_reports_progress ... ok
+test http_error_status_surfaces ... ok
+test body_cap_guards_zip_bombs ... ok
+test follows_redirect_chain ... ok
+test hsts_upgrades_plain_http ... ok
+test too_many_redirects_errors ... ok
+test slow_server_hits_total_timeout ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/fetch_online.rs (target/debug/deps/fetch_online-b5d941a34366be8a)
+
+running 5 tests
+test expired_cert_maps ... ignored
+test fetches_example_com ... ignored
+test http_to_https_redirect_followed ... ignored
+test self_signed_maps_to_unknown_issuer ... ignored
+test wrong_host_maps ... ignored
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/paint-027a9ea5df33fbb9)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/profile-2e610ea5924b11a0)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/shell-0534236980982339)
+
+running 9 tests
+test history::tests::empty_history_has_no_current ... ok
+test omnibox::tests::caret_moves_by_chars_not_bytes ... ok
+test history::tests::new_navigation_clears_forward ... ok
+test text::tests::blend_rect_respects_alpha ... ok
+test history::tests::navigate_and_walk_back_forward ... ok
+test text::tests::fill_rect_clips_to_canvas ... ok
+test omnibox::tests::set_text_parks_caret_at_end ... ok
+test text::tests::packs_rgb_channels ... ok
+test omnibox::tests::insert_and_backspace ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/test_utils-b0f6d3b2132c9bf3)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/web_api-06e698b36d011e22)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
