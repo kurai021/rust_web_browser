@@ -1,0 +1,19 @@
+# Example profile config (Phase 0).
+# Real use from Phase 9 on: copy to <profile-dir>/config.toml.
+
+[general]
+homepage = "about:blank"
+search_engine = "https://duckduckgo.com/?q={query}"
+
+[privacy]
+adblock_enabled = true
+third_party_cookies = "block"
+doh_enabled = false
+javascript_enabled = true
+
+[downloads]
+path = "~/Downloads"
+ask_every_time = true
+
+[render]
+software_fallback = false

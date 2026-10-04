@@ -1,0 +1,22 @@
+[package]
+name = "shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["simd"]
+simd = []
+
+[dependencies]
+net = { path = "../net" }
+url = "2"
+winit = "0.30"
+softbuffer = "0.4"
+cosmic-text = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+thiserror = "2"
+
+[lints]
+workspace = true

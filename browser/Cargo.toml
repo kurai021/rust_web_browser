@@ -1,0 +1,44 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[package]
+name = "browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "browser"
+path = "src/main.rs"
+
+[dependencies]
+shell = { path = "crates/shell" }
+net = { path = "crates/net" }
+url = "2"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[features]
+default = ["simd"]
+simd = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "unwind"
+# target-cpu=native forbidden in release builds (plan/15 §15.3).
+# SIMD/asm uses runtime dispatch with a scalar fallback.
+
+[lints]
+workspace = true
