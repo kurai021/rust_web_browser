@@ -1,19 +1,20 @@
-//! `css`: Phase 0 stub — spec in `plan/06-css.md`.
+//! `css` — in-house CSS engine: syntax, selectors, cascade (plan/06).
 //!
-//! Real implementation in Phase 3 (syntax, selectors, cascade, values).
+//! Built from scratch per the sealed framework; no style engine is reused.
 
-/// Stub marker: always `true` in Phase 0.
-#[must_use]
-pub fn stub() -> bool {
-    true
-}
+pub mod cascade;
+pub mod conditions;
+pub mod selectors;
+pub mod style;
+pub mod stylesheet;
+pub mod syntax;
+pub mod token;
+pub mod values;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub use cascade::{Cascade, ComputedStyles, MatchedRule, Origin};
+pub use conditions::{Environment, MediaQueryList};
+pub use style::ComputedStyle;
 
-    #[test]
-    fn stub_active() {
-        assert!(stub());
-    }
-}
+pub use stylesheet::{parse_stylesheet, Rule, Stylesheet};
+
+pub use token::{Token, Tokenizer};

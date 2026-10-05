@@ -1,4 +1,4 @@
-//! `browser` binary — Phase 1 (plan/10 §10.2.11, plan/14 Phase 1).
+//! `browser` binary — Phase 3 (plan/10 §10.2.11, plan/14 Phase 3).
 //!
 //! `browser [url] [--profile-dir p] [--software-render] [--perf] [--headless-test url]`
 //! (`--headless-test` is a test harness only, never a product).
@@ -26,15 +26,15 @@ struct Args {
 fn print_help() {
     print!(
         "browser {VERSION}\n\
-         Graphical web browser in Rust (Phase 1: minimal window + fetch)\n\
+         Graphical web browser in Rust (Phase 3: HTML and CSS)\n\
          \n\
          Usage: browser [url] [options]\n\
          \n\
          Options:\n  \
            --profile-dir <dir>    Profile directory (HSTS cache)\n  \
-           --software-render      Force software rendering (default in Phase 1)\n  \
+           --software-render      Force software rendering (default until Phase 4)\n  \
            --perf                 Local performance counters\n  \
-           --headless-test <url>  Fetch without a window (test harness)\n  \
+           --headless-test <url>  Load HTML/CSS without a window (test harness)\n  \
            --help                 This help\n  \
            --version              Version\n"
     );
@@ -106,23 +106,36 @@ fn run_headless(url_text: &str, perf: bool) -> ExitCode {
     let result = runtime.block_on(async {
         let client = net::Client::new(FetchOptions::default()).expect("TLS stack initializes");
         let mut last = 0usize;
-        client
+        let fetched = client
             .fetch_with_http_fallback(&url, allow_downgrade, &mut |progress: Progress| {
                 last = progress.downloaded;
                 if perf {
                     eprintln!("headless progress: {last} bytes");
                 }
             })
-            .await
+            .await?;
+        let bytes = fetched.bytes.len();
+        let page = shell::page::load_page(&client, fetched).await;
+        let styles = page.computed_styles(Default::default());
+        let article =
+            shell::article::article_from_styled_document(&page.document, &page.url, &styles);
+        Ok::<_, net::Error>((page, article, bytes))
     });
     match result {
-        Ok(fetched) => {
+        Ok((page, article, bytes)) => {
             println!(
                 "HEADLESS OK status={} url={} bytes={} elapsed={:?}",
-                fetched.status,
-                fetched.url.as_str(),
-                fetched.bytes.len(),
+                page.status,
+                page.url.as_str(),
+                bytes,
                 started.elapsed()
+            );
+            println!(
+                "HEADLESS CSS sheets={} blocks={} warnings={} title={:?}",
+                page.stylesheets.len(),
+                article.blocks.len(),
+                page.warnings.len(),
+                article.title
             );
             ExitCode::SUCCESS
         }

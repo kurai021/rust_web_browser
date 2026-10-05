@@ -4,6 +4,13 @@
 
 [advisories]
 yanked = "warn"
+# Maintenance-only notices, not vulnerability exemptions. Preserve the
+# existing shaping API for Phase 3; review replacements during Phase 11.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste is a build-time macro used by safer-bytes/WOFF2; no security vulnerability is reported" },
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz is the existing cosmic-text shaping dependency; maintenance migration tracked in Phase 3 evidence" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser is the existing fontdb/winit dependency; maintenance migration tracked in Phase 3 evidence" },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -20,6 +27,8 @@ allow = [
   "Unicode-3.0",
   "CC0-1.0",
   "MPL-2.0",
+  "Zlib", # slotmap, the existing font database arena
+  "CDLA-Permissive-2.0", # data license for Mozilla's webpki-roots bundle
   # Copyleft exceptions (doc 02): linking them subjects the binary to copyleft.
   "LGPL-3.0-only",
   "LGPL-3.0-or-later",

@@ -1,0 +1,4 @@
+@layer base,theme;
+@layer base { div { --gap:3px; color:blue!important; padding:var(--gap); } }
+@layer theme { #target { color:rgb(10% 20% 30% / .5); margin:1em auto; } }
+@media (max-width:500px) { div > p:nth-child(2n+1) { font-size:clamp(12px,3vw,20px); } }

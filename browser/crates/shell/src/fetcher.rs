@@ -11,7 +11,10 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use net::{Client, Error, FetchOptions, Fetched, Progress, UserInput};
+use crate::fonts::{load_fonts, FontAsset};
+use crate::page::{load_page, Page};
+use css::Environment;
+use net::{Client, Error, FetchOptions, Progress, UserInput};
 use tokio::task::JoinHandle as TokioHandle;
 use url::Url;
 
@@ -20,9 +23,21 @@ use url::Url;
 pub enum Command {
     /// Load `url`. Aborts anything in flight. `allow_downgrade` enables the
     /// https→http fallback for bare-host input (plan/04 §4.3.3).
-    Navigate { url: Url, allow_downgrade: bool },
+    Navigate {
+        id: u64,
+        url: Url,
+        allow_downgrade: bool,
+        environment: Environment,
+    },
+    /// Recompute media-dependent styles off the UI thread after a resize.
+    Restyle {
+        id: u64,
+        revision: u64,
+        page: Arc<Page>,
+        environment: Environment,
+    },
     /// Abort the in-flight fetch, if any.
-    Stop,
+    Stop { id: u64 },
     /// Persist HSTS under `dir` and exit the worker.
     Shutdown,
 }
@@ -31,19 +46,28 @@ pub enum Command {
 #[derive(Debug)]
 pub enum FetchEvent {
     /// A fetch started (progress bar on).
-    Started { url: Url },
+    Started { id: u64, url: Url },
     /// Body progress update.
     Progress {
+        id: u64,
         downloaded: usize,
         total: Option<u64>,
     },
     /// Fetch finished (success or typed failure).
     Done {
+        id: u64,
         url: Url,
-        result: Result<Fetched, Error>,
+        result: Result<(Arc<Page>, css::ComputedStyles), Error>,
+    },
+    /// Font-display swap: fonts arrive after the styled fallback document.
+    Fonts { id: u64, assets: Vec<FontAsset> },
+    Styled {
+        id: u64,
+        revision: u64,
+        styles: css::ComputedStyles,
     },
     /// Nothing in flight anymore after a stop.
-    Stopped,
+    Stopped { id: u64 },
 }
 
 /// Handle held by the UI thread.
@@ -120,6 +144,7 @@ fn worker_main(
         *client.hsts() = loaded;
     }
     let mut in_flight: Option<TokioHandle<()>> = None;
+    let mut restyling: Option<TokioHandle<()>> = None;
 
     let abort_in_flight = |slot: &mut Option<TokioHandle<()>>| {
         if let Some(handle) = slot.take() {
@@ -130,16 +155,22 @@ fn worker_main(
     while let Ok(command) = commands.recv() {
         match command {
             Command::Navigate {
+                id,
                 url,
                 allow_downgrade,
+                environment,
             } => {
                 abort_in_flight(&mut in_flight);
+                abort_in_flight(&mut restyling);
                 let client = Arc::clone(&client);
                 let events = events.clone();
                 let wake = Arc::clone(&wake);
                 let profile_dir = profile_dir.clone();
                 in_flight = Some(runtime.spawn(async move {
-                    let _ = events.send(FetchEvent::Started { url: url.clone() });
+                    let _ = events.send(FetchEvent::Started {
+                        id,
+                        url: url.clone(),
+                    });
                     wake();
                     let events_for_progress = events.clone();
                     let mut last_report = 0usize;
@@ -149,9 +180,10 @@ fn worker_main(
                             allow_downgrade,
                             &mut |progress: Progress| {
                                 // Thin out progress events: every 32 KiB.
-                                if progress.downloaded - last_report >= 32 * 1024 {
+                                if progress.downloaded.saturating_sub(last_report) >= 32 * 1024 {
                                     last_report = progress.downloaded;
                                     let _ = events_for_progress.send(FetchEvent::Progress {
+                                        id,
                                         downloaded: progress.downloaded,
                                         total: progress.total,
                                     });
@@ -160,18 +192,61 @@ fn worker_main(
                             },
                         )
                         .await;
+                    let result = match result {
+                        Ok(fetched) => {
+                            let page = Arc::new(load_page(&client, fetched).await);
+                            let styles = page.computed_styles(environment);
+                            Ok((page, styles))
+                        }
+                        Err(err) => Err(err),
+                    };
+                    let font_page = result.as_ref().ok().map(|(page, _)| page.clone());
                     persist_hsts(&client, &profile_dir);
-                    let _ = events.send(FetchEvent::Done { url, result });
+                    let _ = events.send(FetchEvent::Done { id, url, result });
                     wake();
+                    if let Some(page) = font_page {
+                        let assets = load_fonts(&client, &page, environment).await;
+                        if !assets.is_empty() {
+                            let _ = events.send(FetchEvent::Fonts { id, assets });
+                            wake();
+                        }
+                    }
                 }));
             }
-            Command::Stop => {
+            Command::Restyle {
+                id,
+                revision,
+                page,
+                environment,
+            } => {
+                abort_in_flight(&mut restyling);
+                let events = events.clone();
+                let wake = wake.clone();
+                let client = client.clone();
+                restyling = Some(runtime.spawn(async move {
+                    let styles = page.computed_styles(environment);
+                    let _ = events.send(FetchEvent::Styled {
+                        id,
+                        revision,
+                        styles,
+                    });
+                    wake();
+                    let assets = load_fonts(&client, &page, environment).await;
+                    if !assets.is_empty() {
+                        let _ = events.send(FetchEvent::Fonts { id, assets });
+                        wake();
+                    }
+                }));
+            }
+            Command::Stop { id } => {
                 abort_in_flight(&mut in_flight);
-                let _ = events.send(FetchEvent::Stopped);
+                abort_in_flight(&mut restyling);
+                let _ = events.send(FetchEvent::Stopped { id });
                 wake();
             }
             Command::Shutdown => {
                 abort_in_flight(&mut in_flight);
+                abort_in_flight(&mut restyling);
                 persist_hsts(&client, &profile_dir);
                 break;
             }

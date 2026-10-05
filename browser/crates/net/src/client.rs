@@ -120,6 +120,19 @@ impl Client {
         url: &Url,
         on_progress: &mut (dyn FnMut(Progress) + Send),
     ) -> Result<Fetched, Error> {
+        self.fetch_limited(url, self.options.max_body_bytes, on_progress)
+            .await
+    }
+
+    /// A stricter resource-specific decoded-body limit. Shares the existing
+    /// transport, cookies, HSTS, deadlines and streaming cancellation path.
+    pub async fn fetch_limited(
+        &self,
+        url: &Url,
+        max_bytes: usize,
+        on_progress: &mut (dyn FnMut(Progress) + Send),
+    ) -> Result<Fetched, Error> {
+        let max_bytes = max_bytes.min(self.options.max_body_bytes);
         let url = self.effective_url(url)?;
         let request = self
             .inner
@@ -149,10 +162,8 @@ impl Client {
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(|e| map_reqwest(&e))?;
             downloaded += chunk.len();
-            if downloaded > self.options.max_body_bytes {
-                return Err(Error::BodyTooLarge {
-                    cap: self.options.max_body_bytes,
-                });
+            if downloaded > max_bytes {
+                return Err(Error::BodyTooLarge { cap: max_bytes });
             }
             bytes.extend_from_slice(&chunk);
             on_progress(Progress { downloaded, total });

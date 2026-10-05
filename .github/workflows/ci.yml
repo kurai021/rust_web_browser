@@ -3,6 +3,12 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    - cron: '43 2 * * *'
+
+defaults:
+  run:
+    working-directory: browser
 
 jobs:
   test:
@@ -13,6 +19,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: browser
+      - run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --no-default-features
 
@@ -24,6 +33,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: browser
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
@@ -47,6 +58,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  css-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: CSS parser and cascade fuzz smoke
+        working-directory: browser/crates/css
+        env:
+          ASAN_OPTIONS: quarantine_size_mb=16
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then seconds=3600; else seconds=300; fi
+          cargo +nightly fuzz run parse fuzz/seeds -- -max_total_time="$seconds" -max_len=4096 -timeout=3 -rss_limit_mb=1536

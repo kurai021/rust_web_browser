@@ -27,8 +27,8 @@ impl Canvas<'_> {
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
         let x0 = x.max(0);
         let y0 = y.max(0);
-        let x1 = (x + w).min(self.w as i32);
-        let y1 = (y + h).min(self.h as i32);
+        let x1 = x.saturating_add(w).min(self.w as i32);
+        let y1 = y.saturating_add(h).min(self.h as i32);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -55,8 +55,8 @@ impl Canvas<'_> {
         }
         let x0 = x.max(0);
         let y0 = y.max(0);
-        let x1 = (x + w as i32).min(self.w as i32);
-        let y1 = (y + h as i32).min(self.h as i32);
+        let x1 = x.saturating_add(w as i32).min(self.w as i32);
+        let y1 = y.saturating_add(h as i32).min(self.h as i32);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -101,6 +101,105 @@ impl TextBuffer {
     pub fn set_text(&mut self, font_system: &mut FontSystem, text: &str) {
         self.buffer
             .set_text(font_system, text, Attrs::new(), Shaping::Advanced);
+    }
+
+    /// CSS attributes are applied to the existing shaping path. Inline
+    /// spans share their surrounding run, preserving kerning and hit offsets.
+    pub fn set_styled_text(
+        &mut self,
+        font_system: &mut FontSystem,
+        text: &str,
+        style: &css::ComputedStyle,
+        spans: &[crate::article::InlineStyleSpan],
+    ) {
+        let size = style.font_size.clamp(0.1, 10_000.0);
+        self.buffer.set_metrics(
+            font_system,
+            Metrics::new(size, style.line_height.pixels(size).clamp(0.1, 20_000.0)),
+        );
+        self.wrap = match style.white_space {
+            css::style::WhiteSpace::Pre | css::style::WhiteSpace::NoWrap => Wrap::None,
+            _ => Wrap::WordOrGlyph,
+        };
+        self.buffer.set_wrap(font_system, self.wrap);
+        let mut cuts = std::collections::BTreeSet::from([0, text.len()]);
+        for span in spans {
+            if span.end <= text.len()
+                && text.is_char_boundary(span.start)
+                && text.is_char_boundary(span.end)
+            {
+                cuts.insert(span.start);
+                cuts.insert(span.end);
+            }
+        }
+        let cuts: Vec<usize> = cuts.into_iter().collect();
+        let mut runs = Vec::new();
+        for window in cuts.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            let selected = spans
+                .iter()
+                .rev()
+                .find(|s| s.start <= start && s.end >= end)
+                .map(|s| &*s.style)
+                .unwrap_or(style);
+            runs.push((start, end, style_attrs(selected, font_system)));
+        }
+        let default_attrs = style_attrs(style, font_system);
+        self.buffer.set_rich_text(
+            font_system,
+            runs.iter()
+                .map(|(start, end, attrs)| (&text[*start..*end], attrs.as_attrs())),
+            default_attrs.as_attrs(),
+            Shaping::Advanced,
+        );
+        self.buffer.shape_until_scroll(font_system, false);
+    }
+
+    pub fn set_alignment(&mut self, font_system: &mut FontSystem, align: css::style::TextAlign) {
+        let align = match align {
+            css::style::TextAlign::Right | css::style::TextAlign::End => cosmic_text::Align::Right,
+            css::style::TextAlign::Center => cosmic_text::Align::Center,
+            css::style::TextAlign::Justify => cosmic_text::Align::Justified,
+            _ => cosmic_text::Align::Left,
+        };
+        for line in &mut self.buffer.lines {
+            line.set_align(Some(align));
+        }
+        self.buffer.shape_until_scroll(font_system, false);
+    }
+
+    /// Geometry from shaped glyphs, including wrapped/RTL text. Unlike the
+    /// Phase 2 substring overlays this does not reshape a slice in isolation.
+    pub fn range_rects(
+        &mut self,
+        font_system: &mut FontSystem,
+        start: usize,
+        end: usize,
+    ) -> Vec<(f32, f32, f32, f32, f32)> {
+        self.buffer.shape_until_scroll(font_system, false);
+        let offsets = self.line_offsets();
+        let mut rects = Vec::new();
+        for run in self.buffer.layout_runs() {
+            let base = offsets.get(run.line_i).copied().unwrap_or(0);
+            let mut left = f32::INFINITY;
+            let mut right = f32::NEG_INFINITY;
+            for glyph in run.glyphs {
+                if glyph.end + base > start && glyph.start + base < end {
+                    left = left.min(glyph.x);
+                    right = right.max(glyph.x + glyph.w);
+                }
+            }
+            if left.is_finite() && right >= left {
+                rects.push((
+                    left,
+                    run.line_top,
+                    run.line_y,
+                    right - left,
+                    run.line_height,
+                ));
+            }
+        }
+        rects
     }
 
     /// Resize the layout box (call on window resize).
@@ -265,6 +364,68 @@ impl TextBuffer {
                 tmp.blend_rect(x + offset_x, y + offset_y, rw, rh, (r, g, b, a));
             });
     }
+}
+
+fn style_attrs(style: &css::ComputedStyle, system: &FontSystem) -> cosmic_text::AttrsOwned {
+    use cosmic_text::{Family, Style, Weight};
+    let mut family = Family::Serif;
+    let mut web_name = None;
+    for name in &style.font_family {
+        let alias = crate::fonts::web_family(name);
+        if system
+            .db()
+            .faces()
+            .any(|f| f.families.iter().any(|(face, _)| face == &alias))
+        {
+            web_name = Some(alias);
+            break;
+        }
+        let generic = match name.to_ascii_lowercase().as_str() {
+            "serif" => Some(Family::Serif),
+            "sans-serif" | "system-ui" => Some(Family::SansSerif),
+            "monospace" => Some(Family::Monospace),
+            "cursive" => Some(Family::Cursive),
+            "fantasy" => Some(Family::Fantasy),
+            _ => None,
+        };
+        if let Some(generic) = generic {
+            family = generic;
+            break;
+        }
+        if system.db().faces().any(|f| {
+            f.families
+                .iter()
+                .any(|(face, _)| face.eq_ignore_ascii_case(name))
+        }) {
+            family = Family::Name(name);
+            break;
+        }
+    }
+    if let Some(name) = &web_name {
+        family = Family::Name(name);
+    }
+    let color = style.color;
+    let alpha = if style.visible && style.font_size > 0.0 {
+        (color.a as f32 * style.opacity) as u8
+    } else {
+        0
+    };
+    let size = style.font_size.clamp(0.1, 10_000.0);
+    cosmic_text::AttrsOwned::new(
+        Attrs::new()
+            .family(family)
+            .weight(Weight(style.font_weight))
+            .style(if style.italic {
+                Style::Italic
+            } else {
+                Style::Normal
+            })
+            .color(Color::rgba(color.r, color.g, color.b, alpha))
+            .metrics(Metrics::new(
+                size,
+                style.line_height.pixels(size).clamp(0.1, 20_000.0),
+            )),
+    )
 }
 
 /// Byte range in the line covered by a run's glyphs.

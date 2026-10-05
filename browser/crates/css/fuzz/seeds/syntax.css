@@ -1,0 +1,4 @@
+@import url("one.css");
+@font-face {font-family:"Demo";src:url(font.woff2) format("woff2");font-display:swap}
+div:not(#foo,.a) { background:linear-gradient(red,blue); font:italic 700 18px/1.5 sans-serif; }
+p::before {content:"x";color:currentColor}

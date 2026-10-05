@@ -10,14 +10,24 @@ default = ["simd"]
 simd = []
 
 [dependencies]
-net = { path = "../net" }
-html = { path = "../html" }
+net = { path = "../net", version = "0.1.0" }
+html = { path = "../html", version = "0.1.0" }
+css = { path = "../css", version = "0.1.0" }
+encoding_rs = "0.8"
+flate2 = "1"
+base64 = "0.22"
+percent-encoding = "2"
+woff2-patched = "0.4"
+brotli = "7"
 url = "2"
 winit = "0.30"
 softbuffer = "0.4"
 cosmic-text = "0.12"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 thiserror = "2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "macros"] }

@@ -37,7 +37,29 @@ Transitive note: `self_cell` 1.3.0 (via cosmic-text) is dual `Apache-2.0 OR GPL-
 | criterion | 0.5 | MIT OR Apache-2.0 | dev-dependency (benches only) |
 | libfuzzer-sys | 0.4 | MIT OR Apache-2.0 | fuzz harness only, nightly, never in the binary |
 
-## Copyleft exceptions (GPL/AGPL/LGPL)
+## Phase 3 dependency additions and first actual deny run (2026-10-05)
+
+| Dependency / data | License | Use |
+|---|---|---|
+| woff2-patched 0.4.0 | Apache-2.0 | Rust WOFF2 auxiliary decoder, not a web engine |
+| brotli 7.0.0 | BSD-3-Clause OR MIT | Bounded preflight before WOFF2 reconstruction |
+| base64 0.22.1 | MIT OR Apache-2.0 | Font data-URL decode |
+| percent-encoding 2.3.2 | MIT OR Apache-2.0 | Font data-URL decode |
+| slotmap 1.1.1 (existing transitive) | Zlib | Font database arena |
+| webpki-roots 1.0.9 (existing transitive data) | CDLA-Permissive-2.0 | Mozilla certificate-root data |
+| WPT test inputs | BSD-3-Clause | Adapted CSS conformance cases; retained license under css/tests/wpt |
+
+Other additions reuse existing approved crates (`url`, `encoding_rs`, `flate2`,
+`libfuzzer-sys`). No GPL/AGPL-only product dependency was introduced.
+
+The first actual cargo-deny run required allowing the two existing permissive
+licenses above and adding explicit local path dependency versions. Maintenance
+notices `RUSTSEC-2024-0436`, `RUSTSEC-2026-0206`, `RUSTSEC-2026-0192` have narrowly
+documented maintenance exceptions, with replacement review tracked for Phase 11.
+Vulnerability advisories remain enforced. cargo-audit and cargo-deny now run
+locally and pass; maintenance-only cargo-audit warnings are recorded in Phase 3.
+
+## Copyleft exception registry
 
 | Crate | Version | License | Anti-overengineering justification |
 |-------|---------|---------|------------------------------------|
@@ -45,5 +67,5 @@ Transitive note: `self_cell` 1.3.0 (via cosmic-text) is dual `Apache-2.0 OR GPL-
 
 ## Verification
 
-- `cargo deny` config in `browser/deny.toml` (blocked: `cargo-deny`/`cargo-audit` binaries unavailable in this environment; first CI run pending).
+- `cargo deny` config in `browser/deny.toml`; Phase 3 actual check passes. Earlier phases had only the manual scan below.
 - Manual substitute: direct licenses read from registry manifests; transitive scan over the resolved tree.

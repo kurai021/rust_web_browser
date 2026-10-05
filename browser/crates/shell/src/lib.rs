@@ -1,4 +1,4 @@
-//! `shell` — Phase 1 graphical window (plan/10).
+//! `shell` — graphical navigation and Phase 3 HTML/CSS integration (plan/10).
 //!
 //! Toolbar with back/forward/stop-reload buttons, an editable omnibox, a
 //! scrollable raw-source viewport and a status bar. The real page viewport
@@ -8,8 +8,10 @@
 pub mod app;
 pub mod article;
 pub mod fetcher;
+pub mod fonts;
 pub mod history;
 pub mod omnibox;
+pub mod page;
 pub mod text;
 
 use std::path::PathBuf;

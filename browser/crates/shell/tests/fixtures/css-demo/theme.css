@@ -1,0 +1,10 @@
+@import "base.css";
+body { font-family: sans-serif; font-size: 18px; background-color: #f4f0e8; max-width: 32em; margin: 20px auto; }
+.card { background: white; color: #273444; padding: 12px; margin: 24px 0; border: 2px solid #4a8a62; line-height: 1.6; }
+a:link { color: #086c48; }
+.hidden { display: none; }
+@media (max-width: 500px) {
+  body { font-size: 14px; margin: 8px; }
+  h1 { font-size: 24px; }
+  .card { background-color: #fff2c9; margin: 12px 0; }
+}

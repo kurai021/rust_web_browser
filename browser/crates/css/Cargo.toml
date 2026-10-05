@@ -9,5 +9,10 @@ license.workspace = true
 default = ["simd"]
 simd = []
 
+[dependencies]
+html = { path = "../html", version = "0.1.0" }
+thiserror = "2"
+url = "2"
+
 [lints]
 workspace = true

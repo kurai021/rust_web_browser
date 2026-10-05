@@ -4,8 +4,17 @@
 //! (headings, paragraphs, preformatted text, list items, rules, images)
 //! with byte-offset link spans. Styling/boxes land with CSS in Phase 3+.
 
+use css::{ComputedStyle, ComputedStyles};
 use html::{Document, Namespace, NodeData, NodeId};
+use std::sync::Arc;
 use url::Url;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineStyleSpan {
+    pub start: usize,
+    pub end: usize,
+    pub style: Arc<ComputedStyle>,
+}
 
 /// A hyperlink: byte range inside the block text plus the target URL.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +59,10 @@ pub struct Article {
     pub title: Option<String>,
     /// Blocks in document order.
     pub blocks: Vec<Block>,
+    /// Page/body style and styles aligned with the existing block list.
+    pub page_style: Option<Arc<ComputedStyle>>,
+    pub block_styles: Vec<Option<Arc<ComputedStyle>>>,
+    pub inline_styles: Vec<Vec<InlineStyleSpan>>,
 }
 
 /// Build an article from a parsed document.
@@ -58,9 +71,22 @@ pub struct Article {
 /// `template` contents. Relative links resolve against `base_url`.
 #[must_use]
 pub fn article_from_document(doc: &Document, base_url: &Url) -> Article {
+    article_with_styles(doc, base_url, None)
+}
+
+pub fn article_from_styled_document(
+    doc: &Document,
+    base_url: &Url,
+    styles: &ComputedStyles,
+) -> Article {
+    article_with_styles(doc, base_url, Some(styles))
+}
+
+fn article_with_styles(doc: &Document, base_url: &Url, styles: Option<&ComputedStyles>) -> Article {
     let mut article = Article {
         title: doc.title(),
         blocks: Vec::new(),
+        ..Article::default()
     };
     let root = match doc.document_element() {
         Some(root) => root,
@@ -71,11 +97,20 @@ pub fn article_from_document(doc: &Document, base_url: &Url) -> Article {
         .into_iter()
         .find(|&id| doc.is_element_named(id, "body"))
         .unwrap_or(root);
+    article.page_style = styles.and_then(|styles| styles.get(body)).cloned();
+    if article
+        .page_style
+        .as_ref()
+        .is_some_and(|s| s.display == css::style::Display::None)
+    {
+        return article;
+    }
     let mut walker = Walker {
         doc,
         base_url,
         article: &mut article,
         list_depth: 0,
+        styles,
     };
     walker.walk_children(body);
     article
@@ -86,6 +121,7 @@ struct Walker<'a> {
     base_url: &'a Url,
     article: &'a mut Article,
     list_depth: u8,
+    styles: Option<&'a ComputedStyles>,
 }
 
 impl Walker<'_> {
@@ -96,12 +132,19 @@ impl Walker<'_> {
     }
 
     fn walk(&mut self, id: NodeId) {
+        if self
+            .styles
+            .and_then(|s| s.get(id))
+            .is_some_and(|s| s.display == css::style::Display::None)
+        {
+            return;
+        }
         match self.doc.get(id).data.clone() {
             NodeData::Text(text) => {
                 // Stray top-level text becomes a paragraph (whitespace only
                 // runs are dropped to avoid blank blocks).
                 if !text.trim().is_empty() {
-                    self.push_text_block(text);
+                    self.push_text_block(text, id);
                 }
             }
             NodeData::Element(el) => {
@@ -118,11 +161,9 @@ impl Walker<'_> {
                         } else {
                             el.tag_name.as_bytes()[1] - b'0'
                         };
-                        let (text, links) = self.inline_text(id);
+                        let (text, links, spans) = self.inline_text(id);
                         if !text.trim().is_empty() {
-                            self.article
-                                .blocks
-                                .push(Block::Heading { level, text, links });
+                            self.push_block(Block::Heading { level, text, links }, id, spans);
                         }
                     }
                     "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
@@ -133,7 +174,7 @@ impl Walker<'_> {
                     "pre" | "listing" | "plaintext" | "xmp" => {
                         let text = self.doc.text_content(id);
                         if !text.trim().is_empty() {
-                            self.article.blocks.push(Block::Pre { text });
+                            self.push_block(Block::Pre { text }, id, Vec::new());
                         }
                     }
                     "ul" | "ol" | "dl" => {
@@ -142,13 +183,17 @@ impl Walker<'_> {
                         self.list_depth = self.list_depth.saturating_sub(1);
                     }
                     "li" | "dd" | "dt" => {
-                        let (text, links) = self.inline_text(id);
+                        let (text, links, spans) = self.inline_text(id);
                         if !text.trim().is_empty() {
-                            self.article.blocks.push(Block::ListItem {
-                                depth: self.list_depth.max(1),
-                                text,
-                                links,
-                            });
+                            self.push_block(
+                                Block::ListItem {
+                                    depth: self.list_depth.max(1),
+                                    text,
+                                    links,
+                                },
+                                id,
+                                spans,
+                            );
                         }
                     }
                     "tr" => {
@@ -164,21 +209,25 @@ impl Walker<'_> {
                             }
                         }
                         if !cells.iter().all(|cell| cell.is_empty()) {
-                            self.article.blocks.push(Block::Paragraph {
-                                text: cells.join(" | "),
-                                links: Vec::new(),
-                            });
+                            self.push_block(
+                                Block::Paragraph {
+                                    text: cells.join(" | "),
+                                    links: Vec::new(),
+                                },
+                                id,
+                                Vec::new(),
+                            );
                         }
                     }
-                    "hr" => self.article.blocks.push(Block::Rule),
-                    "br" => self.push_text_block("\n".to_owned()),
+                    "hr" => self.push_block(Block::Rule, id, Vec::new()),
+                    "br" => self.push_text_block("\n".to_owned(), id),
                     "img" => {
                         let alt = self
                             .doc
                             .get_attribute(id, "alt")
                             .unwrap_or("[image]")
                             .to_owned();
-                        self.article.blocks.push(Block::Image { alt });
+                        self.push_block(Block::Image { alt }, id, Vec::new());
                     }
                     _ => self.walk_children(id),
                 }
@@ -199,39 +248,62 @@ impl Walker<'_> {
             if is_inline_node(self.doc, child) {
                 self.collect_inline(child, &mut items);
             } else {
-                Self::flush_items(&mut items, self, kind);
+                Self::flush_items(&mut items, self, kind, id);
                 self.walk(child);
             }
         }
-        Self::flush_items(&mut items, self, kind);
+        Self::flush_items(&mut items, self, kind, id);
     }
 
     /// Flush accumulated inline items as one block.
-    fn flush_items(items: &mut Vec<InlineItem>, target: &mut Self, kind: BlockKind) {
+    fn flush_items(items: &mut Vec<InlineItem>, target: &mut Self, kind: BlockKind, id: NodeId) {
         let taken = std::mem::take(items);
         if taken.is_empty() {
             return;
         }
-        let (text, links) = build_run(&taken);
+        let (text, links, ranges) = build_run(&taken);
+        let spans = target.style_spans(ranges);
         if text.trim().is_empty() {
             return;
         }
-        target.push_kind(kind, text, links);
+        target.push_kind(kind, text, links, id, spans);
     }
 
     /// Inline text with link spans for `node` (transparent inline content).
     /// Whitespace is normalized in the same pass, so link offsets always
     /// match the final text.
-    fn inline_text(&self, id: NodeId) -> (String, Vec<LinkSpan>) {
+    fn inline_text(&self, id: NodeId) -> (String, Vec<LinkSpan>, Vec<InlineStyleSpan>) {
         let mut items = Vec::new();
         self.collect_inline(id, &mut items);
-        build_run(&items)
+        let (text, links, ranges) = build_run(&items);
+        (text, links, self.style_spans(ranges))
     }
 
     /// Collect a flat inline stream for `id` (recurses transparently).
     fn collect_inline(&self, id: NodeId, items: &mut Vec<InlineItem>) {
+        if self
+            .styles
+            .and_then(|s| s.get(id))
+            .is_some_and(|s| s.display == css::style::Display::None)
+        {
+            return;
+        }
+        let element = matches!(self.doc.get(id).data, NodeData::Element(_));
+        if element && self.styles.is_some() {
+            items.push(InlineItem::BeginStyle(id));
+        }
         match self.doc.get(id).data.clone() {
-            NodeData::Text(chunk) => items.push(InlineItem::Text(chunk)),
+            NodeData::Text(chunk) => {
+                let style = self
+                    .doc
+                    .get(id)
+                    .parent
+                    .and_then(|p| self.styles.and_then(|s| s.get(p)));
+                items.push(InlineItem::Text(transform_text(
+                    &chunk,
+                    style.map(|s| &**s),
+                )));
+            }
             NodeData::Element(el) if el.namespace == Namespace::Html => {
                 match el.tag_name.as_str() {
                     "script" | "style" | "noscript" => {}
@@ -265,25 +337,91 @@ impl Walker<'_> {
             }
             _ => {}
         }
+        if element && self.styles.is_some() {
+            items.push(InlineItem::EndStyle);
+        }
     }
 
-    fn push_text_block(&mut self, text: String) {
-        let (text, _) = build_run(&[InlineItem::Text(text)]);
+    fn push_text_block(&mut self, text: String, id: NodeId) {
+        let (text, _, _) = build_run(&[InlineItem::Text(text)]);
         if text.trim().is_empty() {
             return;
         }
-        self.article.blocks.push(Block::Paragraph {
-            text,
-            links: Vec::new(),
-        });
+        self.push_block(
+            Block::Paragraph {
+                text,
+                links: Vec::new(),
+            },
+            id,
+            Vec::new(),
+        );
     }
 
-    fn push_kind(&mut self, kind: BlockKind, text: String, links: Vec<LinkSpan>) {
+    fn push_kind(
+        &mut self,
+        kind: BlockKind,
+        text: String,
+        links: Vec<LinkSpan>,
+        id: NodeId,
+        spans: Vec<InlineStyleSpan>,
+    ) {
         match kind {
             BlockKind::Paragraph => {
-                self.article.blocks.push(Block::Paragraph { text, links });
+                self.push_block(Block::Paragraph { text, links }, id, spans);
             }
         }
+    }
+
+    fn push_block(&mut self, block: Block, id: NodeId, spans: Vec<InlineStyleSpan>) {
+        let source = if matches!(self.doc.get(id).data, NodeData::Element(_)) {
+            Some(id)
+        } else {
+            self.doc.get(id).parent
+        };
+        self.article.block_styles.push(
+            source
+                .and_then(|id| self.styles.and_then(|s| s.get(id)))
+                .cloned(),
+        );
+        self.article.inline_styles.push(spans);
+        self.article.blocks.push(block);
+    }
+
+    fn style_spans(&self, ranges: Vec<(NodeId, usize, usize)>) -> Vec<InlineStyleSpan> {
+        ranges
+            .into_iter()
+            .filter_map(|(id, start, end)| {
+                Some(InlineStyleSpan {
+                    start,
+                    end,
+                    style: self.styles?.get(id)?.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+fn transform_text(text: &str, style: Option<&ComputedStyle>) -> String {
+    match style.map(|s| s.text_transform.as_str()) {
+        Some("uppercase") => text.to_uppercase(),
+        Some("lowercase") => text.to_lowercase(),
+        Some("capitalize") => {
+            let mut start = true;
+            let mut out = String::new();
+            for ch in text.chars() {
+                if ch.is_whitespace() {
+                    start = true;
+                    out.push(ch);
+                } else if start {
+                    out.extend(ch.to_uppercase());
+                    start = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+        _ => text.to_owned(),
     }
 }
 
@@ -298,6 +436,8 @@ enum InlineItem {
     Text(String),
     BeginLink(Url),
     EndLink,
+    BeginStyle(NodeId),
+    EndStyle,
 }
 
 /// True for text and transparent inline elements (links, phrasing).
@@ -346,11 +486,13 @@ fn is_inline_node(doc: &Document, id: NodeId) -> bool {
 
 /// Build normalized text plus link spans from an inline stream.
 /// Whitespace collapses in the same pass, so offsets always match.
-fn build_run(items: &[InlineItem]) -> (String, Vec<LinkSpan>) {
+fn build_run(items: &[InlineItem]) -> (String, Vec<LinkSpan>, Vec<(NodeId, usize, usize)>) {
     let mut out = String::new();
     let mut links = Vec::new();
     let mut open: Vec<(Url, usize)> = Vec::new();
     let mut pending_space = false;
+    let mut style_stack = Vec::new();
+    let mut ranges = Vec::new();
     let push_char = |ch: char, out: &mut String, pending_space: &mut bool| {
         if ch == '\n' {
             // Hard break: drop pending spaces, keep one newline.
@@ -394,6 +536,20 @@ fn build_run(items: &[InlineItem]) -> (String, Vec<LinkSpan>) {
                     }
                 }
             }
+            InlineItem::BeginStyle(id) => {
+                if pending_space && !out.is_empty() && !out.ends_with('\n') {
+                    out.push(' ');
+                }
+                pending_space = false;
+                style_stack.push((*id, out.len()));
+            }
+            InlineItem::EndStyle => {
+                if let Some((id, start)) = style_stack.pop() {
+                    if start < out.len() {
+                        ranges.push((id, start, out.len()));
+                    }
+                }
+            }
         }
     }
     // Unclosed links (malformed nesting) end at the run end.
@@ -407,7 +563,8 @@ fn build_run(items: &[InlineItem]) -> (String, Vec<LinkSpan>) {
         }
     }
     links.sort_by_key(|link| link.start);
-    (out, links)
+    ranges.sort_by_key(|(_, start, end)| (*start, std::cmp::Reverse(*end)));
+    (out, links, ranges)
 }
 
 // ---------- block view (rendering) ----------
@@ -430,12 +587,19 @@ struct Overlay {
 /// A block plus its laid-out text, link overlays and metrics.
 pub struct BlockView {
     buffer: TextBuffer,
+    text: String,
     links: Vec<LinkSpan>,
     overlays: Vec<Overlay>,
     /// Top offset inside the article (set by layout).
     pub y: f32,
     /// Laid-out height including trailing gap.
     pub height: f32,
+    style: Option<Arc<ComputedStyle>>,
+    x_offset: f32,
+    text_origin: (f32, f32),
+    box_size: (f32, f32),
+    decorations: Vec<(f32, f32, f32, css::values::Color)>,
+    link_rects: Vec<(Url, f32, f32, f32, f32)>,
 }
 
 impl BlockView {
@@ -504,11 +668,127 @@ impl BlockView {
         let height = text_h + gap;
         Self {
             buffer,
+            text,
             links,
             overlays,
             y,
             height,
+            style: None,
+            x_offset: 0.0,
+            text_origin: (0.0, 0.0),
+            box_size: (width, text_h),
+            decorations: Vec::new(),
+            link_rects: Vec::new(),
         }
+    }
+
+    /// Phase 3 uses the same block renderer with computed typography and
+    /// simple vertical boxes. Full nested flow layout belongs to Phase 4.
+    pub fn layout_styled(
+        font_system: &mut FontSystem,
+        block: &Block,
+        width: f32,
+        y: f32,
+        style: Arc<ComputedStyle>,
+        spans: &[InlineStyleSpan],
+        env: css::Environment,
+    ) -> Self {
+        let mut view = Self::layout(font_system, block, width, y);
+        let ctx = env.length_context(style.font_size, 16.0, width);
+        let margin: [f32; 4] = std::array::from_fn(|i| style.margin[i].resolve(ctx).unwrap_or(0.0));
+        let padding: [f32; 4] =
+            std::array::from_fn(|i| style.padding[i].resolve(ctx).unwrap_or(0.0).max(0.0));
+        let border: [f32; 4] =
+            std::array::from_fn(|i| style.border_width[i].resolve(ctx).unwrap_or(0.0).max(0.0));
+        let horizontal = padding[1] + padding[3] + border[1] + border[3];
+        let available = (width - margin[1] - margin[3]).max(1.0);
+        let specified = style.width.resolve(ctx);
+        let mut content_width = specified
+            .map(|w| if style.border_box { w - horizontal } else { w })
+            .unwrap_or(available - horizontal)
+            .max(1.0);
+        if let Some(max) = style.max_width.resolve(ctx) {
+            content_width = content_width.min(max.max(1.0));
+        }
+        if let Some(min) = style.min_width.resolve(ctx) {
+            content_width = content_width.max(min.max(1.0));
+        }
+        content_width = content_width.min(available).max(1.0);
+        let box_width = content_width + horizontal;
+        let remaining = (width - box_width - margin[1] - margin[3]).max(0.0);
+        let left_auto = matches!(style.margin[3], css::values::SizeValue::Auto);
+        let right_auto = matches!(style.margin[1], css::values::SizeValue::Auto);
+        view.x_offset = margin[3]
+            + if left_auto && right_auto {
+                remaining / 2.0
+            } else if left_auto {
+                remaining
+            } else {
+                0.0
+            };
+        view.text_origin = (padding[3] + border[3], padding[0] + border[0]);
+        // List bullets shift inline ranges by their UTF-8 byte length.
+        let shifted = if let Block::ListItem { depth, .. } = block {
+            let offset = format!("{}• ", "  ".repeat(depth.saturating_sub(1) as usize)).len();
+            spans
+                .iter()
+                .map(|s| InlineStyleSpan {
+                    start: s.start + offset,
+                    end: s.end + offset,
+                    style: s.style.clone(),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            spans.to_vec()
+        };
+        view.buffer
+            .set_size(font_system, content_width, 1_000_000.0);
+        view.buffer
+            .set_styled_text(font_system, &view.text, &style, &shifted);
+        view.buffer.set_alignment(font_system, style.text_align);
+        let text_height = view.buffer.full_height(font_system);
+        let content_height = style.height.resolve(ctx).unwrap_or(text_height).max(0.0);
+        let box_height = content_height + padding[0] + padding[2] + border[0] + border[2];
+        view.buffer
+            .set_size(font_system, content_width, text_height.max(0.1));
+        // Metrics/style changes invalidate the Phase 2 substring overlays.
+        // Accent colors now come from the actual anchor's computed style.
+        view.overlays.clear();
+        let mut decoration_ranges = vec![(0, view.text.len(), style.clone())];
+        decoration_ranges.extend(
+            shifted
+                .iter()
+                .map(|span| (span.start, span.end, span.style.clone())),
+        );
+        for (start, end, style) in decoration_ranges {
+            if style.text_decoration == "none" || !style.visible {
+                continue;
+            }
+            for (x, top, baseline, w, line_height) in
+                view.buffer.range_rects(font_system, start, end)
+            {
+                if style.text_decoration.contains("underline") {
+                    view.decorations.push((x, baseline + 2.0, w, style.color));
+                }
+                if style.text_decoration.contains("overline") {
+                    view.decorations.push((x, top, w, style.color));
+                }
+                if style.text_decoration.contains("line-through") {
+                    view.decorations
+                        .push((x, top + line_height * 0.5, w, style.color));
+                }
+            }
+        }
+        for link in &view.links {
+            for (x, top, _, w, h) in view.buffer.range_rects(font_system, link.start, link.end) {
+                view.link_rects.push((link.href.clone(), x, top, w, h));
+            }
+        }
+        view.y = y + margin[0];
+        view.height = margin[0] + box_height + margin[2];
+        view.box_size = (box_width, box_height);
+        view.style = Some(style);
+        view
     }
 
     /// Paint the block at `(x, y_offset)` (viewport origin).
@@ -521,7 +801,58 @@ impl BlockView {
         y_offset: i32,
     ) {
         let base_y = y_offset + self.y as i32;
-        self.buffer.draw(font_system, cache, canvas, x, base_y);
+        let x = x + self.x_offset as i32;
+        if let Some(style) = &self.style {
+            if style.visible {
+                let bg = style.background_color;
+                let (w, h) = self.box_size;
+                canvas.blend_rect(
+                    x,
+                    base_y,
+                    w.max(0.0) as u32,
+                    h.max(0.0) as u32,
+                    (bg.r, bg.g, bg.b, (bg.a as f32 * style.opacity) as u8),
+                );
+                let ctx = css::values::LengthContext {
+                    percentage_basis: w,
+                    font_size: style.font_size,
+                    ..Default::default()
+                };
+                let borders: [i32; 4] = std::array::from_fn(|i| {
+                    style.border_width[i].resolve(ctx).unwrap_or(0.0).max(0.0) as i32
+                });
+                for (i, (rx, ry, rw, rh)) in [
+                    (x, base_y, w as i32, borders[0]),
+                    (x + w as i32 - borders[1], base_y, borders[1], h as i32),
+                    (x, base_y + h as i32 - borders[2], w as i32, borders[2]),
+                    (x, base_y, borders[3], h as i32),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let c = style.border_color[i];
+                    canvas.blend_rect(
+                        rx,
+                        ry,
+                        rw.max(0) as u32,
+                        rh.max(0) as u32,
+                        (c.r, c.g, c.b, c.a),
+                    );
+                }
+            }
+        }
+        let text_x = x + self.text_origin.0 as i32;
+        let text_y = base_y + self.text_origin.1 as i32;
+        self.buffer.draw(font_system, cache, canvas, text_x, text_y);
+        for (dx, dy, w, color) in &self.decorations {
+            canvas.blend_rect(
+                text_x + *dx as i32,
+                text_y + *dy as i32,
+                w.max(1.0) as u32,
+                1,
+                (color.r, color.g, color.b, color.a),
+            );
+        }
         for overlay in &mut self.overlays {
             overlay.buffer.draw(
                 font_system,
@@ -543,6 +874,17 @@ impl BlockView {
 
     /// Link whose span contains buffer-local `(x, y)`, if any.
     pub fn hit_link(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<Url> {
+        if self.style.is_some() {
+            let x = x - self.x_offset - self.text_origin.0;
+            let y = y - self.text_origin.1;
+            return self
+                .link_rects
+                .iter()
+                .find(|(_, left, top, w, h)| {
+                    x >= *left && x < *left + *w && y >= *top && y < *top + *h
+                })
+                .map(|(url, _, _, _, _)| url.clone());
+        }
         let offset = self.buffer.hit_offset(font_system, x, y)?;
         self.links
             .iter()
@@ -669,5 +1011,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn computed_styles_change_pixels_spacing_and_keep_shaped_links() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let doc=html::parse_full(b"<p id='p' style='color:#135;font-size:24px;padding:8px;margin:12px;border:2px solid red'>Text <a href='/next'>Link</a><span style='display:none'>SECRET</span></p>",&url,html::ParseOpts::default());
+        let sheet=css::parse_stylesheet("a{color:green;text-decoration:underline} @media(max-width:450px){#p{font-size:12px!important}}",None);
+        let mut cascade = css::Cascade::default();
+        let styles = cascade.compute(&doc, std::slice::from_ref(&sheet));
+        let article = article_from_styled_document(&doc, &url, &styles);
+        assert_eq!(article.blocks.len(), 1);
+        assert!(matches!(&article.blocks[0],Block::Paragraph {text,..} if text=="Text Link"));
+        let style = article.block_styles[0].as_ref().unwrap();
+        assert_eq!(style.font_size, 24.0);
+        let mut fonts = FontSystem::new();
+        let mut view = BlockView::layout_styled(
+            &mut fonts,
+            &article.blocks[0],
+            350.0,
+            0.0,
+            style.clone(),
+            &article.inline_styles[0],
+            cascade.environment,
+        );
+        assert_eq!(view.text_origin, (10.0, 10.0));
+        assert_eq!(view.y, 12.0);
+        assert!(!view.link_rects.is_empty());
+        let (url, left, top, w, h) = view.link_rects[0].clone();
+        let hit = view.hit_link(
+            &mut fonts,
+            view.x_offset + view.text_origin.0 + left + w / 2.0,
+            view.text_origin.1 + top + h / 2.0,
+        );
+        assert_eq!(hit.as_ref(), Some(&url));
+        let mut pixels = vec![0xffffff; 400 * 200];
+        let mut canvas = Canvas {
+            w: 400,
+            h: 200,
+            pixels: &mut pixels,
+        };
+        view.draw(&mut fonts, &mut SwashCache::new(), &mut canvas, 0, 0);
+        assert_eq!(canvas.pixels[12 * 400 + 12], 0xff0000); // actual border pixel
+        cascade.environment.width = 400.0;
+        let narrow_styles = cascade.compute(&doc, &[sheet]);
+        let narrow = article_from_styled_document(&doc, &url, &narrow_styles);
+        assert_eq!(narrow.block_styles[0].as_ref().unwrap().font_size, 12.0);
+        let smaller = BlockView::layout_styled(
+            &mut fonts,
+            &narrow.blocks[0],
+            350.0,
+            0.0,
+            narrow.block_styles[0].clone().unwrap(),
+            &narrow.inline_styles[0],
+            cascade.environment,
+        );
+        assert!(smaller.height < view.height);
     }
 }

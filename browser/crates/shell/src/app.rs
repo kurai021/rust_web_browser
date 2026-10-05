@@ -1,4 +1,4 @@
-//! Phase 1 window: toolbar + omnibox + raw-text viewport + status bar.
+//! Phase 3 window: existing navigation chrome plus a CSS-styled viewport.
 //!
 //! Stack per plan/10 §10.4 and plan/03 §3.4: `winit` window, `softbuffer`
 //! software pixels, `cosmic-text` glyphs. Network stays on the worker
@@ -7,7 +7,9 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use net::{Error as NetError, Fetched};
+use crate::page::Page;
+use css::{ComputedStyles, Environment};
+use net::Error as NetError;
 use softbuffer::{Context, Surface};
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -53,9 +55,9 @@ fn welcome_article() -> Article {
     Article {
         title: Some("Welcome".to_owned()),
         blocks: vec![
-            Block::Heading { level: 1, text: "browser — Phase 2".to_owned(), links: Vec::new() },
+            Block::Heading { level: 1, text: "browser — Phase 3".to_owned(), links: Vec::new() },
             Block::Paragraph {
-                text: "This window renders pages as structured text: headings, paragraphs, lists and links. Styling lands with CSS in Phase 3.".to_owned(),
+                text: "This window renders structured pages with CSS colors, typography and margins. Full flow layout arrives in Phase 4.".to_owned(),
                 links: Vec::new(),
             },
             Block::Heading { level: 2, text: "Try".to_owned(), links: Vec::new() },
@@ -68,6 +70,7 @@ fn welcome_article() -> Article {
                 links: Vec::new(),
             },
         ],
+        ..Article::default()
     }
 }
 
@@ -117,6 +120,15 @@ pub struct ShellApp {
     omnibox_focused: bool,
     view: View,
     article: Article,
+    page: Option<Arc<Page>>,
+    redirected_from: Option<Url>,
+    styles: ComputedStyles,
+    navigation_id: u64,
+    style_revision: u64,
+    dark_theme: bool,
+    web_font_ids: Vec<cosmic_text::fontdb::ID>,
+    page_origin: (f32, f32),
+    canvas_color: css::values::Color,
     blocks: Vec<BlockView>,
     load: LoadState,
     pending_history: bool,
@@ -166,6 +178,15 @@ impl ShellApp {
             omnibox_focused: true,
             view: View::Welcome,
             article: welcome_article(),
+            page: None,
+            redirected_from: None,
+            styles: ComputedStyles::default(),
+            navigation_id: 0,
+            style_revision: 0,
+            dark_theme: false,
+            web_font_ids: Vec::new(),
+            page_origin: (12.0, 10.0),
+            canvas_color: css::values::Color::WHITE,
             blocks: Vec::new(),
             load: LoadState::Idle,
             pending_history: false,
@@ -220,6 +241,8 @@ impl ShellApp {
     /// Begin a fetch. `record_history` is false for back/forward/reload
     /// (the entry already exists); the final URL is recorded on Done.
     fn start_fetch(&mut self, url: Url, allow_downgrade: bool, record_history: bool) {
+        self.navigation_id = self.navigation_id.wrapping_add(1);
+        self.style_revision = self.style_revision.wrapping_add(1);
         self.pending_history = record_history;
         self.load = LoadState::Loading {
             url: url.clone(),
@@ -230,8 +253,10 @@ impl ShellApp {
         self.request_redraw();
         if let Some(fetcher) = &self.fetcher {
             fetcher.send(Command::Navigate {
+                id: self.navigation_id,
                 url,
                 allow_downgrade,
+                environment: self.environment(),
             });
         }
     }
@@ -261,7 +286,9 @@ impl ShellApp {
     fn stop_or_reload(&mut self) {
         if matches!(self.load, LoadState::Loading { .. }) {
             if let Some(fetcher) = &self.fetcher {
-                fetcher.send(Command::Stop);
+                fetcher.send(Command::Stop {
+                    id: self.navigation_id,
+                });
             }
         } else {
             self.reload();
@@ -275,6 +302,11 @@ impl ShellApp {
 
     /// Swap the article, reset scroll and schedule a rebuild.
     fn set_article(&mut self, article: Article, view: View) {
+        if view != View::Document {
+            self.clear_web_fonts();
+            self.page = None;
+            self.canvas_color = css::values::Color::WHITE;
+        }
         self.view = view;
         self.article = article;
         self.bump_content();
@@ -282,19 +314,81 @@ impl ShellApp {
 
     /// Rebuild laid-out blocks at `width` px.
     fn rebuild_blocks(&mut self, width: f32) {
+        let env = self.environment();
+        let mut content_width = width;
+        self.page_origin = (12.0, 10.0);
+        if let Some(style) = &self.article.page_style {
+            let ctx = env.length_context(style.font_size, 16.0, width);
+            let margin: [f32; 4] =
+                std::array::from_fn(|i| style.margin[i].resolve(ctx).unwrap_or(0.0));
+            let padding: [f32; 4] =
+                std::array::from_fn(|i| style.padding[i].resolve(ctx).unwrap_or(0.0).max(0.0));
+            let available = (width - margin[1] - margin[3] - padding[1] - padding[3]).max(1.0);
+            content_width = style.width.resolve(ctx).unwrap_or(available);
+            if let Some(max) = style.max_width.resolve(ctx) {
+                content_width = content_width.min(max.max(1.0));
+            }
+            if let Some(min) = style.min_width.resolve(ctx) {
+                content_width = content_width.max(min.max(1.0));
+            }
+            content_width = content_width.clamp(1.0, available);
+            let auto_left = matches!(style.margin[3], css::values::SizeValue::Auto);
+            let auto_right = matches!(style.margin[1], css::values::SizeValue::Auto);
+            let extra = (available - content_width).max(0.0);
+            self.page_origin = (
+                margin[3]
+                    + padding[3]
+                    + if auto_left && auto_right {
+                        extra / 2.0
+                    } else if auto_left {
+                        extra
+                    } else {
+                        0.0
+                    },
+                margin[0] + padding[0],
+            );
+        }
         let mut y = 10.0;
         let mut blocks = Vec::with_capacity(self.article.blocks.len());
-        for block in &self.article.blocks {
-            let mut view = BlockView::layout(&mut self.font_system, block, width, y);
-            view.y = y;
+        for (index, block) in self.article.blocks.iter().enumerate() {
+            let view = if let Some(style) = self
+                .article
+                .block_styles
+                .get(index)
+                .and_then(|s| s.as_ref())
+            {
+                let spans = self
+                    .article
+                    .inline_styles
+                    .get(index)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                BlockView::layout_styled(
+                    &mut self.font_system,
+                    block,
+                    content_width,
+                    y,
+                    style.clone(),
+                    spans,
+                    env,
+                )
+            } else {
+                BlockView::layout(&mut self.font_system, block, content_width, y)
+            };
             y += view.height;
             blocks.push(view);
         }
         self.blocks = blocks;
-        self.content_h = y + 10.0;
+        self.content_h = y + self.page_origin.1 + 10.0;
     }
 
     fn show_welcome(&mut self) {
+        if let Some(fetcher) = &self.fetcher {
+            fetcher.send(Command::Stop {
+                id: self.navigation_id,
+            });
+        }
+        self.navigation_id = self.navigation_id.wrapping_add(1);
         self.load = LoadState::Idle;
         self.set_article(welcome_article(), View::Welcome);
         self.omnibox.set_text("");
@@ -315,6 +409,7 @@ impl ShellApp {
                     links: Vec::new(),
                 },
             ],
+            ..Article::default()
         };
         self.load = LoadState::Idle;
         self.set_article(article, View::Error);
@@ -323,8 +418,19 @@ impl ShellApp {
     }
 
     fn on_fetch_event(&mut self, event: FetchEvent) {
+        let id = match &event {
+            FetchEvent::Started { id, .. }
+            | FetchEvent::Progress { id, .. }
+            | FetchEvent::Done { id, .. }
+            | FetchEvent::Fonts { id, .. }
+            | FetchEvent::Styled { id, .. }
+            | FetchEvent::Stopped { id } => *id,
+        };
+        if id != self.navigation_id {
+            return;
+        }
         match event {
-            FetchEvent::Started { url } => {
+            FetchEvent::Started { url, .. } => {
                 self.load = LoadState::Loading {
                     url,
                     downloaded: 0,
@@ -332,7 +438,9 @@ impl ShellApp {
                 };
                 self.update_title();
             }
-            FetchEvent::Progress { downloaded, total } => {
+            FetchEvent::Progress {
+                downloaded, total, ..
+            } => {
                 if let LoadState::Loading {
                     downloaded: d,
                     total: t,
@@ -343,40 +451,117 @@ impl ShellApp {
                     *t = total;
                 }
             }
-            FetchEvent::Done { url, result } => {
+            FetchEvent::Done { url, result, .. } => {
                 self.load = LoadState::Idle;
                 match result {
-                    Ok(fetched) => self.show_document(&url, &fetched),
+                    Ok((page, styles)) => self.show_document(&url, page, styles),
                     Err(err) => self.show_error(&url, &err),
                 }
             }
-            FetchEvent::Stopped => {
+            FetchEvent::Stopped { .. } => {
                 self.load = LoadState::Idle;
                 self.update_title();
+            }
+            FetchEvent::Styled {
+                revision, styles, ..
+            } => {
+                if revision == self.style_revision {
+                    self.styles = styles;
+                    self.refresh_styled_article();
+                }
+            }
+            FetchEvent::Fonts { assets, .. } => {
+                self.web_font_ids
+                    .extend(crate::fonts::install_fonts(&mut self.font_system, &assets));
+                self.content_version = self.content_version.wrapping_add(1);
             }
         }
         self.request_redraw();
     }
 
-    fn show_document(&mut self, requested: &Url, fetched: &Fetched) {
+    fn show_document(&mut self, requested: &Url, page: Arc<Page>, styles: ComputedStyles) {
         if self.pending_history {
-            self.history.navigate(fetched.url.clone());
+            self.history.navigate(page.url.clone());
         }
         self.pending_history = false;
-        let doc = html::parse_full(&fetched.bytes, &fetched.url, html::ParseOpts::default());
-        let mut article = crate::article::article_from_document(&doc, &fetched.url);
-        if requested.as_str() != fetched.url.as_str() {
+        self.clear_web_fonts();
+        self.redirected_from = (requested != &page.url).then(|| requested.clone());
+        self.omnibox.set_text(page.url.as_str());
+        self.page = Some(page);
+        self.styles = styles;
+        self.refresh_styled_article();
+        self.queue_restyle();
+        self.update_title();
+    }
+
+    fn environment(&self) -> Environment {
+        Environment {
+            width: self.size.width.saturating_sub(SCROLLBAR_W as u32) as f32,
+            height: self.viewport_h(),
+            dark: self.dark_theme,
+        }
+    }
+
+    fn queue_restyle(&mut self) {
+        if let (Some(fetcher), Some(page)) = (&self.fetcher, &self.page) {
+            self.style_revision = self.style_revision.wrapping_add(1);
+            fetcher.send(Command::Restyle {
+                id: self.navigation_id,
+                revision: self.style_revision,
+                page: page.clone(),
+                environment: self.environment(),
+            });
+        }
+    }
+
+    fn refresh_styled_article(&mut self) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let mut article =
+            crate::article::article_from_styled_document(&page.document, &page.url, &self.styles);
+        if let Some(requested) = &self.redirected_from {
             article.blocks.insert(
                 0,
                 Block::Paragraph {
-                    text: format!("(redirected from {})", requested.as_str()),
+                    text: format!("(redirected from {requested})"),
                     links: Vec::new(),
                 },
             );
+            article.block_styles.insert(0, None);
+            article.inline_styles.insert(0, Vec::new());
         }
+        let root_bg = page
+            .document
+            .document_element()
+            .and_then(|id| self.styles.get(id))
+            .map(|s| s.background_color)
+            .unwrap_or(css::values::Color::TRANSPARENT);
+        self.canvas_color = if root_bg.a > 0 {
+            root_bg
+        } else {
+            article
+                .page_style
+                .as_ref()
+                .map(|s| s.background_color)
+                .unwrap_or(css::values::Color::TRANSPARENT)
+        };
+        let scroll = self.scroll_y;
         self.set_article(article, View::Document);
-        self.omnibox.set_text(fetched.url.as_str());
-        self.update_title();
+        self.scroll_y = scroll;
+    }
+
+    fn clear_web_fonts(&mut self) {
+        if self.web_font_ids.is_empty() {
+            return;
+        }
+        for id in self.web_font_ids.drain(..) {
+            self.font_system.db_mut().remove_face(id);
+        }
+        let db = self.font_system.db().clone();
+        let locale = self.font_system.locale().to_owned();
+        self.font_system = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
+        self.text_renderer = TextRenderer::new();
     }
 
     fn show_error(&mut self, url: &Url, err: &NetError) {
@@ -408,6 +593,7 @@ impl ShellApp {
                     links: Vec::new(),
                 },
             ],
+            ..Article::default()
         };
         self.set_article(article, View::Error);
         self.update_title();
@@ -632,8 +818,9 @@ impl ShellApp {
         // Viewport text click: follow links.
         let (vx, vy, vw, vh) = self.viewport_rect();
         if mx >= vx && mx < vx + vw - SCROLLBAR_W && my >= vy && my < vy + vh {
-            let content_y = my as f32 - vy as f32 + self.scroll_y - 10.0;
-            if let Some(href) = self.hit_link(mx as f32 - vx as f32 - 12.0, content_y) {
+            let content_y = my as f32 - vy as f32 + self.scroll_y - self.page_origin.1;
+            if let Some(href) = self.hit_link(mx as f32 - vx as f32 - self.page_origin.0, content_y)
+            {
                 self.omnibox.set_text(href.as_str());
                 self.start_fetch(href, false, true);
                 return;
@@ -770,13 +957,24 @@ impl ShellApp {
         };
         canvas.fill_rect(0, 0, w as i32, h as i32, BG);
         canvas.fill_rect(vx, vy, vw, vh, VIEW_BG);
+        let bg = self.canvas_color;
+        canvas.blend_rect(
+            vx,
+            vy,
+            vw.max(0) as u32,
+            vh.max(0) as u32,
+            (bg.r, bg.g, bg.b, bg.a),
+        );
         for block in &mut self.blocks {
+            if block.y + block.height < self.scroll_y || block.y > self.scroll_y + vh as f32 {
+                continue;
+            }
             block.draw(
                 fs,
                 cache,
                 &mut canvas,
-                vx + 12,
-                vy + 10 - self.scroll_y as i32,
+                vx + self.page_origin.0 as i32,
+                vy + self.page_origin.1 as i32 - self.scroll_y as i32,
             );
         }
         paint_scrollbar(&mut canvas, vx, vy, vw, vh, self.content_h, self.scroll_y);
@@ -816,7 +1014,7 @@ impl ShellApp {
         if self.content_measured_for == Some(key) {
             return;
         }
-        self.rebuild_blocks((vw - 24.0).max(80.0));
+        self.rebuild_blocks((vw - SCROLLBAR_W as f32).max(1.0));
         self.content_measured_for = Some(key);
     }
 
@@ -850,8 +1048,9 @@ impl ShellApp {
                         })
                         .sum::<usize>();
                     format!(
-                        "Done — {} blocks · {links} links (structured text; CSS lands in Phase 3)",
+                        "Done — {} blocks · {links} links · {} CSS sheets",
                         self.article.blocks.len(),
+                        self.page.as_ref().map_or(0, |p| p.stylesheets.len()),
                     )
                 }
                 View::Error => "Failed — see the error above".to_owned(),
@@ -1006,7 +1205,12 @@ impl ApplicationHandler<Wake> for ShellApp {
             WindowEvent::Resized(size) => {
                 self.size = size;
                 self.content_measured_for = None;
+                self.queue_restyle();
                 self.request_redraw();
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                self.dark_theme = theme == winit::window::Theme::Dark;
+                self.queue_restyle();
             }
             WindowEvent::RedrawRequested => {
                 self.render();

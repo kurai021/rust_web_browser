@@ -3,3 +3,6 @@
 crates/html/fuzz/corpus/
 crates/html/fuzz/artifacts/
 crates/html/fuzz/target/
+crates/css/fuzz/corpus/
+crates/css/fuzz/artifacts/
+crates/css/fuzz/target/
