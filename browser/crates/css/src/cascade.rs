@@ -196,6 +196,32 @@ impl Cascade {
         inline: bool,
     ) -> ComputedStyle {
         let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
+        // Replaced-element dimension attributes are presentational hints,
+        // below every author rule. Explicit width/height:auto can therefore
+        // restore intrinsic sizing instead of being overridden in layout.
+        if inline
+            && matches!(&doc.get(node).data, NodeData::Element(el) if matches!(el.tag_name.as_str(), "img" | "video"))
+        {
+            for name in ["width", "height"] {
+                if let Some(n) = doc
+                    .get_attribute(node, name)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                {
+                    candidates.entry(name.into()).or_default().push(Candidate {
+                        decl: Declaration {
+                            name: name.into(),
+                            value: vec![Token::Dimension(n.min(10_000_000.0), "px".into())],
+                            important: false,
+                        },
+                        origin: Origin::Author,
+                        layer: None,
+                        rank: (2, false, 0, Specificity::default(), 0, 0),
+                        base: None,
+                    });
+                }
+            }
+        }
         for rule in &flat.rules {
             let Some(specificity) = rule
                 .rule

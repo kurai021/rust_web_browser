@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::fonts::{load_fonts, FontAsset};
-use crate::page::{load_page, Page};
+use crate::images::load_images;
+use crate::page::{load_page_from_document, Page};
 use css::Environment;
 use net::{Client, Error, FetchOptions, Progress, UserInput};
 use tokio::task::JoinHandle as TokioHandle;
@@ -53,6 +54,12 @@ pub enum FetchEvent {
         downloaded: usize,
         total: Option<u64>,
     },
+    /// Consistent partial DOM/CSS, emitted while the HTML stream is open.
+    Preview {
+        id: u64,
+        page: Arc<Page>,
+        styles: css::ComputedStyles,
+    },
     /// Fetch finished (success or typed failure).
     Done {
         id: u64,
@@ -60,10 +67,21 @@ pub enum FetchEvent {
         result: Result<(Arc<Page>, css::ComputedStyles), Error>,
     },
     /// Font-display swap: fonts arrive after the styled fallback document.
-    Fonts { id: u64, assets: Vec<FontAsset> },
+    Fonts {
+        id: u64,
+        page: Arc<Page>,
+        assets: Vec<FontAsset>,
+    },
+    Image {
+        id: u64,
+        page: Arc<Page>,
+        url: Url,
+        success: bool,
+    },
     Styled {
         id: u64,
         revision: u64,
+        page: Arc<Page>,
         styles: css::ComputedStyles,
     },
     /// Nothing in flight anymore after a stop.
@@ -134,6 +152,7 @@ fn worker_main(
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .max_blocking_threads(2)
         .thread_name("net-io")
         .enable_all()
         .build()
@@ -174,11 +193,51 @@ fn worker_main(
                     wake();
                     let events_for_progress = events.clone();
                     let mut last_report = 0usize;
+                    let mut parser = None::<html::Parser>;
+                    let mut stream_url = None;
+                    let mut previews = 0usize;
+                    let mut next_preview = 16 * 1024;
+                    let mut last_preview = None::<std::time::Instant>;
                     let result = client
-                        .fetch_with_http_fallback(
+                        .fetch_stream_with_http_fallback(
                             &url,
                             allow_downgrade,
-                            &mut |progress: Progress| {
+                            &mut |head, chunk, progress: Progress| {
+                                if stream_url.as_ref() != Some(&head.url) {
+                                    parser = Some(html::Parser::new(
+                                        head.url.clone(),
+                                        Box::new(html::NullSink),
+                                        Default::default(),
+                                    ));
+                                    stream_url = Some(head.url.clone());
+                                }
+                                if let Some(parser) = &mut parser {
+                                    parser.push(chunk);
+                                }
+                                if previews < 8
+                                    && progress.downloaded >= next_preview
+                                    && last_preview.is_none_or(|t| {
+                                        t.elapsed() >= std::time::Duration::from_millis(200)
+                                    })
+                                {
+                                    next_preview = progress.downloaded.saturating_add(128 * 1024);
+                                    if let Some(document) =
+                                        parser.as_ref().and_then(html::Parser::snapshot)
+                                    {
+                                        if !document.get_elements_by_tag_name("body").is_empty() {
+                                            let page = Arc::new(Page::preview(head, document));
+                                            let styles = page.computed_styles(environment);
+                                            let _ = events_for_progress.send(FetchEvent::Preview {
+                                                id,
+                                                page,
+                                                styles,
+                                            });
+                                            previews += 1;
+                                            last_preview = Some(std::time::Instant::now());
+                                            wake();
+                                        }
+                                    }
+                                }
                                 // Thin out progress events: every 32 KiB.
                                 if progress.downloaded.saturating_sub(last_report) >= 32 * 1024 {
                                     last_report = progress.downloaded;
@@ -194,22 +253,45 @@ fn worker_main(
                         .await;
                     let result = match result {
                         Ok(fetched) => {
-                            let page = Arc::new(load_page(&client, fetched).await);
+                            let document = parser.map(html::Parser::finish).unwrap_or_else(|| {
+                                html::parse_full(&fetched.bytes, &fetched.url, Default::default())
+                            });
+                            let page =
+                                Arc::new(load_page_from_document(&client, fetched, document).await);
                             let styles = page.computed_styles(environment);
                             Ok((page, styles))
                         }
                         Err(err) => Err(err),
                     };
-                    let font_page = result.as_ref().ok().map(|(page, _)| page.clone());
+                    let resource_page = result
+                        .as_ref()
+                        .ok()
+                        .map(|(page, styles)| (page.clone(), styles.clone()));
                     persist_hsts(&client, &profile_dir);
                     let _ = events.send(FetchEvent::Done { id, url, result });
                     wake();
-                    if let Some(page) = font_page {
-                        let assets = load_fonts(&client, &page, environment).await;
-                        if !assets.is_empty() {
-                            let _ = events.send(FetchEvent::Fonts { id, assets });
+                    if let Some((page, styles)) = resource_page {
+                        let fonts = async {
+                            let assets = load_fonts(&client, &page, environment).await;
+                            if !assets.is_empty() {
+                                let _ = events.send(FetchEvent::Fonts {
+                                    id,
+                                    page: page.clone(),
+                                    assets,
+                                });
+                                wake();
+                            }
+                        };
+                        let images = load_images(&client, &page, &styles, |url, success| {
+                            let _ = events.send(FetchEvent::Image {
+                                id,
+                                page: page.clone(),
+                                url,
+                                success,
+                            });
                             wake();
-                        }
+                        });
+                        tokio::join!(fonts, images);
                     }
                 }));
             }
@@ -228,14 +310,29 @@ fn worker_main(
                     let _ = events.send(FetchEvent::Styled {
                         id,
                         revision,
-                        styles,
+                        page: page.clone(),
+                        styles: styles.clone(),
                     });
                     wake();
                     let assets = load_fonts(&client, &page, environment).await;
                     if !assets.is_empty() {
-                        let _ = events.send(FetchEvent::Fonts { id, assets });
+                        let _ = events.send(FetchEvent::Fonts {
+                            id,
+                            page: page.clone(),
+                            assets,
+                        });
                         wake();
                     }
+                    load_images(&client, &page, &styles, |url, success| {
+                        let _ = events.send(FetchEvent::Image {
+                            id,
+                            page: page.clone(),
+                            url,
+                            success,
+                        });
+                        wake();
+                    })
+                    .await;
                 }));
             }
             Command::Stop { id } => {

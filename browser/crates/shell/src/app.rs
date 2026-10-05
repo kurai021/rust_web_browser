@@ -1,10 +1,10 @@
-//! Phase 3 window: existing navigation chrome plus a CSS-styled viewport.
+//! Phase 4 window: existing chrome, progressive flow layout and GPU/CPU paint.
 //!
-//! Stack per plan/10 §10.4 and plan/03 §3.4: `winit` window, `softbuffer`
-//! software pixels, `cosmic-text` glyphs. Network stays on the worker
-//! thread (`fetcher.rs`); this file never blocks on I/O.
+//! winit chrome, wgpu compositing and the matching softbuffer fallback.
+//! Network, image decoding, page layout and glyph preparation stay on workers.
 
 use std::num::NonZeroU32;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use crate::page::Page;
@@ -55,9 +55,9 @@ fn welcome_article() -> Article {
     Article {
         title: Some("Welcome".to_owned()),
         blocks: vec![
-            Block::Heading { level: 1, text: "browser — Phase 3".to_owned(), links: Vec::new() },
+            Block::Heading { level: 1, text: "browser — Phase 4".to_owned(), links: Vec::new() },
             Block::Paragraph {
-                text: "This window renders structured pages with CSS colors, typography and margins. Full flow layout arrives in Phase 4.".to_owned(),
+                text: "This window renders nested flow layout, shaped text and images using GPU painting with a software fallback.".to_owned(),
                 links: Vec::new(),
             },
             Block::Heading { level: 2, text: "Try".to_owned(), links: Vec::new() },
@@ -106,6 +106,13 @@ pub struct ShellApp {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+    gpu: Option<paint::gpu::GpuWindow>,
+    gpu_pending: Option<Receiver<Result<paint::gpu::GpuWindow, String>>>,
+    gpu_worker: Option<std::thread::JoinHandle<()>>,
+    gpu_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    software_render: bool,
+    perf: bool,
+    pixels: Vec<u32>,
     size: PhysicalSize<u32>,
     fatal_init: Option<String>,
 
@@ -130,9 +137,23 @@ pub struct ShellApp {
     page_origin: (f32, f32),
     canvas_color: css::values::Color,
     blocks: Vec<BlockView>,
+    flow: Option<layout::LayoutResult>,
+    scene: paint::Scene,
+    layout_worker: Option<crate::layout_worker::LayoutWorker>,
+    font_generation: u64,
+    flow_navigation: Option<u64>,
+    scroll_offsets: layout::ScrollOffsets,
+    zoom: f32,
+    layout_passes: u64,
+    layout_ms: f64,
+    frames: u64,
+    navigation_started: Option<std::time::Instant>,
+    painted_navigation: bool,
+    preview_seen: bool,
     load: LoadState,
     pending_history: bool,
     scroll_y: f32,
+    scroll_x: f32,
     content_h: f32,
     content_measured_for: Option<(u64, u32)>,
     content_version: u64,
@@ -166,6 +187,13 @@ impl ShellApp {
             window: None,
             context: None,
             surface: None,
+            gpu: None,
+            gpu_pending: None,
+            gpu_worker: None,
+            gpu_wake: None,
+            software_render: false,
+            perf: false,
+            pixels: Vec::new(),
             size: PhysicalSize::new(1100, 750),
             fatal_init: None,
             font_system,
@@ -188,9 +216,23 @@ impl ShellApp {
             page_origin: (12.0, 10.0),
             canvas_color: css::values::Color::WHITE,
             blocks: Vec::new(),
+            flow: None,
+            scene: paint::Scene::default(),
+            layout_worker: None,
+            font_generation: 0,
+            flow_navigation: None,
+            scroll_offsets: layout::ScrollOffsets::default(),
+            zoom: 1.0,
+            layout_passes: 0,
+            layout_ms: 0.0,
+            frames: 0,
+            navigation_started: None,
+            painted_navigation: false,
+            preview_seen: false,
             load: LoadState::Idle,
             pending_history: false,
             scroll_y: 0.0,
+            scroll_x: 0.0,
             content_h: 0.0,
             content_measured_for: None,
             content_version: 0,
@@ -211,10 +253,83 @@ impl ShellApp {
         self.fatal_init.take()
     }
 
+    pub fn configure_rendering(
+        &mut self,
+        software: bool,
+        perf: bool,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.software_render = software;
+        self.perf = perf;
+        match crate::layout_worker::LayoutWorker::spawn(wake.clone()) {
+            Ok(worker) => self.layout_worker = Some(worker),
+            Err(err) => self.fatal_init = Some(format!("layout worker failed: {err}")),
+        }
+        self.gpu_wake = Some(wake);
+    }
+
+    fn start_gpu(&mut self, window: Arc<Window>) {
+        if self.software_render {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.gpu_wake.clone();
+        match std::thread::Builder::new()
+            .name("paint-init".into())
+            .spawn(move || {
+                let size = window.inner_size();
+                let result = pollster::block_on(paint::gpu::GpuWindow::new(
+                    window,
+                    layout::Size::new(size.width as f32, size.height as f32),
+                ));
+                let _ = tx.send(result);
+                if let Some(wake) = wake {
+                    wake();
+                }
+            }) {
+            Ok(worker) => {
+                self.gpu_worker = Some(worker);
+                self.gpu_pending = Some(rx);
+            }
+            Err(err) => {
+                eprintln!("browser: GPU init unavailable, using software: {err}");
+                self.software_render = true;
+            }
+        }
+    }
+
+    fn poll_gpu(&mut self) {
+        let ready = self.gpu_pending.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(result) = ready {
+            self.gpu_pending = None;
+            match result {
+                Ok(gpu) => {
+                    if self.perf {
+                        eprintln!("PERF renderer=gpu adapter={}", gpu.gpu.adapter_name);
+                    }
+                    self.surface = None;
+                    self.context = None;
+                    self.gpu = Some(gpu);
+                }
+                Err(err) => {
+                    eprintln!("browser: GPU unavailable, using software: {err}");
+                    self.software_render = true;
+                }
+            }
+            self.request_redraw();
+        }
+    }
+
     /// Join the worker thread (saves HSTS). Called after the loop exits.
     pub fn shutdown(&mut self) {
+        if let Some(worker) = &mut self.layout_worker {
+            worker.shutdown();
+        }
         if let Some(fetcher) = self.fetcher.take() {
             fetcher.shutdown();
+        }
+        if let Some(worker) = self.gpu_worker.take() {
+            let _ = worker.join();
         }
     }
 
@@ -244,6 +359,9 @@ impl ShellApp {
         self.navigation_id = self.navigation_id.wrapping_add(1);
         self.style_revision = self.style_revision.wrapping_add(1);
         self.pending_history = record_history;
+        self.navigation_started = Some(std::time::Instant::now());
+        self.painted_navigation = false;
+        self.preview_seen = false;
         self.load = LoadState::Loading {
             url: url.clone(),
             downloaded: 0,
@@ -262,7 +380,12 @@ impl ShellApp {
     }
 
     fn reload(&mut self) {
-        if let Some(url) = self.history.current().cloned() {
+        if let Some(url) = self
+            .page
+            .as_ref()
+            .map(|p| p.url.clone())
+            .or_else(|| self.history.current().cloned())
+        {
             self.start_fetch(url, false, false);
         } else if matches!(self.view, View::Error) {
             self.show_welcome();
@@ -306,6 +429,12 @@ impl ShellApp {
             self.clear_web_fonts();
             self.page = None;
             self.canvas_color = css::values::Color::WHITE;
+            self.flow = None;
+            self.flow_navigation = None;
+            self.scene = paint::Scene::default();
+            self.scroll_offsets.clear();
+            self.zoom = 1.0;
+            self.scroll_x = 0.0;
         }
         self.view = view;
         self.article = article;
@@ -314,6 +443,21 @@ impl ShellApp {
 
     /// Rebuild laid-out blocks at `width` px.
     fn rebuild_blocks(&mut self, width: f32) {
+        if let Some(page) = &self.page {
+            if let Some(worker) = &self.layout_worker {
+                worker.request(crate::layout_worker::Request {
+                    navigation: self.navigation_id,
+                    revision: self.content_version,
+                    viewport: layout::Size::new(width, self.viewport_h()),
+                    page: page.clone(),
+                    styles: self.styles.clone(),
+                    font_generation: self.font_generation,
+                    locale: self.font_system.locale().to_owned(),
+                    db: self.font_system.db().clone(),
+                });
+            }
+            return;
+        }
         let env = self.environment();
         let mut content_width = width;
         self.page_origin = (12.0, 10.0);
@@ -421,8 +565,10 @@ impl ShellApp {
         let id = match &event {
             FetchEvent::Started { id, .. }
             | FetchEvent::Progress { id, .. }
+            | FetchEvent::Preview { id, .. }
             | FetchEvent::Done { id, .. }
             | FetchEvent::Fonts { id, .. }
+            | FetchEvent::Image { id, .. }
             | FetchEvent::Styled { id, .. }
             | FetchEvent::Stopped { id } => *id,
         };
@@ -458,22 +604,60 @@ impl ShellApp {
                     Err(err) => self.show_error(&url, &err),
                 }
             }
+            FetchEvent::Preview { page, styles, .. } => {
+                if !self.preview_seen {
+                    self.clear_web_fonts();
+                    self.scroll_offsets.clear();
+                    self.scroll_y = 0.0;
+                    self.scroll_x = 0.0;
+                    self.preview_seen = true;
+                }
+                self.page = Some(page);
+                self.styles = styles;
+                self.refresh_styled_article();
+            }
             FetchEvent::Stopped { .. } => {
                 self.load = LoadState::Idle;
                 self.update_title();
             }
             FetchEvent::Styled {
-                revision, styles, ..
+                revision,
+                page,
+                styles,
+                ..
             } => {
-                if revision == self.style_revision {
+                if revision == self.style_revision
+                    && self
+                        .page
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &page))
+                {
                     self.styles = styles;
                     self.refresh_styled_article();
                 }
             }
-            FetchEvent::Fonts { assets, .. } => {
-                self.web_font_ids
-                    .extend(crate::fonts::install_fonts(&mut self.font_system, &assets));
-                self.content_version = self.content_version.wrapping_add(1);
+            FetchEvent::Fonts { page, assets, .. } => {
+                if self
+                    .page
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &page))
+                {
+                    let added = crate::fonts::install_fonts(&mut self.font_system, &assets);
+                    if !added.is_empty() {
+                        self.web_font_ids.extend(added);
+                        self.font_generation = self.font_generation.wrapping_add(1);
+                        self.content_version = self.content_version.wrapping_add(1);
+                    }
+                }
+            }
+            FetchEvent::Image { page, .. } => {
+                if self
+                    .page
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &page))
+                {
+                    self.content_version = self.content_version.wrapping_add(1);
+                }
             }
         }
         self.request_redraw();
@@ -485,6 +669,11 @@ impl ShellApp {
         }
         self.pending_history = false;
         self.clear_web_fonts();
+        if !self.preview_seen {
+            self.scroll_y = 0.0;
+            self.scroll_x = 0.0;
+            self.scroll_offsets.clear();
+        }
         self.redirected_from = (requested != &page.url).then(|| requested.clone());
         self.omnibox.set_text(page.url.as_str());
         self.page = Some(page);
@@ -518,19 +707,17 @@ impl ShellApp {
         let Some(page) = &self.page else {
             return;
         };
-        let mut article =
-            crate::article::article_from_styled_document(&page.document, &page.url, &self.styles);
-        if let Some(requested) = &self.redirected_from {
-            article.blocks.insert(
-                0,
-                Block::Paragraph {
-                    text: format!("(redirected from {requested})"),
-                    links: Vec::new(),
-                },
-            );
-            article.block_styles.insert(0, None);
-            article.inline_styles.insert(0, Vec::new());
-        }
+        let body_style = page
+            .document
+            .get_elements_by_tag_name("body")
+            .first()
+            .and_then(|&id| self.styles.get(id))
+            .cloned();
+        let article = Article {
+            title: page.document.title(),
+            page_style: body_style,
+            ..Article::default()
+        };
         let root_bg = page
             .document
             .document_element()
@@ -562,6 +749,7 @@ impl ShellApp {
         let locale = self.font_system.locale().to_owned();
         self.font_system = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
         self.text_renderer = TextRenderer::new();
+        self.font_generation = self.font_generation.wrapping_add(1);
     }
 
     fn show_error(&mut self, url: &Url, err: &NetError) {
@@ -636,6 +824,31 @@ impl ShellApp {
         }
         for event in events {
             self.on_fetch_event(event);
+        }
+    }
+
+    fn drain_layout(&mut self) {
+        let ready = self
+            .layout_worker
+            .as_ref()
+            .map_or_else(Vec::new, |w| w.drain());
+        for result in ready {
+            if result.navigation != self.navigation_id
+                || result.revision != self.content_version
+                || result.viewport.width != self.environment().width.max(1.0)
+                || result.viewport.height != self.viewport_h()
+            {
+                continue;
+            }
+            self.content_h = result.layout.content_size.height * self.zoom;
+            self.flow = Some(result.layout);
+            self.scene = result.scene;
+            self.flow_navigation = Some(result.navigation);
+            self.layout_ms = result.elapsed_ms;
+            self.layout_passes = result.passes;
+            self.blocks.clear();
+            self.page_origin = (0.0, 0.0);
+            self.request_redraw();
         }
     }
 
@@ -766,11 +979,44 @@ impl ShellApp {
     }
 
     fn on_wheel(&mut self, delta: &MouseScrollDelta) {
-        let dy = match delta {
-            MouseScrollDelta::LineDelta(_, y) => -*y * LINE_SCROLL_PX,
-            MouseScrollDelta::PixelDelta(pos) => -(pos.y as f32),
+        let (mut dx, mut dy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (-*x * LINE_SCROLL_PX, -*y * LINE_SCROLL_PX),
+            MouseScrollDelta::PixelDelta(pos) => (-(pos.x as f32), -(pos.y as f32)),
         };
+        if self.modifiers.control_key() {
+            self.zoom_by((-dy / 600.0).exp());
+            return;
+        }
+        if self.modifiers.shift_key() {
+            std::mem::swap(&mut dx, &mut dy);
+        }
+        if let Some(flow) = &self.flow {
+            let x = (self.mouse_x as f32 + self.scroll_x) / self.zoom;
+            let y = (self.mouse_y as f32 - TOOLBAR_H as f32 + self.scroll_y) / self.zoom;
+            if flow.scroll_by_at(
+                x,
+                y,
+                (dx / self.zoom, dy / self.zoom),
+                &mut self.scroll_offsets,
+            ) {
+                self.request_redraw();
+                return;
+            }
+            let max = (flow.content_size.width * self.zoom - self.environment().width).max(0.0);
+            self.scroll_x = (self.scroll_x + dx).clamp(0.0, max);
+        }
         self.scroll_by(dy);
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        let old = self.zoom;
+        self.zoom = (self.zoom * factor).clamp(0.25, 4.0);
+        if let Some(flow) = &self.flow {
+            self.content_h = flow.content_size.height * self.zoom;
+        }
+        self.scroll_y *= self.zoom / old;
+        self.scroll_x *= self.zoom / old;
+        self.request_redraw();
     }
 
     fn scroll_by(&mut self, dy: f32) {
@@ -819,8 +1065,10 @@ impl ShellApp {
         let (vx, vy, vw, vh) = self.viewport_rect();
         if mx >= vx && mx < vx + vw - SCROLLBAR_W && my >= vy && my < vy + vh {
             let content_y = my as f32 - vy as f32 + self.scroll_y - self.page_origin.1;
-            if let Some(href) = self.hit_link(mx as f32 - vx as f32 - self.page_origin.0, content_y)
-            {
+            if let Some(href) = self.hit_link(
+                mx as f32 - vx as f32 - self.page_origin.0 + self.scroll_x,
+                content_y,
+            ) {
                 self.omnibox.set_text(href.as_str());
                 self.start_fetch(href, false, true);
                 return;
@@ -832,6 +1080,9 @@ impl ShellApp {
 
     /// Link under viewport-content point `(x, y)` (content coords).
     fn hit_link(&mut self, x: f32, y: f32) -> Option<Url> {
+        if let Some(flow) = &self.flow {
+            return flow.hit_link(x / self.zoom, y / self.zoom, &self.scroll_offsets);
+        }
         for block in &mut self.blocks {
             if y >= block.y && y < block.y + block.height {
                 return block.hit_link(&mut self.font_system, x, y - block.y);
@@ -886,6 +1137,7 @@ impl ShellApp {
     // ---------- rendering ----------
 
     fn render(&mut self) {
+        let frame_started = std::time::Instant::now();
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -893,7 +1145,7 @@ impl ShellApp {
         // may assign anything, and the startup guess is often wrong. A stale
         // size makes softbuffer fail and the window never commits a frame.
         self.size = window.inner_size();
-        if self.surface.is_none() {
+        if self.gpu.is_none() && self.surface.is_none() {
             let context = match Context::new(window.clone()) {
                 Ok(context) => context,
                 Err(err) => {
@@ -921,6 +1173,10 @@ impl ShellApp {
         self.measure_content(vw as f32);
         let max_scroll = (self.content_h - vh as f32).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let max_x = self.flow.as_ref().map_or(0.0, |f| {
+            (f.content_size.width * self.zoom - self.environment().width).max(0.0)
+        });
+        self.scroll_x = self.scroll_x.clamp(0.0, max_x);
         let status = self.status_line();
         self.status_text.set_text(&mut self.font_system, &status);
         self.status_text
@@ -932,28 +1188,16 @@ impl ShellApp {
         self.omnibox_text
             .set_size(&mut self.font_system, omni_w, h as f32);
 
-        // Phase B: pixels. `surface` stays inside `self`; every other
-        // borrow below is a disjoint field, so this compiles without moves.
-        // Surface errors are logged: failing silently here leaves a window
-        // that never commits a frame (invisible to the compositor).
-        let surface = self.surface.as_mut().expect("surface created above");
-        if let Err(err) = surface.resize(ww, hh) {
-            eprintln!("browser: surface resize failed: {err}");
-            return;
-        }
-        let mut buffer = match surface.buffer_mut() {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                eprintln!("browser: pixel buffer failed: {err}");
-                return;
-            }
-        };
+        // Chrome uses the established text widgets. Only its small toolbar,
+        // status and scrollbar strips are uploaded when the GPU is active.
+        // Page fills, blending and image/glyph scaling run in the WGSL path.
+        self.pixels.resize(w as usize * h as usize, 0);
         let fs = &mut self.font_system;
         let cache = &mut self.text_renderer.cache;
         let mut canvas = Canvas {
             w,
             h,
-            pixels: &mut buffer,
+            pixels: &mut self.pixels,
         };
         canvas.fill_rect(0, 0, w as i32, h as i32, BG);
         canvas.fill_rect(vx, vy, vw, vh, VIEW_BG);
@@ -965,17 +1209,37 @@ impl ShellApp {
             vh.max(0) as u32,
             (bg.r, bg.g, bg.b, bg.a),
         );
-        for block in &mut self.blocks {
-            if block.y + block.height < self.scroll_y || block.y > self.scroll_y + vh as f32 {
-                continue;
+        let page_clip = layout::Rect::new(
+            vx as f32,
+            vy as f32,
+            (vw - SCROLLBAR_W).max(1) as f32,
+            vh as f32,
+        );
+        if self.flow.is_some() {
+            if self.gpu.is_none() {
+                self.scene.paint_software(
+                    canvas.pixels,
+                    w,
+                    h,
+                    page_clip,
+                    (vx as f32 - self.scroll_x, vy as f32 - self.scroll_y),
+                    self.zoom,
+                    &self.scroll_offsets,
+                );
             }
-            block.draw(
-                fs,
-                cache,
-                &mut canvas,
-                vx + self.page_origin.0 as i32,
-                vy + self.page_origin.1 as i32 - self.scroll_y as i32,
-            );
+        } else {
+            for block in &mut self.blocks {
+                if block.y + block.height < self.scroll_y || block.y > self.scroll_y + vh as f32 {
+                    continue;
+                }
+                block.draw(
+                    fs,
+                    cache,
+                    &mut canvas,
+                    vx + self.page_origin.0 as i32,
+                    vy + self.page_origin.1 as i32 - self.scroll_y as i32,
+                );
+            }
         }
         paint_scrollbar(&mut canvas, vx, vy, vw, vh, self.content_h, self.scroll_y);
         canvas.fill_rect(0, 0, w as i32, TOOLBAR_H, CHROME_BG);
@@ -1003,8 +1267,76 @@ impl ShellApp {
         );
         self.status_text
             .draw(fs, cache, &mut canvas, PAD, h as i32 - STATUS_H + 5);
-        if let Err(err) = buffer.present() {
-            eprintln!("browser: present failed: {err}");
+        window.pre_present_notify();
+        if let Some(gpu) = &mut self.gpu {
+            let window_clip = layout::Rect::new(0.0, 0.0, w as f32, h as f32);
+            let mut quads = vec![(paint::Quad::solid(page_clip, self.canvas_color), page_clip)];
+            if self.flow.is_some() {
+                quads.extend(self.scene.visible_quads(
+                    page_clip,
+                    (vx as f32 - self.scroll_x, vy as f32 - self.scroll_y),
+                    self.zoom,
+                    &self.scroll_offsets,
+                ));
+            } else if let Some(q) = chrome_quad(&self.pixels, w, h, (vx, vy, vw - SCROLLBAR_W, vh))
+            {
+                quads.push((q, page_clip));
+            }
+            for rect in [
+                (0, 0, w as i32, TOOLBAR_H),
+                (0, h as i32 - STATUS_H, w as i32, STATUS_H),
+                (vx + vw - SCROLLBAR_W, vy, SCROLLBAR_W, vh),
+            ] {
+                if let Some(q) = chrome_quad(&self.pixels, w, h, rect) {
+                    quads.push((q, window_clip));
+                }
+            }
+            gpu.resize(w, h);
+            if let Err(err) = gpu.present(&quads) {
+                eprintln!("browser: GPU present failed, switching to software: {err}");
+                self.gpu = None;
+                self.software_render = true;
+                self.request_redraw();
+                return;
+            }
+        } else {
+            let Some(surface) = &mut self.surface else {
+                return;
+            };
+            if let Err(err) = surface.resize(ww, hh) {
+                eprintln!("browser: surface resize failed: {err}");
+                return;
+            }
+            let mut buffer = match surface.buffer_mut() {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    eprintln!("browser: pixel buffer failed: {err}");
+                    return;
+                }
+            };
+            buffer.copy_from_slice(&self.pixels);
+            if let Err(err) = buffer.present() {
+                eprintln!("browser: present failed: {err}");
+                return;
+            }
+        }
+        self.frames += 1;
+        if self.perf {
+            if !self.painted_navigation
+                && self.view == View::Document
+                && self.flow_navigation == Some(self.navigation_id)
+                && (self.preview_seen || matches!(self.load, LoadState::Idle))
+            {
+                let elapsed = self
+                    .navigation_started
+                    .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "PERF first_paint_ms={elapsed:.3} before_eof={}",
+                    matches!(self.load, LoadState::Loading { .. })
+                );
+                self.painted_navigation = true;
+            }
+            eprintln!("PERF frame={} renderer={} layout_passes={} layout_ms={:.3} frame_ms={:.3} scroll={:.1} zoom={:.2}", self.frames, if self.gpu.is_some() { "gpu" } else { "software" }, self.layout_passes, self.layout_ms, frame_started.elapsed().as_secs_f64() * 1000.0, self.scroll_y, self.zoom);
         }
     }
 
@@ -1036,6 +1368,20 @@ impl ShellApp {
             LoadState::Idle => match self.view {
                 View::Welcome => "Ready — type a URL and press Enter".to_owned(),
                 View::Document => {
+                    if let Some(flow) = &self.flow {
+                        return format!(
+                            "Done — {} boxes · {} lines · {} CSS sheets · {:.0}% · {}",
+                            flow.stats.boxes,
+                            flow.stats.lines,
+                            self.page.as_ref().map_or(0, |p| p.stylesheets.len()),
+                            self.zoom * 100.0,
+                            if self.gpu.is_some() {
+                                "GPU"
+                            } else {
+                                "software"
+                            }
+                        );
+                    }
                     let links = self
                         .article
                         .blocks
@@ -1062,6 +1408,34 @@ impl ShellApp {
 struct ToolbarLayout {
     buttons: Vec<Button>,
     omnibox_rect: (i32, i32, i32, i32),
+}
+
+fn chrome_quad(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    rect: (i32, i32, i32, i32),
+) -> Option<paint::Quad> {
+    let (x, y, w, h) = rect;
+    let x0 = x.max(0).min(width as i32) as u32;
+    let y0 = y.max(0).min(height as i32) as u32;
+    let x1 = x.saturating_add(w).max(0).min(width as i32) as u32;
+    let y1 = y.saturating_add(h).max(0).min(height as i32) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+    for row in y0..y1 {
+        for col in x0..x1 {
+            let p = *pixels.get((row * width + col) as usize)?;
+            rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, 255]);
+        }
+    }
+    let image = layout::RasterImage::new(x1 - x0, y1 - y0, rgba)?;
+    Some(paint::Quad::image(
+        layout::Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32),
+        image,
+    ))
 }
 
 fn paint_button(
@@ -1174,7 +1548,9 @@ impl ApplicationHandler<Wake> for ShellApp {
             .with_inner_size(PhysicalSize::new(1100, 750));
         match event_loop.create_window(attrs) {
             Ok(window) => {
-                self.window = Some(Arc::new(window));
+                let window = Arc::new(window);
+                self.start_gpu(window.clone());
+                self.window = Some(window);
                 self.request_redraw();
                 // Kick off the startup navigation/search now that the UI exists.
                 if let Some(url) = self.start_url.take() {
@@ -1234,6 +1610,7 @@ impl ApplicationHandler<Wake> for ShellApp {
             WindowEvent::MouseWheel { delta, .. } => {
                 self.on_wheel(&delta);
             }
+            WindowEvent::PinchGesture { delta, .. } => self.zoom_by((delta as f32).exp()),
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -1251,11 +1628,15 @@ impl ApplicationHandler<Wake> for ShellApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
         self.drain_fetcher();
+        self.drain_layout();
+        self.poll_gpu();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
         // Drain in case events arrived without a wake (e.g. startup fetch).
         self.drain_fetcher();
+        self.drain_layout();
+        self.poll_gpu();
     }
 }

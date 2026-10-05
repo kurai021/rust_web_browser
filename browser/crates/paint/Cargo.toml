@@ -9,5 +9,25 @@ license.workspace = true
 default = ["simd"]
 simd = []
 
+[dependencies]
+layout = { path = "../layout", version = "0.1.0" }
+css = { path = "../css", version = "0.1.0" }
+cosmic-text = "0.12"
+image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+resvg = "0.45"
+roxmltree = "0.20"
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+url = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+html = { path = "../html", version = "0.1.0" }
+
+[[bench]]
+name = "composite"
+harness = false
+
 [lints]
 workspace = true

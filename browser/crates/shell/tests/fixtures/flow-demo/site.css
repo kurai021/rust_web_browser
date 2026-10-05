@@ -1,0 +1,25 @@
+html { background: #e9edf4; color: #1e293b; font-family: sans-serif; }
+body { margin: 0; }
+main { max-width: 720px; margin: 24px auto; padding: 0 24px; }
+header { padding: 24px; background: #17345d; color: white; border-radius: 12px; }
+h1 { font-size: 38px; margin: 12px 0; }
+h2 { font-size: 23px; margin: 0 0 16px; color: #17345d; }
+p { line-height: 1.5; margin: 14px 0; }
+.eyebrow { font-size: 12px; font-weight: bold; }
+figure { margin: 24px 0; }
+img { max-width: 100%; }
+figure img { display: block; width: 100%; height: auto; }
+figcaption { font-size: 13px; color: #4b5563; margin-top: 8px; }
+.card { background: white; border: 1px solid #cbd5e1; padding: 24px; margin: 24px 0; border-radius: 8px; }
+.highlight { color: #713f12; background: #fef3c7; padding: 0 4px; }
+a { color: #126abc; }
+.scrollbox { height: 120px; overflow: auto; border: 1px solid #91a3bb; padding: 8px; }
+pre { background: #edf2f7; padding: 12px; overflow: auto; font-size: 14px; }
+.generated::before { content: "[before] "; color: #047857; font-weight: bold; }
+.generated::after { content: " [after]"; color: #047857; }
+footer { text-align: center; padding: 12px; }
+@media (max-width: 500px) {
+  main { margin: 12px auto; padding: 0 12px; }
+  header, .card { padding: 16px; }
+  h1 { font-size: 28px; }
+}

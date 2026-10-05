@@ -22,8 +22,59 @@ pub struct Page {
     pub stylesheets: Vec<Stylesheet>,
     pub warnings: Vec<String>,
     pub(crate) font_cache: Arc<crate::fonts::FontCache>,
+    pub image_cache: Arc<paint::images::ImageCache>,
+    pub(crate) image_requests: Arc<tokio::sync::Mutex<crate::images::ImageRequests>>,
 }
 impl Page {
+    /// Embedded CSS is available on a partial DOM; linked sheets and images
+    /// continue loading independently. This never finalizes the HTML parser.
+    pub fn preview(head: &net::ResponseHead, document: Document) -> Self {
+        let base = document
+            .get_elements_by_tag_name("base")
+            .into_iter()
+            .find_map(|id| {
+                document
+                    .get_attribute(id, "href")
+                    .and_then(|raw| head.url.join(raw).ok())
+            })
+            .unwrap_or_else(|| head.url.clone());
+        let mut sheets = Vec::new();
+        let mut bytes = 0usize;
+        for id in document.get_elements_by_tag_name("style") {
+            if document
+                .get_attribute(id, "type")
+                .is_some_and(|t| !t.is_empty() && !t.eq_ignore_ascii_case("text/css"))
+            {
+                continue;
+            }
+            let text = document.text_content(id);
+            bytes = bytes.saturating_add(text.len());
+            if bytes > MAX_CSS_TOTAL_BYTES {
+                break;
+            }
+            let mut sheet = css::parse_stylesheet(&text, Some(&base));
+            if let Some(media) = document
+                .get_attribute(id, "media")
+                .filter(|s| !s.trim().is_empty())
+            {
+                sheet.rules = vec![Rule::Media(
+                    MediaQueryList::parse(media),
+                    std::mem::take(&mut sheet.rules),
+                )];
+            }
+            sheets.push(sheet);
+        }
+        Self {
+            url: head.url.clone(),
+            status: head.status,
+            document: Arc::new(document),
+            stylesheets: sheets,
+            warnings: Vec::new(),
+            font_cache: Arc::default(),
+            image_cache: Arc::default(),
+            image_requests: Arc::default(),
+        }
+    }
     pub fn computed_styles(&self, env: Environment) -> ComputedStyles {
         Cascade {
             environment: env,
@@ -36,11 +87,18 @@ impl Page {
 /// Load the document's CSS in document order, not request completion order.
 /// Invalid/failed sheets are isolated; the remaining page stays navigable.
 pub async fn load_page(client: &Client, fetched: Fetched) -> Page {
-    let document = Arc::new(html::parse_full(
-        &fetched.bytes,
-        &fetched.url,
-        html::ParseOpts::default(),
-    ));
+    let document = html::parse_full(&fetched.bytes, &fetched.url, html::ParseOpts::default());
+    load_page_from_document(client, fetched, document).await
+}
+
+/// The streaming navigation driver supplies the finished DOM, avoiding a
+/// second full HTML parse after progressive snapshots.
+pub async fn load_page_from_document(
+    client: &Client,
+    fetched: Fetched,
+    document: Document,
+) -> Page {
+    let document = Arc::new(document);
     let base = document
         .get_elements_by_tag_name("base")
         .into_iter()
@@ -133,6 +191,8 @@ pub async fn load_page(client: &Client, fetched: Fetched) -> Page {
         stylesheets: sheets,
         warnings: loader.warnings,
         font_cache: Arc::default(),
+        image_cache: Arc::default(),
+        image_requests: Arc::default(),
     }
 }
 

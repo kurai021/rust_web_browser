@@ -1,18 +1,20 @@
-//! `shell` — graphical navigation and Phase 3 HTML/CSS integration (plan/10).
+//! Graphical navigation, progressive HTML/CSS and Stage A painting (plan/10).
 //!
 //! Toolbar with back/forward/stop-reload buttons, an editable omnibox, a
-//! scrollable raw-source viewport and a status bar. The real page viewport
-//! (`paint`) and multi-tab UI land in later phases; the window, input and
-//! background-fetch plumbing built here are reused by them.
+//! flow viewport and status bar. Network/decode/layout stay off the UI thread;
+//! page-owned assets and revision IDs prevent stale navigation/resize results.
 
 pub mod app;
 pub mod article;
 pub mod fetcher;
 pub mod fonts;
 pub mod history;
+pub mod images;
+pub mod layout_worker;
 pub mod omnibox;
 pub mod page;
 pub mod text;
+pub mod viewport;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +40,10 @@ pub struct Options {
     pub fetch: FetchOptions,
     /// Profile dir for HSTS persistence (`None` = memory only).
     pub profile_dir: Option<PathBuf>,
+    /// Skip GPU initialization and use the same display list on softbuffer.
+    pub software_render: bool,
+    /// Emit local layout/frame counters; no telemetry or network reporting.
+    pub perf: bool,
 }
 
 /// Window startup failure.
@@ -60,13 +66,18 @@ pub fn run(options: Options) -> Result<(), ShellError> {
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = proxy.send_event(Wake::Fetch);
     });
-    let fetcher = Fetcher::spawn(options.fetch.clone(), options.profile_dir.clone(), wake);
+    let fetcher = Fetcher::spawn(
+        options.fetch.clone(),
+        options.profile_dir.clone(),
+        wake.clone(),
+    );
     let mut app = ShellApp::new(
         fetcher,
         options.start_url,
         options.start_allow_downgrade,
         options.start_search,
     );
+    app.configure_rendering(options.software_render, options.perf, wake);
     let _ = event_loop.run_app(&mut app);
     if let Some(fatal) = app.take_fatal() {
         app.shutdown();

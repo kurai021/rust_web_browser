@@ -9,7 +9,7 @@ pub mod error;
 pub mod hsts;
 pub mod url;
 
-pub use client::{Client, FetchOptions, Fetched, Progress};
+pub use client::{Client, FetchOptions, Fetched, Progress, ResponseHead};
 pub use error::{Error, TlsError};
 pub use hsts::HstsStore;
 pub use url::{classify_user_input, parse_url, UserInput};

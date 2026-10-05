@@ -59,6 +59,23 @@ documented maintenance exceptions, with replacement review tracked for Phase 11.
 Vulnerability advisories remain enforced. cargo-audit and cargo-deny now run
 locally and pass; maintenance-only cargo-audit warnings are recorded in Phase 3.
 
+## Phase 4 auxiliary dependencies (2026-10-05)
+
+| Dependency | License | Use |
+|---|---|---|
+| wgpu 24.0.5 | MIT OR Apache-2.0 | GPU window/compositing backend |
+| image 0.25.8 | MIT OR Apache-2.0 | Bounded PNG/JPEG/GIF/WebP decoding and test PNG encoding |
+| resvg/usvg 0.45.1 | MIT OR Apache-2.0 | SVG-as-image auxiliary renderer, not a web engine |
+| roxmltree 0.20.0 | MIT OR Apache-2.0 | SVG resource-budget preflight before geometry expansion |
+| bytemuck 1.25.2 | MIT OR Apache-2.0 OR Zlib | Typed GPU vertex uploads |
+| pollster 0.4.0 | MIT OR Apache-2.0 | GPU initialization on the dedicated setup thread |
+| unicode-bidi 0.3.18 | MIT OR Apache-2.0 | Rust bidi ordering of inline flow |
+
+No copyleft-only addition. Other direct dependencies reuse approved crates.
+SVG font fallback adds maintained-policy notices for the newer transitive
+rustybuzz/ttf-parser versions under the same documented maintenance exceptions.
+No vulnerability exemption was added; cargo-audit/cargo-deny remain enforced.
+
 ## Copyleft exception registry
 
 | Crate | Version | License | Anti-overengineering justification |

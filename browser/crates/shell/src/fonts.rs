@@ -395,7 +395,7 @@ pub fn install_fonts(
 }
 
 pub(crate) fn web_family(family: &str) -> String {
-    format!("__browser_web_{}", family.to_ascii_lowercase())
+    layout::text::web_family(family)
 }
 
 #[cfg(test)]

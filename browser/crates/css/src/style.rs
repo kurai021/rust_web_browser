@@ -364,6 +364,7 @@ fn build_initial_properties() -> Properties {
         ("max-width", "none"),
         ("max-height", "none"),
         ("box-sizing", "content-box"),
+        ("aspect-ratio", "auto"),
         ("overflow", "visible"),
         ("position", "static"),
         ("top", "auto"),
@@ -691,6 +692,20 @@ fn valid_longhand(name: &str, value: &[Token]) -> bool {
                 })
         }
         "box-sizing" => matches!(kw.as_str(), "content-box" | "border-box"),
+        "aspect-ratio" => {
+            if kw == "auto" {
+                return true;
+            }
+            let parts: Vec<_> = value.iter().filter(|t| **t != Token::Whitespace).collect();
+            let parts = if matches!(parts.first(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("auto"))
+            {
+                &parts[1..]
+            } else {
+                &parts[..]
+            };
+            matches!(parts, [Token::Number(n)] if n.is_finite() && *n > 0.0)
+                || matches!(parts, [Token::Number(n), Token::Delim('/'), Token::Number(d)] if n.is_finite() && d.is_finite() && *n > 0.0 && *d > 0.0)
+        }
         "overflow" => matches!(
             kw.as_str(),
             "visible" | "hidden" | "clip" | "scroll" | "auto"

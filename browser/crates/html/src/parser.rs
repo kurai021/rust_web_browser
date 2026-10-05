@@ -101,12 +101,15 @@ pub struct Parser {
     tokenizer: Tokenizer,
     /// Fragment context element (spec fragment case).
     fragment_context: Option<String>,
+    previous_cr: bool,
 }
 
 impl Parser {
     /// New parser. Nothing is parsed until input arrives.
     #[must_use]
     pub fn new(url: Url, sink: Box<dyn DomSink>, opts: crate::ParseOpts) -> Self {
+        let mut tokenizer = Tokenizer::new();
+        tokenizer.begin_stream();
         Self {
             url,
             opts,
@@ -118,8 +121,9 @@ impl Parser {
             suspended: false,
             eof_processed: false,
             tree: None,
-            tokenizer: Tokenizer::new(),
+            tokenizer,
             fragment_context: None,
+            previous_cr: false,
         }
     }
 
@@ -148,6 +152,18 @@ impl Parser {
         }
     }
 
+    /// A consistent partial DOM without injecting EOF or consuming the parser.
+    /// Used for progressive painting; encoding detection still waits for the
+    /// prescribed head prescan. Detached templates remain inert.
+    pub fn snapshot(&self) -> Option<Document> {
+        if !self.encoding_determined {
+            return None;
+        }
+        let mut document = self.tree.as_ref()?.document().clone();
+        enforce_attr_budget(&mut document, self.opts.max_attr_len);
+        Some(document)
+    }
+
     /// Pause token consumption (blocking `<script>` with scripting on).
     /// Buffered input waits; already-emitted tokens are unaffected.
     pub fn suspend_for_script(&mut self) {
@@ -168,6 +184,7 @@ impl Parser {
     pub fn finish(mut self) -> Document {
         self.finished_input = true;
         self.decode_available(true);
+        self.tokenizer.finish_input();
         self.suspended = false;
         self.drive();
         self.into_document()
@@ -195,7 +212,16 @@ impl Parser {
         let (_, read, _) = decoder.decode_to_string(&input, &mut output, final_chunk);
         self.raw.extend_from_slice(&input[read..]);
         // WHATWG preprocessing: CRLF/CR → LF.
-        let normalized = normalize_newlines(&output);
+        let previous_cr = self.previous_cr;
+        if !output.is_empty() {
+            self.previous_cr = output.ends_with('\r');
+        }
+        let output = if previous_cr {
+            output.strip_prefix('\n').unwrap_or(&output)
+        } else {
+            &output
+        };
+        let normalized = normalize_newlines(output);
         self.tokenizer.feed(&normalized);
     }
 
@@ -375,7 +401,7 @@ fn enforce_attr_budget(doc: &mut Document, max_attr_len: usize) {
 
 /// Sink for parser lifecycle events (script boundaries, token flow).
 /// All methods have no-op defaults; the shell overrides what it needs.
-pub trait DomSink {
+pub trait DomSink: Send {
     /// Called once per pulled token (progress/heartbeat hook).
     fn note_token(&mut self) {}
     /// Called when a blocking script suspends parsing.

@@ -9,5 +9,19 @@ license.workspace = true
 default = ["simd"]
 simd = []
 
+[dependencies]
+html = { path = "../html", version = "0.1.0" }
+css = { path = "../css", version = "0.1.0" }
+cosmic-text = "0.12"
+unicode-bidi = "0.3"
+url = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "flow"
+harness = false
+
 [lints]
 workspace = true

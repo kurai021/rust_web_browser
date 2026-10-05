@@ -76,6 +76,14 @@ pub struct Fetched {
     pub bytes: Vec<u8>,
 }
 
+/// Headers shared with the streaming HTML consumer before EOF.
+#[derive(Debug, Clone)]
+pub struct ResponseHead {
+    pub url: Url,
+    pub status: u16,
+    pub content_type: Option<String>,
+}
+
 /// HTTPS client with HSTS state.
 pub struct Client {
     inner: reqwest::Client,
@@ -132,6 +140,18 @@ impl Client {
         max_bytes: usize,
         on_progress: &mut (dyn FnMut(Progress) + Send),
     ) -> Result<Fetched, Error> {
+        self.fetch_stream_limited(url, max_bytes, &mut |_, _, progress| on_progress(progress))
+            .await
+    }
+
+    /// Decoded chunks reach the HTML parser as they arrive, under the same
+    /// body/redirect/deadline caps. No separate networking stack is involved.
+    pub async fn fetch_stream_limited(
+        &self,
+        url: &Url,
+        max_bytes: usize,
+        on_chunk: &mut (dyn FnMut(&ResponseHead, &[u8], Progress) + Send),
+    ) -> Result<Fetched, Error> {
         let max_bytes = max_bytes.min(self.options.max_body_bytes);
         let url = self.effective_url(url)?;
         let request = self
@@ -155,6 +175,11 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let total = response.content_length();
+        let head = ResponseHead {
+            url: final_url.clone(),
+            status,
+            content_type: content_type.clone(),
+        };
 
         let mut bytes = Vec::new();
         let mut downloaded = 0usize;
@@ -166,7 +191,7 @@ impl Client {
                 return Err(Error::BodyTooLarge { cap: max_bytes });
             }
             bytes.extend_from_slice(&chunk);
-            on_progress(Progress { downloaded, total });
+            on_chunk(&head, &chunk, Progress { downloaded, total });
         }
         Ok(Fetched {
             url: final_url,
@@ -187,16 +212,34 @@ impl Client {
         allow_downgrade: bool,
         on_progress: &mut (dyn FnMut(Progress) + Send),
     ) -> Result<Fetched, Error> {
-        match self.fetch(url, on_progress).await {
+        self.fetch_stream_with_http_fallback(url, allow_downgrade, &mut |_, _, progress| {
+            on_progress(progress)
+        })
+        .await
+    }
+
+    pub async fn fetch_stream_with_http_fallback(
+        &self,
+        url: &Url,
+        allow_downgrade: bool,
+        on_chunk: &mut (dyn FnMut(&ResponseHead, &[u8], Progress) + Send),
+    ) -> Result<Fetched, Error> {
+        match self
+            .fetch_stream_limited(url, self.options.max_body_bytes, on_chunk)
+            .await
+        {
             Ok(fetched) => Ok(fetched),
             Err(Error::Connect(_) | Error::Dns(_) | Error::Timeout(_))
                 if allow_downgrade && url.scheme() == "https" && !self.is_hsts_host(url) =>
             {
                 let mut plain = url.clone();
                 if plain.set_scheme("http").is_ok() {
-                    return self.fetch(&plain, on_progress).await;
+                    return self
+                        .fetch_stream_limited(&plain, self.options.max_body_bytes, on_chunk)
+                        .await;
                 }
-                self.fetch(url, on_progress).await
+                self.fetch_stream_limited(url, self.options.max_body_bytes, on_chunk)
+                    .await
             }
             Err(other) => Err(other),
         }

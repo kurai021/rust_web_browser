@@ -27,6 +27,8 @@ shell = { path = "crates/shell", version = "0.1.0" }
 net = { path = "crates/net", version = "0.1.0" }
 url = "2"
 tokio = { version = "1", features = ["rt", "macros"] }
+cosmic-text = "0.12"
+layout = { path = "crates/layout", version = "0.1.0" }
 
 [features]
 default = ["simd"]

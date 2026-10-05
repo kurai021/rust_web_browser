@@ -673,7 +673,7 @@ impl TreeBuilder {
             }
             let furthest_id = furthest.expect("checked");
             // Common ancestor (element above the formatting element).
-            let _common_ancestor = self.open_elements[stack_pos.saturating_sub(1)];
+            let common_ancestor = self.open_elements[stack_pos.saturating_sub(1)];
             // Step 8-12: bookmark + inner loop over nodes between.
             // Only nodes in the formatting list are cloned; any other node
             // between is dropped from the stack (spec inner loop).
@@ -699,9 +699,14 @@ impl TreeBuilder {
                     .iter()
                     .any(|entry| matches!(entry, FormatEntry::Element(id) if *id == node_id));
                 if inner > 3 && in_list {
-                    self.active_formatting.retain(
-                        |entry| !matches!(entry, FormatEntry::Element(id) if *id == node_id),
-                    );
+                    if let Some(pos) = self.active_formatting.iter().position(
+                        |entry| matches!(entry, FormatEntry::Element(id) if *id == node_id),
+                    ) {
+                        self.active_formatting.remove(pos);
+                        if pos < bookmark {
+                            bookmark = bookmark.saturating_sub(1);
+                        }
+                    }
                 }
                 let still_listed = self
                     .active_formatting
@@ -716,6 +721,11 @@ impl TreeBuilder {
                     NodeData::Element(el) => (el.tag_name.clone(), el.attributes.clone()),
                     _ => continue,
                 };
+                if self.doc.node_count() >= self.max_nodes {
+                    self.doc.truncated = Some(crate::dom::Truncated::TooManyNodes);
+                    self.stopped = true;
+                    return true;
+                }
                 let clone_id = self.doc.create_element(&tag, Namespace::Html);
                 if let NodeData::Element(ElementData {
                     attributes: ref mut target,
@@ -751,7 +761,7 @@ impl TreeBuilder {
             }
             // Step 13-15: move the last node under the common ancestor
             // (or foster-parent it out of table scope).
-            let common_id = self.open_elements[stack_pos.saturating_sub(1)];
+            let common_id = common_ancestor;
             self.doc.detach(last_node);
             match self.appropriate_for(common_id) {
                 FosterTarget::Before(table_id) => {
@@ -768,6 +778,11 @@ impl TreeBuilder {
                 NodeData::Element(el) => (el.tag_name.clone(), el.attributes.clone()),
                 _ => return true,
             };
+            if self.doc.node_count() >= self.max_nodes {
+                self.doc.truncated = Some(crate::dom::Truncated::TooManyNodes);
+                self.stopped = true;
+                return true;
+            }
             let new_format = self.doc.create_element(&tag, Namespace::Html);
             if let NodeData::Element(ElementData {
                 attributes: ref mut target,
@@ -787,7 +802,17 @@ impl TreeBuilder {
             }
             self.doc.append_child(furthest_id, new_format);
             // Step 17: fix the lists.
-            self.active_formatting.remove(formatting_pos);
+            // Inner-loop removals shift positions: re-find the stable NodeId.
+            if let Some(pos) = self
+                .active_formatting
+                .iter()
+                .position(|entry| matches!(entry, FormatEntry::Element(id) if *id == formatting_id))
+            {
+                self.active_formatting.remove(pos);
+                if pos < bookmark {
+                    bookmark = bookmark.saturating_sub(1);
+                }
+            }
             let bookmark = bookmark.min(self.active_formatting.len());
             self.active_formatting
                 .insert(bookmark, FormatEntry::Element(new_format));
@@ -1934,9 +1959,13 @@ impl TreeBuilder {
             }
             "p" => {
                 if !self.has_in_button_scope("p") {
-                    self.insert_element("p", &[]);
-                    // Reprocess per spec.
-                    return self.mode_in_body_end_tag(name);
+                    // The implied start tag must enter the open-element stack.
+                    // Inserting an unattached-to-stack <p> and reprocessing
+                    // forever was exposed by the Phase 4 streaming fuzzer.
+                    self.doc.error(0, "unmatched-p-end-tag");
+                    if self.insert_and_push("p", &[]).is_none() {
+                        return Step::Continue;
+                    }
                 }
                 self.close_p_in_button_scope();
                 Step::Continue

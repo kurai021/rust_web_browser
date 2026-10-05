@@ -73,6 +73,9 @@ pub struct Tokenizer {
     stashed: Option<Token>,
     /// Double-escape depth inside `<script><!--…`.
     escaped_depth: u32,
+    script_escaped: bool,
+    script_dashes: u8,
+    finished_input: bool,
     /// Collected errors.
     pub errors: Vec<ParseError>,
 }
@@ -96,6 +99,9 @@ impl Tokenizer {
             cdata_allowed: false,
             stashed: None,
             escaped_depth: 0,
+            script_escaped: false,
+            script_dashes: 0,
+            finished_input: true,
             errors: Vec::new(),
         }
     }
@@ -103,6 +109,15 @@ impl Tokenizer {
     /// Append decoded text (byte offsets stay stable).
     pub fn feed(&mut self, chunk: &str) {
         self.input.push_str(chunk);
+    }
+
+    /// The parser distinguishes temporary exhaustion from real EOF. Direct
+    /// one-shot tokenization keeps its original EOF behavior by default.
+    pub fn begin_stream(&mut self) {
+        self.finished_input = false;
+    }
+    pub fn finish_input(&mut self) {
+        self.finished_input = true;
     }
 
     /// True when all fed input is consumed.
@@ -115,6 +130,8 @@ impl Tokenizer {
     pub fn set_state_for_tag(&mut self, tag: &str) {
         self.last_start_tag = Some(tag.to_owned());
         self.escaped_depth = 0;
+        self.script_escaped = false;
+        self.script_dashes = 0;
         self.model = match tag {
             "textarea" | "title" => ContentModel::Rcdata,
             "style" | "iframe" | "noembed" | "noframes" | "noscript" | "xmp" => {
@@ -142,6 +159,9 @@ impl Tokenizer {
         if let Some(token) = self.stashed.take() {
             return token;
         }
+        if self.incomplete_markup() {
+            return Token::Eof;
+        }
         match self.model {
             ContentModel::Pcdata => self.data_state(),
             ContentModel::Rcdata => self.rcdata_state(),
@@ -152,6 +172,60 @@ impl Tokenizer {
     }
 
     // ---------- cursor helpers ----------
+
+    fn incomplete_markup(&self) -> bool {
+        if self.finished_input || self.model == ContentModel::Plaintext {
+            return false;
+        }
+        let rest = self.input.get(self.pos..).unwrap_or("");
+        if !rest.starts_with('<') {
+            return false;
+        }
+        if self.model != ContentModel::Pcdata {
+            let end = format!("</{}", self.last_start_tag.as_deref().unwrap_or(""));
+            let lower = rest
+                .get(..rest.len().min(end.len()))
+                .unwrap_or(rest)
+                .to_ascii_lowercase();
+            let end_prefix = end.starts_with(&lower) || lower == end;
+            let script_prefix = self.model == ContentModel::ScriptData
+                && ("<!--".starts_with(rest)
+                    || (self.script_escaped && "<script".starts_with(&rest.to_ascii_lowercase())));
+            if !end_prefix && !script_prefix {
+                return false;
+            }
+        }
+        if rest.starts_with("<!--") {
+            return self.model == ContentModel::Pcdata
+                && !rest.contains("-->")
+                && !rest.contains("--!>");
+        }
+        if self.cdata_allowed && rest.starts_with("<![CDATA[") {
+            return !rest.contains("]]>");
+        }
+        let mut quote = None;
+        for &ch in &rest.as_bytes()[1..] {
+            match (quote, ch) {
+                (Some(q), c) if q == c => quote = None,
+                (None, b'\'' | b'"') => quote = Some(ch),
+                (None, b'>') => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn incomplete_reference(&self) -> bool {
+        if self.finished_input {
+            return false;
+        }
+        let rest = self.input.get(self.pos + 1..).unwrap_or("");
+        if let Some(numeric) = rest.strip_prefix('#') {
+            let digits = numeric.strip_prefix(['x', 'X']).unwrap_or(numeric);
+            return digits.bytes().all(|b| b.is_ascii_hexdigit());
+        }
+        rest.len() <= 33 && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+    }
 
     fn peek(&mut self) -> Option<char> {
         if self.peeked.is_none() {
@@ -245,6 +319,9 @@ impl Tokenizer {
                     };
                 }
                 Some('&') => {
+                    if self.incomplete_reference() {
+                        return self.split_characters(out);
+                    }
                     self.bump();
                     match self.consume_char_ref(false) {
                         Some(text) => out.push_str(&text),
@@ -795,6 +872,13 @@ impl Tokenizer {
             self.rewind(after_lt);
             return EndTagAttempt::NotATag;
         }
+        if self
+            .peek()
+            .is_some_and(|ch| !Self::is_ws(ch) && ch != '/' && ch != '>')
+        {
+            self.rewind(after_lt);
+            return EndTagAttempt::NotATag;
+        }
         // Attributes on raw end tags are skipped per spec (with an error).
         loop {
             self.skip_ws();
@@ -805,15 +889,15 @@ impl Tokenizer {
                     return EndTagAttempt::Tag(Token::EndTag { name });
                 }
                 Some('/') => {
-                    let save = self.pos;
                     self.bump();
                     if self.peek() == Some('>') {
                         self.bump();
                         self.set_pcdata();
                         return EndTagAttempt::Tag(Token::EndTag { name });
                     }
-                    self.rewind(save);
-                    // Fall through to attribute skipping.
+                    // A non-closing solidus is a parse error but must still
+                    // advance; rewinding here left the probe in an infinite loop.
+                    self.error("unexpected-solidus-in-tag");
                     self.skip_raw_attribute();
                 }
                 None => {
@@ -887,6 +971,9 @@ impl Tokenizer {
             match self.peek() {
                 None => return self.split_characters(out),
                 Some('&') => {
+                    if self.incomplete_reference() {
+                        return self.split_characters(out);
+                    }
                     self.bump();
                     match self.consume_char_ref(false) {
                         Some(text) => out.push_str(&text),
@@ -894,6 +981,9 @@ impl Tokenizer {
                     }
                 }
                 Some('<') => {
+                    if self.incomplete_markup() {
+                        return self.split_characters(out);
+                    }
                     self.bump();
                     if let Some(token) = self.raw_less_than(&mut out, &expected) {
                         return token;
@@ -922,6 +1012,9 @@ impl Tokenizer {
             match self.peek() {
                 None => return self.split_characters(out),
                 Some('<') => {
+                    if self.incomplete_markup() {
+                        return self.split_characters(out);
+                    }
                     self.bump();
                     if let Some(token) = self.raw_less_than(&mut out, &expected) {
                         return token;
@@ -954,12 +1047,17 @@ impl Tokenizer {
         }
         let expected = self.last_start_tag.clone().unwrap_or_default();
         let mut out = String::new();
-        let mut escaped = false;
-        let mut dashes = 0u8;
+        let mut escaped = self.script_escaped;
+        let mut dashes = self.script_dashes;
         loop {
             match self.peek() {
-                None => return self.split_characters(out),
+                None => return self.split_script(out, escaped, dashes),
                 Some('<') => {
+                    self.script_escaped = escaped;
+                    self.script_dashes = dashes;
+                    if self.incomplete_markup() {
+                        return self.split_script(out, escaped, dashes);
+                    }
                     self.bump();
                     if !escaped && self.starts_with("!--") {
                         self.consume(3);
@@ -986,7 +1084,7 @@ impl Tokenizer {
                                 return token;
                             }
                             if !out.is_empty() && self.stashed.is_some() {
-                                return self.split_characters(out);
+                                return self.split_script(out, escaped, dashes);
                             }
                             continue;
                         }
@@ -998,19 +1096,25 @@ impl Tokenizer {
                         return token;
                     }
                     if !out.is_empty() && self.stashed.is_some() {
-                        return self.split_characters(out);
+                        return self.split_script(out, escaped, dashes);
                     }
                 }
                 Some('-') if escaped => {
                     self.bump();
                     out.push('-');
-                    dashes += 1;
+                    dashes = dashes.saturating_add(1);
                     if dashes >= 2 && self.peek() == Some('>') {
                         self.bump();
                         out.push('>');
                         escaped = false;
                         dashes = 0;
                     }
+                }
+                Some('>') if escaped && dashes >= 2 => {
+                    self.bump();
+                    out.push('>');
+                    escaped = false;
+                    dashes = 0;
                 }
                 Some('\0') => {
                     self.bump();
@@ -1027,6 +1131,12 @@ impl Tokenizer {
                 }
             }
         }
+    }
+
+    fn split_script(&mut self, out: String, escaped: bool, dashes: u8) -> Token {
+        self.script_escaped = escaped;
+        self.script_dashes = dashes;
+        self.split_characters(out)
     }
 
     /// `</script …>` probe honoring the escape depth.

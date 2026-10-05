@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Flow notebook — Phase 4</title>
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+<main>
+  <header><p class="eyebrow">RUST BROWSER / PHASE 4</p><h1>The flow notebook</h1><p>Nested boxes, shaped text and asynchronous images. Painted by the same display list on GPU and software.</p></header>
+  <figure><a href="second.html"><img src="landscape.svg" width="720" height="220" alt="A colorful mountain diagram"></a><figcaption>A local SVG-as-image. Its intrinsic aspect ratio survives a narrow resize.</figcaption></figure>
+  <section class="card"><h2>Readable documentation</h2><p>Flow keeps <strong>bold text</strong>, <em>italic text</em> and <span class="highlight">inline highlights</span> on a common baseline. A <a href="second.html">shaped link</a> remains clickable after wrapping and scrolling.</p><p>Margins between paragraphs collapse rather than adding twice. The section owns its background, border and padding instead of flattening into separate article paragraphs.</p></section>
+  <section class="card"><h2>Inline replaced content</h2><p>A tiny PNG <img width="24" height="24" alt="PNG dot" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/ABJqvP8EAgI4NVLPHwAAAABJRU5ErkJggg=="> shares the line with text. A missing image <img src="missing.png" alt="useful alternative text" width="160" height="26"> preserves its alternative text.</p><p class="bidi">English mixed with العربية and עברית — bidi shaping stays in Rust.</p></section>
+  <section class="card"><h2>A local scroll frame</h2><div class="scrollbox"><p>First local line.</p><p>Second local line, with a <a href="second.html">link inside overflow</a>.</p><p>Third local line.</p><p>Fourth local line.</p><p>Fifth local line.</p><p>Sixth local line.</p></div></section>
+  <section class="card"><h2>Whitespace and generated content</h2><pre>fn paint(list: &amp;DisplayList) {
+    // Scroll changes offsets, not layout.
+    composite(list);
+}</pre><p class="generated">The before/after content belongs to the render tree.</p></section>
+  <section class="card"><h2>More to scroll</h2><p>Wheel and PageDown move the viewport without re-layout. Ctrl+wheel and pinch scale the existing scene.</p><p>One paragraph.</p><p>Another paragraph.</p><p>A final paragraph before the footer.</p><ul><li>Block flow</li><li>Inline flow</li><li>Images and font fallback</li></ul></section>
+  <footer><p><a href="second.html">Continue to the second document →</a></p><p class="eyebrow">LOCAL FIXTURE · NO EXTERNAL REQUESTS</p></footer>
+</main>
+</body>
+</html>

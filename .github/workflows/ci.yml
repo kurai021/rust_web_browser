@@ -24,6 +24,11 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --no-default-features
+      - run: sudo apt-get install -y mesa-vulkan-drivers libegl1
+      - name: GPU and scalar display-list parity
+        env:
+          XDG_RUNTIME_DIR: /tmp
+        run: cargo test -p paint --test backends gpu_and_software_render_the_same_display_list -- --ignored --exact
 
   clippy:
     runs-on: ubuntu-latest
@@ -75,3 +80,32 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then seconds=3600; else seconds=300; fi
           cargo +nightly fuzz run parse fuzz/seeds -- -max_total_time="$seconds" -max_len=4096 -timeout=3 -rss_limit_mb=1536
+
+  image-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+      - run: cargo install cargo-fuzz --locked
+      - name: Bounded raster and SVG decoder fuzz smoke
+        working-directory: browser/crates/paint
+        env:
+          ASAN_OPTIONS: quarantine_size_mb=16
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then seconds=3600; else seconds=300; fi
+          cargo +nightly fuzz run image_decode fuzz/seeds -- -max_total_time="$seconds" -max_len=4096 -timeout=3 -rss_limit_mb=1536
+
+  html-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Streaming HTML parser fuzz smoke
+        working-directory: browser/crates/html
+        env:
+          ASAN_OPTIONS: quarantine_size_mb=16
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then seconds=3600; else seconds=300; fi
+          cargo +nightly fuzz run parse fuzz/seeds -- -max_total_time="$seconds" -max_len=8192 -timeout=3 -rss_limit_mb=1536

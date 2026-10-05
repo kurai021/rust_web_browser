@@ -1,18 +1,24 @@
-# browser — Graphical web browser in Rust (Phase 3)
+# browser — Graphical web browser in Rust (Phase 4)
 
 Sealed theoretical framework in `../plan/` (see `../plan/SEALED.md`, v1.2).
 Sequential phased implementation per `../plan/14-roadmap-phases.md`.
 
-## Current status: Phase 3 — CSS and computed styles
+## Current status: Phase 4 — Flow layout and GPU painting
 
-Cargo workspace with 12 component crates. `net`, `html`, `css` and `shell`
-now load and render structured HTML with CSS colors, typography, inline styles,
-simple margins/borders, responsive media rules and page-owned font sources.
-The other component crates remain the planned extension points.
+Cargo workspace with 12 component crates. `net`, `html`, `css`, `layout`,
+`paint` and `shell` now render nested block/inline flow, shaped text, generated
+content and asynchronous PNG/JPEG/GIF/WebP/SVG images. A backend-independent
+display list drives wgpu/Vulkan/GL and the software fallback. Page layout,
+glyph preparation and image decoding run on workers; scroll and pinch/Ctrl+wheel
+zoom change layer offsets/scale without re-layout. Resize re-evaluates CSS and
+queues a new flow layout, discarding obsolete revisions.
 
 Start the graphical browser with `cargo run -- https://example.com/`.
-`--headless-test` is only the test harness and also loads document CSS.
-Full flow layout/GPU painting is next (Phase 4).
+`--software-render` forces software presentation; GPU initialization is otherwise
+asynchronous with fallback on failure. `--perf` prints local frame/layout and
+first-paint counters. `--headless-test` is only the test harness and now fetches,
+lays out and paints HTML/CSS/images, reporting a deterministic pixel hash.
+JavaScript is next (Phase 5); flex/grid/positioning/tables are Phase 6.
 
 ## Layout
 
@@ -42,11 +48,30 @@ cargo deny check
 `codegen-units=16`, `panic=unwind`. `target-cpu=native` forbidden
 (plan/15 §15.3): SIMD uses runtime dispatch.
 
-## Local CSS demo
+## Local demos and performance
 
 Serve `crates/shell/tests/fixtures/css-demo/` over local HTTP, then open its
 URL in the browser. It demonstrates external/imported/embedded/inline CSS,
 inline typography, clickable links and the 500px media breakpoint.
 
+Serve `crates/shell/tests/fixtures/flow-demo/` for nested cards, intrinsic images,
+inline styling/bidi, generated content and an overflow scroll frame. Wheel,
+PageUp/PageDown and the document scrollbar scroll; Shift+wheel/horizontal
+touchpad deltas pan wide content. Ctrl+wheel and pinch scale the scene.
+
+```sh
+cargo run --release -- http://127.0.0.1:8764/ --perf
+cargo run --release -- http://127.0.0.1:8764/ --software-render --perf
+cargo bench -p layout --bench flow
+cargo bench -p paint --bench composite
+cargo run --release -p shell --example phase4_probe
+cargo test -p paint --test backends gpu_and_software_render_the_same_display_list -- --ignored --exact
+```
+
+Phase 4 is the measured Stage A implementation described in `crates/layout/README.md`
+and `crates/paint/README.md`. GIF/WebP decode their first frame. SVG-as-image
+uses local font fallback and rejects external resource references. Resource
+caps fail to visible alt/placeholder content rather than blocking the UI.
+
 CI lives at the repository root `.github/workflows/ci.yml`; Cargo commands
-run inside `browser/`. Evidence is under `../plan/evidence/phase-3/`.
+run inside `browser/`. Current evidence is under `../plan/evidence/phase-4/`.

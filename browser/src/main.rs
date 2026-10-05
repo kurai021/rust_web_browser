@@ -1,4 +1,4 @@
-//! `browser` binary — Phase 3 (plan/10 §10.2.11, plan/14 Phase 3).
+//! `browser` binary — Phase 4 (plan/10 §10.2.11, plan/14 Phase 4).
 //!
 //! `browser [url] [--profile-dir p] [--software-render] [--perf] [--headless-test url]`
 //! (`--headless-test` is a test harness only, never a product).
@@ -26,15 +26,15 @@ struct Args {
 fn print_help() {
     print!(
         "browser {VERSION}\n\
-         Graphical web browser in Rust (Phase 3: HTML and CSS)\n\
+         Graphical web browser in Rust (Phase 4: flow layout and GPU paint)\n\
          \n\
          Usage: browser [url] [options]\n\
          \n\
          Options:\n  \
            --profile-dir <dir>    Profile directory (HSTS cache)\n  \
-           --software-render      Force software rendering (default until Phase 4)\n  \
+           --software-render      Force the software display-list backend\n  \
            --perf                 Local performance counters\n  \
-           --headless-test <url>  Load HTML/CSS without a window (test harness)\n  \
+           --headless-test <url>  Load/layout/paint without a window (test harness)\n  \
            --help                 This help\n  \
            --version              Version\n"
     );
@@ -119,10 +119,20 @@ fn run_headless(url_text: &str, perf: bool) -> ExitCode {
         let styles = page.computed_styles(Default::default());
         let article =
             shell::article::article_from_styled_document(&page.document, &page.url, &styles);
-        Ok::<_, net::Error>((page, article, bytes))
+        let assets = shell::fonts::load_fonts(&client, &page, Default::default()).await;
+        shell::images::load_images(&client, &page, &styles, |_, _| {}).await;
+        let mut fonts = cosmic_text::FontSystem::new();
+        shell::fonts::install_fonts(&mut fonts, &assets);
+        let frame = shell::viewport::headless_frame(
+            &page,
+            &styles,
+            layout::Size::new(800.0, 600.0),
+            &mut fonts,
+        );
+        Ok::<_, net::Error>((page, article, bytes, frame))
     });
     match result {
-        Ok((page, article, bytes)) => {
+        Ok((page, article, bytes, frame)) => {
             println!(
                 "HEADLESS OK status={} url={} bytes={} elapsed={:?}",
                 page.status,
@@ -137,6 +147,7 @@ fn run_headless(url_text: &str, perf: bool) -> ExitCode {
                 page.warnings.len(),
                 article.title
             );
+            println!("HEADLESS LAYOUT boxes={} lines={} glyphs={} image_bytes={} paint_hash={:016x} layout_ms={:.3} paint_ms={:.3}", frame.layout.stats.boxes, frame.layout.stats.lines, frame.layout.stats.glyphs, page.image_cache.bytes(), frame.hash, frame.layout_ms, frame.paint_ms);
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -182,6 +193,8 @@ fn run(argv: &[String]) -> ExitCode {
         start_search,
         fetch: FetchOptions::default(),
         profile_dir: profile_dir_of(&args),
+        software_render: args.software_render,
+        perf: args.perf,
     };
     match shell::run(options) {
         Ok(()) => ExitCode::SUCCESS,
