@@ -1,0 +1,182 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/adblock-0560187603838d2d)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/browser-123a96a191eb8f65)
+
+running 8 tests
+test tests::double_url_is_error ... ok
+test tests::headless_test_stub ... ok
+test tests::bare_host_classifies_to_https_url ... ok
+test tests::no_args_opens_about_blank ... ok
+test tests::positional_url_and_flags ... ok
+test tests::profile_without_value_is_error ... ok
+test tests::unknown_flag_is_error ... ok
+test tests::words_classify_to_search ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/css-b300bb4fc99d2651)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/dom_bindings-ac77c20f2d09b49e)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/html-dc51fbcf216cade5)
+
+running 14 tests
+test dom::tests::detach_and_reparent ... ok
+test dom::tests::append_and_text_coalescing ... ok
+test entities::tests::basic_named ... ok
+test dom::tests::id_index_first_wins ... ok
+test entities::tests::legacy_blocked_in_attribute_before_equals ... ok
+test entities::tests::legacy_without_semicolon_in_text ... ok
+test entities::tests::longest_match_wins_over_unknown_tails ... ok
+test entities::tests::numeric_decimal_and_hex ... ok
+test entities::tests::numeric_edge_cases ... ok
+test parser::tests::hello_world ... ok
+test parser::tests::suspend_resume_roundtrip ... ok
+test parser::tests::utf16_bom_decodes ... ok
+test parser::tests::meta_charset_wins_over_utf8 ... ok
+test parser::tests::fuzz_smoke_no_panic_no_hang ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/wpt.rs (target/debug/deps/wpt-a4fcf932b1a5815a)
+
+running 2 tests
+test wpt_tree_local_suite ... ok
+test wpt_tokenizer_entities ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/parse.rs (target/debug/deps/parse-25401df08c56f38d)
+Gnuplot not found, using plotters backend
+Testing parse_1mb
+Success
+
+     Running unittests src/lib.rs (target/debug/deps/js-b7fc2bbaf2acce77)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/layout-fc851dac8f979e43)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/net-1d3bd7c5f7addeb3)
+
+running 18 tests
+test error::tests::dns_hint_detection ... ok
+test error::tests::finds_expired_in_chain ... ok
+test error::tests::finds_unknown_issuer_in_chain ... ok
+test error::tests::finds_wrong_host_in_chain ... ok
+test error::tests::no_tls_error_without_tls_markers ... ok
+test hsts::tests::expired_entries_do_not_apply ... ok
+test hsts::tests::malformed_headers_are_ignored ... ok
+test hsts::tests::include_subdomains_covers_children ... ok
+test hsts::tests::max_age_zero_removes ... ok
+test hsts::tests::records_and_matches_exact_host ... ok
+test url::tests::accepts_http_and_https ... ok
+test url::tests::classifies_absolute_urls ... ok
+test url::tests::plain_words_are_searches ... ok
+test hsts::tests::missing_or_corrupt_file_gives_empty_store ... ok
+test url::tests::rejects_ftp_and_other_schemes ... ok
+test url::tests::rejects_garbage ... ok
+test url::tests::upgrades_bare_hosts_to_https ... ok
+test hsts::tests::save_and_load_roundtrip ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fetch_local.rs (target/debug/deps/fetch_local-5b5011390c887633)
+
+running 9 tests
+test http_error_status_surfaces ... ok
+test get_ok_reports_progress ... ok
+test body_cap_guards_zip_bombs ... ok
+test closed_port_is_a_connect_error ... ok
+test gzip_is_decoded ... ok
+test hsts_upgrades_plain_http ... ok
+test follows_redirect_chain ... ok
+test too_many_redirects_errors ... ok
+test slow_server_hits_total_timeout ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/fetch_online.rs (target/debug/deps/fetch_online-136ec445b981b386)
+
+running 5 tests
+test expired_cert_maps ... ignored
+test fetches_example_com ... ignored
+test http_to_https_redirect_followed ... ignored
+test self_signed_maps_to_unknown_issuer ... ignored
+test wrong_host_maps ... ignored
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/paint-027a9ea5df33fbb9)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/profile-2e610ea5924b11a0)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/shell-0b6950536be28ee8)
+
+running 15 tests
+test history::tests::empty_history_has_no_current ... ok
+test article::tests::lists_and_pre ... ok
+test article::tests::headings_paragraphs_and_title ... ok
+test article::tests::tables_become_row_blocks ... ok
+test history::tests::navigate_and_walk_back_forward ... ok
+test history::tests::new_navigation_clears_forward ... ok
+test omnibox::tests::caret_moves_by_chars_not_bytes ... ok
+test omnibox::tests::insert_and_backspace ... ok
+test article::tests::links_resolve_relative ... ok
+test omnibox::tests::select_all_replaces_on_type ... ok
+test omnibox::tests::set_text_parks_caret_at_end ... ok
+test text::tests::blend_rect_respects_alpha ... ok
+test text::tests::fill_rect_clips_to_canvas ... ok
+test text::tests::packs_rgb_channels ... ok
+test article::tests::link_overlay_roundtrip ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running unittests src/lib.rs (target/debug/deps/test_utils-b0f6d3b2132c9bf3)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/web_api-06e698b36d011e22)
+
+running 1 test
+test tests::stub_active ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

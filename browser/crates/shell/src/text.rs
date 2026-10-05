@@ -84,7 +84,6 @@ pub struct TextBuffer {
     color: Color,
     wrap: Wrap,
 }
-
 impl TextBuffer {
     /// New buffer with fixed metrics. Requires the app `FontSystem`.
     pub fn with_metrics(font_system: &mut FontSystem, font_size: f32, wrap: Wrap) -> Self {
@@ -140,6 +139,11 @@ impl TextBuffer {
         height
     }
 
+    /// Ink color for the next draws.
+    pub fn set_color(&mut self, color: Color) {
+        self.color = color;
+    }
+
     /// Width of the first laid-out line (caret measurement for single-line boxes).
     pub fn first_line_width(&mut self, font_system: &mut FontSystem) -> f32 {
         self.buffer.shape_until_scroll(font_system, false);
@@ -148,6 +152,99 @@ impl TextBuffer {
             .next()
             .map(|run| run.line_w)
             .unwrap_or(0.0)
+    }
+
+    /// Top offset of the first laid-out line (overlay alignment).
+    pub fn first_line_top(&mut self, font_system: &mut FontSystem) -> Option<f32> {
+        self.buffer.shape_until_scroll(font_system, false);
+        self.buffer.layout_runs().next().map(|run| run.line_top)
+    }
+
+    /// Byte offset of line starts in the current text (for hit-testing).
+    fn line_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.buffer.lines.len() + 1);
+        let mut offset = 0usize;
+        for line in &self.buffer.lines {
+            offsets.push(offset);
+            offset += line.text().len() + 1;
+        }
+        offsets.push(offset);
+        offsets
+    }
+
+    /// Map a buffer-local hit to a byte offset in the text.
+    pub fn hit_offset(&mut self, font_system: &mut FontSystem, x: f32, y: f32) -> Option<usize> {
+        self.buffer.shape_until_scroll(font_system, false);
+        let cursor = self.buffer.hit(x, y)?;
+        let offsets = self.line_offsets();
+        let line_start = *offsets.get(cursor.line)?;
+        let line_len = self.buffer.lines.get(cursor.line)?.text().len();
+        Some(line_start + cursor.index.min(line_len))
+    }
+
+    /// Visual fragments of the byte range `[start, end)`: one per wrapped
+    /// line as `(x, line_top, baseline, width, slice)`.
+    ///
+    /// Call after the buffer was fully shaped (e.g. right after
+    /// `full_height`); this also forces a full shape pass to be safe.
+    /// Slice shaping may differ sub-pixel from in-context shaping at run
+    /// boundaries; good enough for link overlays (documented, Phase 2).
+    pub fn link_fragments(
+        &mut self,
+        font_system: &mut FontSystem,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> Vec<(f32, f32, f32, f32, String)> {
+        let saved_scroll = self.buffer.scroll();
+        let (saved_w, saved_h) = self.buffer.size();
+        self.buffer
+            .set_scroll(cosmic_text::Scroll::new(0, 0.0, 0.0));
+        // Tall box lays out every line in one pass.
+        if let Some(w) = saved_w {
+            self.buffer
+                .set_size(font_system, Some(w), Some(1_000_000.0));
+        }
+        self.buffer.shape_until_scroll(font_system, false);
+        let mut fragments = Vec::new();
+        let offsets = self.line_offsets();
+        for run in self.buffer.layout_runs() {
+            let line_start = offsets.get(run.line_i).copied().unwrap_or(0);
+            let line_text = self
+                .buffer
+                .lines
+                .get(run.line_i)
+                .map(|line| line.text())
+                .unwrap_or("");
+            let (run_start, run_end) = glyph_byte_range(&run);
+            let piece_start = start.max(line_start + run_start);
+            let piece_end = end.min(line_start + run_end);
+            if piece_start >= piece_end {
+                continue;
+            }
+            let slice = text.get(piece_start..piece_end).unwrap_or("").to_owned();
+            if slice.is_empty() {
+                continue;
+            }
+            let run_x = run
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.x)
+                .fold(f32::INFINITY, f32::min);
+            let run_x = if run_x.is_finite() { run_x } else { 0.0 };
+            // Prefix measured from the RUN start (visual line), not the
+            // logical line start: wrapped runs share one BufferLine.
+            let prefix_end = piece_start - line_start;
+            let from = run_start.min(prefix_end).min(line_text.len());
+            let to = prefix_end.min(line_text.len());
+            let prefix = &line_text[from..to];
+            let dx = measure_slice(font_system, prefix, self.buffer.metrics());
+            let width = measure_slice(font_system, &slice, self.buffer.metrics());
+            fragments.push((run_x + dx, run.line_top, run.line_y, width, slice));
+        }
+        self.buffer.set_size(font_system, saved_w, saved_h);
+        self.buffer.set_scroll(saved_scroll);
+        fragments
     }
 
     /// Paint glyphs at `(offset_x, offset_y)` clipped to `canvas`.
@@ -168,6 +265,35 @@ impl TextBuffer {
                 tmp.blend_rect(x + offset_x, y + offset_y, rw, rh, (r, g, b, a));
             });
     }
+}
+
+/// Byte range in the line covered by a run's glyphs.
+fn glyph_byte_range(run: &cosmic_text::LayoutRun<'_>) -> (usize, usize) {
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    for glyph in run.glyphs {
+        start = start.min(glyph.start);
+        end = end.max(glyph.end);
+    }
+    if end <= start {
+        (0, 0)
+    } else {
+        (start, end)
+    }
+}
+
+/// Advance width of `text` on one unwrapped line with the given metrics.
+fn measure_slice(font_system: &mut FontSystem, text: &str, metrics: cosmic_text::Metrics) -> f32 {
+    let mut scratch = Buffer::new(font_system, metrics);
+    scratch.set_wrap(font_system, Wrap::None);
+    scratch.set_size(font_system, Some(100_000.0), Some(metrics.line_height));
+    scratch.set_text(font_system, text, Attrs::new(), Shaping::Advanced);
+    scratch.shape_until_scroll(font_system, false);
+    scratch
+        .layout_runs()
+        .next()
+        .map(|run| run.line_w)
+        .unwrap_or(0.0)
 }
 
 /// Shared glyph cache for all text buffers.

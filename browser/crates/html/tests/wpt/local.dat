@@ -1,0 +1,543 @@
+#data
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+
+#data
+hello
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     "hello"
+
+#data
+<!DOCTYPE html><title>T</title><p>Hello</p>
+#errors
+#document
+| <!DOCTYPE html>
+| <html>
+|   <head>
+|     <title>
+|       "T"
+|   <body>
+|     <p>
+|       "Hello"
+
+#data
+<p>a<p>b
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "a"
+|     <p>
+|       "b"
+
+#data
+<li>a<li>b
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <li>
+|       "a"
+|     <li>
+|       "b"
+
+#data
+<dl><dt>a<dd>b<dt>c<dd>d</dl>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <dl>
+|       <dt>
+|         "a"
+|       <dd>
+|         "b"
+|       <dt>
+|         "c"
+|       <dd>
+|         "d"
+
+#data
+<h1>a<h2>b
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <h1>
+|       "a"
+|     <h2>
+|       "b"
+
+#data
+<div><p></div>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       <p>
+
+#data
+<b><i></b></i>
+#errors
+(1:1): unexpected-end-tag
+#document
+| <html>
+|   <head>
+|   <body>
+|     <b>
+|       <i>
+
+#data
+<a>1<b>2</a>3</b>4
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <a>
+|       "1"
+|       <b>
+|         "2"
+|     <b>
+|       "3"
+|     "4"
+
+#data
+<b><div>X</b>Y
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <b>
+|     <div>
+|       <b>
+|         "X"
+|       "Y"
+
+#data
+<a href=x>y<a href=z>w
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <a href="x">
+|       "y"
+|     <a href="z">
+|       "w"
+
+#data
+<table>foo<tr><td>bar</td></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     "foo"
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "bar"
+
+#data
+<table><td>x</td></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "x"
+
+#data
+<table><tbody><tr><td>a<td>b</tr></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "a"
+|           <td>
+|             "b"
+
+#data
+<table><caption>c</caption><tr><td>x</table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <caption>
+|         "c"
+|       <tbody>
+|         <tr>
+|           <td>
+|             "x"
+
+#data
+<table><colgroup><col></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <colgroup>
+|         <col>
+
+#data
+<select><option>a<option>b</select>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+|       <option>
+|         "a"
+|       <option>
+|         "b"
+
+#data
+<select><table><tr><td>x</select>
+#errors
+(1:1): unexpected-table-part-in-select
+(1:1): unexpected-end-tag
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "x"
+
+#data
+<!-- hi --><p>x</p>
+#errors
+#document
+| <!-- hi -->
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "x"
+
+#data
+<p>&amp; &lt; &#65; &#x42; &copy;</p>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "& < A B ©"
+
+#data
+<script>if (a<b) { c&amp;d; }</script>
+#errors
+#document
+| <html>
+|   <head>
+|     <script>
+|       "if (a<b) { c&amp;d; }"
+
+#data
+<style>a & b { color: red; }</style>
+#errors
+#document
+| <html>
+|   <head>
+|     <style>
+|       "a & b { color: red; }"
+|   <body>
+
+#data
+<title>a &amp; b</title>
+#errors
+#document
+| <html>
+|   <head>
+|     <title>
+|       "a & b"
+|   <body>
+
+#data
+<textarea>a<b>c</textarea>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <textarea>
+|       "a<b>c"
+
+#data
+<template><div>x</div></template>
+#errors
+#document
+| <html>
+|   <head>
+|     <template>
+|     content
+|       <div>
+|         "x"
+|   <body>
+
+#data
+<svg><g></g></svg>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <svg svg>
+|       <svg g>
+
+#data
+<math><mi>x</mi></math>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <math math>
+|       <math mi>
+|         "x"
+
+#data
+<svg><![CDATA[<g>]]></svg>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <svg svg>
+|       "<g>"
+
+#data
+<svg><foreignObject><div>x</div></foreignObject></svg>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <svg svg>
+|       <svg foreignObject>
+|         <div>
+|           "x"
+
+#data
+<div><svg viewBox="0 0 1 1"><path /></svg></div>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       <svg svg viewBox="0 0 1 1">
+|         <svg path>
+
+#data
+<p><button>x</button>y
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       <button>
+|         "x"
+|       "y"
+
+#data
+<pre>
+abc</pre>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <pre>
+|       "abc"
+
+#data
+<br><hr><img src=x><wbr>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <br>
+|     <hr>
+|     <img src="x">
+|     <wbr>
+
+#data
+<image>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <img>
+
+#data
+<isindex>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <isindex>
+
+#data
+<a href="a" href="b">x</a>
+#errors
+(1:1): duplicate-attribute
+#document
+| <html>
+|   <head>
+|   <body>
+|     <a href="a">
+|       "x"
+
+#data
+<DIV CLASS=x><P>Hi</P></DIV>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div class="x">
+|       <p>
+|         "Hi"
+
+#data
+</div><p>x
+#errors
+(1:1): unexpected-end-tag
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "x"
+
+#data
+<ul><li>a<ul><li>b</ul><li>c</ul>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <ul>
+|       <li>
+|         "a"
+|         <ul>
+|           <li>
+|             "b"
+|       <li>
+|         "c"
+
+#data
+<table><tr><td>a<td>b</tr><tr><td>c</table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "a"
+|           <td>
+|             "b"
+|         <tr>
+|           <td>
+|             "c"
+
+#data
+<p>1<table>2<tr><td>3</table>4
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "1"
+|       "2"
+|       <table>
+|         <tbody>
+|           <tr>
+|             <td>
+|               "3"
+|       "4"
+
+#data
+<!DOCTYPE html><p>1<table>2<tr><td>3</table>4
+#errors
+#document
+| <!DOCTYPE html>
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "1"
+|     "2"
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "3"
+|     "4"
+
+#data
+<b>1<p>2</b>3
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <b>
+|       "1"
+|     <p>
+|       <b>
+|         "2"
+|       "3"
+
+#data
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN">
+#errors
+#document
+| <!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN">
+| <html>
+|   <head>
+|   <body>

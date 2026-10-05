@@ -11,6 +11,7 @@ simd = []
 
 [dependencies]
 net = { path = "../net" }
+html = { path = "../html" }
 url = "2"
 winit = "0.30"
 softbuffer = "0.4"

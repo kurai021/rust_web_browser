@@ -29,6 +29,14 @@ All permissive; no copyleft exception needed.
 
 Transitive note: `self_cell` 1.3.0 (via cosmic-text) is dual `Apache-2.0 OR GPL-2.0-only` — used under Apache-2.0, no exception required. Full-tree scan on 2026-10-04 found no GPL-only crates in `browser/Cargo.lock`.
 
+## Direct workspace dependencies added in Phase 2 (2026-10-04)
+
+| Crate | Version | License | Note |
+|-------|---------|---------|------|
+| encoding_rs | 0.8 | MIT OR Apache-2.0 | Mandated by plan/05 §5.2 |
+| criterion | 0.5 | MIT OR Apache-2.0 | dev-dependency (benches only) |
+| libfuzzer-sys | 0.4 | MIT OR Apache-2.0 | fuzz harness only, nightly, never in the binary |
+
 ## Copyleft exceptions (GPL/AGPL/LGPL)
 
 | Crate | Version | License | Anti-overengineering justification |

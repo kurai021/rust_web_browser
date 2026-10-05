@@ -17,6 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes};
 
+use crate::article::{Article, Block, BlockView};
 use crate::fetcher::{resolve_input, Command, FetchEvent, Fetcher};
 use crate::history::History;
 use crate::omnibox::Omnibox;
@@ -45,27 +46,38 @@ const ACCENT: u32 = rgb(0x0B, 0x5D, 0xC2);
 const BORDER: u32 = rgb(0xC8, 0xC8, 0xC8);
 const TRACK: u32 = rgb(0xD8, 0xD8, 0xD8);
 const THUMB: u32 = rgb(0xA0, 0xA0, 0xA0);
+const SELECT_BG: u32 = rgb(0xBB, 0xD7, 0xFF);
 
-const WELCOME_TEXT: &str = "\
-browser — Phase 1
+/// Built-in welcome article (also serves for `about:blank`).
+fn welcome_article() -> Article {
+    Article {
+        title: Some("Welcome".to_owned()),
+        blocks: vec![
+            Block::Heading { level: 1, text: "browser — Phase 2".to_owned(), links: Vec::new() },
+            Block::Paragraph {
+                text: "This window renders pages as structured text: headings, paragraphs, lists and links. Styling lands with CSS in Phase 3.".to_owned(),
+                links: Vec::new(),
+            },
+            Block::Heading { level: 2, text: "Try".to_owned(), links: Vec::new() },
+            Block::ListItem { depth: 1, text: "example.com".to_owned(), links: Vec::new() },
+            Block::ListItem { depth: 1, text: "https://example.com/".to_owned(), links: Vec::new() },
+            Block::ListItem { depth: 1, text: "about:blank (this page)".to_owned(), links: Vec::new() },
+            Block::Heading { level: 2, text: "Shortcuts".to_owned(), links: Vec::new() },
+            Block::Paragraph {
+                text: "Click a link to follow it. Ctrl+L focuses the address bar, Enter loads, Esc stops or unfocuses, Ctrl+R reloads, Alt+Left/Right moves through history, wheel and PgUp/PgDn scroll.".to_owned(),
+                links: Vec::new(),
+            },
+        ],
+    }
+}
 
-This window shows the raw fetched source of a page (HTML parsing lands in Phase 2).
-
-Try:
-  example.com
-  https://example.com/
-  about:blank (this page)
-
-Shortcuts:
-  Ctrl+L focus address bar · Enter load · Esc stop/unfocus
-  Ctrl+R reload · Alt+Left/Right back/forward · wheel/PgUp/PgDn scroll";
-
-/// What the viewport currently shows.
-#[derive(Debug, Clone)]
+/// What the viewport currently shows (status semantics; the pixels come
+/// from `article` + `blocks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Welcome,
-    Document { text: String },
-    Error { text: String },
+    Document,
+    Error,
 }
 
 /// Loading progress mirrored from worker events.
@@ -96,7 +108,6 @@ pub struct ShellApp {
 
     font_system: cosmic_text::FontSystem,
     text_renderer: TextRenderer,
-    viewport_text: TextBuffer,
     omnibox_text: TextBuffer,
     omnibox_prefix: TextBuffer,
     status_text: TextBuffer,
@@ -105,11 +116,13 @@ pub struct ShellApp {
     omnibox: Omnibox,
     omnibox_focused: bool,
     view: View,
+    article: Article,
+    blocks: Vec<BlockView>,
     load: LoadState,
     pending_history: bool,
     scroll_y: f32,
     content_h: f32,
-    content_measured_for: Option<(u64, u32, u32)>,
+    content_measured_for: Option<(u64, u32)>,
     content_version: u64,
 
     mouse_x: f64,
@@ -131,8 +144,6 @@ impl ShellApp {
     ) -> Self {
         let mut font_system = cosmic_text::FontSystem::new();
         let text_renderer = TextRenderer::new();
-        let viewport_text =
-            TextBuffer::with_metrics(&mut font_system, 15.0, cosmic_text::Wrap::Word);
         let omnibox_text =
             TextBuffer::with_metrics(&mut font_system, 15.0, cosmic_text::Wrap::None);
         let omnibox_prefix =
@@ -147,7 +158,6 @@ impl ShellApp {
             fatal_init: None,
             font_system,
             text_renderer,
-            viewport_text,
             omnibox_text,
             omnibox_prefix,
             status_text,
@@ -155,6 +165,8 @@ impl ShellApp {
             omnibox: Omnibox::new(),
             omnibox_focused: true,
             view: View::Welcome,
+            article: welcome_article(),
+            blocks: Vec::new(),
             load: LoadState::Idle,
             pending_history: false,
             scroll_y: 0.0,
@@ -169,8 +181,7 @@ impl ShellApp {
             start_allow_downgrade,
             start_search,
         };
-        app.viewport_text
-            .set_text(&mut app.font_system, WELCOME_TEXT);
+        app.set_article(welcome_article(), View::Welcome);
         app
     }
 
@@ -228,7 +239,7 @@ impl ShellApp {
     fn reload(&mut self) {
         if let Some(url) = self.history.current().cloned() {
             self.start_fetch(url, false, false);
-        } else if matches!(self.view, View::Error { .. }) {
+        } else if matches!(self.view, View::Error) {
             self.show_welcome();
         }
     }
@@ -262,26 +273,51 @@ impl ShellApp {
         self.scroll_y = 0.0;
     }
 
+    /// Swap the article, reset scroll and schedule a rebuild.
+    fn set_article(&mut self, article: Article, view: View) {
+        self.view = view;
+        self.article = article;
+        self.bump_content();
+    }
+
+    /// Rebuild laid-out blocks at `width` px.
+    fn rebuild_blocks(&mut self, width: f32) {
+        let mut y = 10.0;
+        let mut blocks = Vec::with_capacity(self.article.blocks.len());
+        for block in &self.article.blocks {
+            let mut view = BlockView::layout(&mut self.font_system, block, width, y);
+            view.y = y;
+            y += view.height;
+            blocks.push(view);
+        }
+        self.blocks = blocks;
+        self.content_h = y + 10.0;
+    }
+
     fn show_welcome(&mut self) {
         self.load = LoadState::Idle;
-        self.view = View::Welcome;
-        self.viewport_text
-            .set_text(&mut self.font_system, WELCOME_TEXT);
+        self.set_article(welcome_article(), View::Welcome);
         self.omnibox.set_text("");
-        self.bump_content();
         self.update_title();
         self.request_redraw();
     }
 
     fn show_search_stub(&mut self, query: &str) {
         // Search engine wiring lands in Phase 9 (plan/01.3.6).
-        let text = format!(
-            "[SEARCH]\nQuery: {query}\n\nWeb search needs a configured search engine (Phase 9).\nType a URL like example.com instead."
-        );
+        let article = Article {
+            title: Some("Search".to_owned()),
+            blocks: vec![
+                Block::Heading { level: 1, text: "Search".to_owned(), links: Vec::new() },
+                Block::Paragraph {
+                    text: format!(
+                        "Query: {query}\n\nWeb search needs a configured search engine (Phase 9).\nType a URL like example.com instead."
+                    ),
+                    links: Vec::new(),
+                },
+            ],
+        };
         self.load = LoadState::Idle;
-        self.view = View::Error { text: text.clone() };
-        self.viewport_text.set_text(&mut self.font_system, &text);
-        self.bump_content();
+        self.set_article(article, View::Error);
         self.update_title();
         self.request_redraw();
     }
@@ -327,24 +363,19 @@ impl ShellApp {
             self.history.navigate(fetched.url.clone());
         }
         self.pending_history = false;
-        let size = format_bytes(fetched.bytes.len());
-        let ctype = fetched.content_type.as_deref().unwrap_or("unknown type");
-        let mut text = format!(
-            "URL: {}\nStatus: {} · {} · {}\n{}\n",
-            fetched.url.as_str(),
-            fetched.status,
-            ctype,
-            size,
-            "─".repeat(60)
-        );
+        let doc = html::parse_full(&fetched.bytes, &fetched.url, html::ParseOpts::default());
+        let mut article = crate::article::article_from_document(&doc, &fetched.url);
         if requested.as_str() != fetched.url.as_str() {
-            text.insert_str(0, &format!("(redirected from {})\n", requested.as_str()));
+            article.blocks.insert(
+                0,
+                Block::Paragraph {
+                    text: format!("(redirected from {})", requested.as_str()),
+                    links: Vec::new(),
+                },
+            );
         }
-        text.push_str(&String::from_utf8_lossy(&fetched.bytes));
-        self.view = View::Document { text: text.clone() };
-        self.viewport_text.set_text(&mut self.font_system, &text);
+        self.set_article(article, View::Document);
         self.omnibox.set_text(fetched.url.as_str());
-        self.bump_content();
         self.update_title();
     }
 
@@ -364,10 +395,21 @@ impl ShellApp {
                 "Check your connection and the address, then Reload (Ctrl+R) or go Back (Alt+Left).",
             ),
         };
-        let text = format!("{title}\nURL: {}\n\n{err}\n\n{advice}", url.as_str());
-        self.view = View::Error { text: text.clone() };
-        self.viewport_text.set_text(&mut self.font_system, &text);
-        self.bump_content();
+        let article = Article {
+            title: Some(title.clone()),
+            blocks: vec![
+                Block::Heading {
+                    level: 1,
+                    text: title,
+                    links: Vec::new(),
+                },
+                Block::Paragraph {
+                    text: format!("URL: {}\n\n{err}\n\n{advice}", url.as_str()),
+                    links: Vec::new(),
+                },
+            ],
+        };
+        self.set_article(article, View::Error);
         self.update_title();
     }
 
@@ -377,10 +419,19 @@ impl ShellApp {
             LoadState::Loading { url, .. } => {
                 format!("browser — {} (loading…)", host_or_url(url))
             }
-            LoadState::Idle => match self.history.current() {
-                Some(url) => format!("browser — {}", host_or_url(url)),
-                None => "browser".to_owned(),
-            },
+            LoadState::Idle => {
+                let host = self
+                    .history
+                    .current()
+                    .map(host_or_url)
+                    .unwrap_or_else(|| "browser".to_owned());
+                match (&self.view, &self.article.title) {
+                    (View::Document, Some(doc_title)) if !doc_title.is_empty() => {
+                        format!("{doc_title} — {host}")
+                    }
+                    _ => format!("browser — {host}"),
+                }
+            }
         };
         window.set_title(&title);
     }
@@ -415,8 +466,7 @@ impl ShellApp {
         if ctrl && !alt {
             match &event.logical_key {
                 Key::Character(ch) if ch.as_str() == "l" || ch.as_str() == "L" => {
-                    self.omnibox_focused = true;
-                    self.request_redraw();
+                    self.focus_omnibox();
                     return;
                 }
                 Key::Character(ch) if ch.as_str() == "r" || ch.as_str() == "R" => {
@@ -451,6 +501,13 @@ impl ShellApp {
         } else {
             self.on_key_viewport(event);
         }
+    }
+
+    /// Focus the address bar with its content selected.
+    fn focus_omnibox(&mut self) {
+        self.omnibox_focused = true;
+        self.omnibox.select_all();
+        self.request_redraw();
     }
 
     fn on_key_omnibox(&mut self, event: &KeyEvent) {
@@ -558,11 +615,10 @@ impl ShellApp {
                 return;
             }
         }
-        // Omnibox focus.
+        // Omnibox focus (selects all, like desktop browsers).
         let (x, y, w, h) = layout.omnibox_rect;
         if mx >= x && mx < x + w && my >= y && my < y + h {
-            self.omnibox_focused = true;
-            self.request_redraw();
+            self.focus_omnibox();
             return;
         }
         // Scrollbar drag (viewport area).
@@ -573,8 +629,28 @@ impl ShellApp {
             self.drag_scroll_to(my);
             return;
         }
+        // Viewport text click: follow links.
+        let (vx, vy, vw, vh) = self.viewport_rect();
+        if mx >= vx && mx < vx + vw - SCROLLBAR_W && my >= vy && my < vy + vh {
+            let content_y = my as f32 - vy as f32 + self.scroll_y - 10.0;
+            if let Some(href) = self.hit_link(mx as f32 - vx as f32 - 12.0, content_y) {
+                self.omnibox.set_text(href.as_str());
+                self.start_fetch(href, false, true);
+                return;
+            }
+        }
         self.omnibox_focused = false;
         self.request_redraw();
+    }
+
+    /// Link under viewport-content point `(x, y)` (content coords).
+    fn hit_link(&mut self, x: f32, y: f32) -> Option<Url> {
+        for block in &mut self.blocks {
+            if y >= block.y && y < block.y + block.height {
+                return block.hit_link(&mut self.font_system, x, y - block.y);
+            }
+        }
+        None
     }
 
     fn drag_scroll_to(&mut self, mouse_y: i32) {
@@ -655,11 +731,9 @@ impl ShellApp {
         };
         // Phase A: mutate text buffers and compute layout (no surface borrow).
         let (vx, vy, vw, vh) = self.viewport_rect();
-        self.measure_content(vw as f32, vh as f32);
+        self.measure_content(vw as f32);
         let max_scroll = (self.content_h - vh as f32).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
-        self.viewport_text
-            .set_scroll_px(&mut self.font_system, self.scroll_y);
         let status = self.status_line();
         self.status_text.set_text(&mut self.font_system, &status);
         self.status_text
@@ -696,8 +770,15 @@ impl ShellApp {
         };
         canvas.fill_rect(0, 0, w as i32, h as i32, BG);
         canvas.fill_rect(vx, vy, vw, vh, VIEW_BG);
-        self.viewport_text
-            .draw(fs, cache, &mut canvas, vx + 12, vy + 10);
+        for block in &mut self.blocks {
+            block.draw(
+                fs,
+                cache,
+                &mut canvas,
+                vx + 12,
+                vy + 10 - self.scroll_y as i32,
+            );
+        }
         paint_scrollbar(&mut canvas, vx, vy, vw, vh, self.content_h, self.scroll_y);
         canvas.fill_rect(0, 0, w as i32, TOOLBAR_H, CHROME_BG);
         canvas.fill_rect(0, TOOLBAR_H - 1, w as i32, 1, BORDER);
@@ -709,7 +790,7 @@ impl ShellApp {
             cache,
             &mut canvas,
             &self.omnibox,
-            &self.omnibox_text,
+            &mut self.omnibox_text,
             &mut self.omnibox_prefix,
             self.omnibox_focused,
             layout.omnibox_rect,
@@ -729,15 +810,13 @@ impl ShellApp {
         }
     }
 
-    /// Re-measure laid-out content height only when content or width changed.
-    fn measure_content(&mut self, vw: f32, vh: f32) {
-        let key = (self.content_version, vw as u32, vh as u32);
+    /// Rebuild laid-out blocks only when content or width changed.
+    fn measure_content(&mut self, vw: f32) {
+        let key = (self.content_version, vw as u32);
         if self.content_measured_for == Some(key) {
             return;
         }
-        self.viewport_text
-            .set_size(&mut self.font_system, vw, vh.max(50.0));
-        self.content_h = self.viewport_text.full_height(&mut self.font_system) + 20.0;
+        self.rebuild_blocks((vw - 24.0).max(80.0));
         self.content_measured_for = Some(key);
     }
 
@@ -756,12 +835,26 @@ impl ShellApp {
                 };
                 format!("Loading {} … {}", host_or_url(url), progress)
             }
-            LoadState::Idle => match &self.view {
+            LoadState::Idle => match self.view {
                 View::Welcome => "Ready — type a URL and press Enter".to_owned(),
-                View::Document { text } | View::Error { text } => {
-                    let lines = text.lines().count();
-                    format!("Done — {lines} lines (raw source; HTML parsing lands in Phase 2)")
+                View::Document => {
+                    let links = self
+                        .article
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            Block::Heading { links, .. }
+                            | Block::Paragraph { links, .. }
+                            | Block::ListItem { links, .. } => Some(links.len()),
+                            _ => None,
+                        })
+                        .sum::<usize>();
+                    format!(
+                        "Done — {} blocks · {links} links (structured text; CSS lands in Phase 3)",
+                        self.article.blocks.len(),
+                    )
                 }
+                View::Error => "Failed — see the error above".to_owned(),
             },
         }
     }
@@ -800,7 +893,7 @@ fn paint_omnibox(
     cache: &mut cosmic_text::SwashCache,
     canvas: &mut Canvas<'_>,
     edit: &Omnibox,
-    body_text: &TextBuffer,
+    body_text: &mut TextBuffer,
     prefix_text: &mut TextBuffer,
     focused: bool,
     rect: (i32, i32, i32, i32),
@@ -812,8 +905,19 @@ fn paint_omnibox(
     canvas.fill_rect(x, y + h - 2, w, 2, border);
     canvas.fill_rect(x, y, 2, h, border);
     canvas.fill_rect(x + w - 2, y, 2, h, border);
+    if focused && edit.is_selected() {
+        // Selection highlight behind the whole text.
+        let sel_w = body_text.first_line_width(font_system).max(2.0);
+        canvas.fill_rect(
+            x + 8,
+            y + 6,
+            sel_w.min((w - 16).max(2) as f32) as i32,
+            (h - 12).max(2),
+            SELECT_BG,
+        );
+    }
     body_text.draw(font_system, cache, canvas, x + 8, y + 6);
-    if focused {
+    if focused && !edit.is_selected() {
         let prefix = edit.text()[..edit.caret()].to_owned();
         prefix_text.set_text(font_system, &prefix);
         prefix_text.set_size(font_system, (w - 16).max(10) as f32, h as f32);

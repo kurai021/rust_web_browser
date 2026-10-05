@@ -6,6 +6,7 @@
 //! background-fetch plumbing built here are reused by them.
 
 pub mod app;
+pub mod article;
 pub mod fetcher;
 pub mod history;
 pub mod omnibox;

@@ -1,1 +1,5 @@
 /target/
+# cargo-fuzz working dirs (harness config + seeds ARE committed)
+crates/html/fuzz/corpus/
+crates/html/fuzz/artifacts/
+crates/html/fuzz/target/
