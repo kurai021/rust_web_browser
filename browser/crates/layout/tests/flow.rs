@@ -55,6 +55,49 @@ fn nested_content_box_and_auto_centering() {
     near(child.content_box.width, 200.0);
     near(main.border_box.height, 44.0);
 }
+#[test]
+fn controls_render_current_values_placeholders_and_click_targets() {
+    let (mut document, _, initial) = page(
+        "<input id=x placeholder='Enter a name'>",
+        "",
+        400.0,
+        &Images::default(),
+    );
+    let node = document.get_element_by_id("x").unwrap();
+    let text = |result: &LayoutResult| {
+        result
+            .boxes
+            .iter()
+            .flat_map(|b| &b.content)
+            .filter_map(|c| match c {
+                Content::Text(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+    assert!(text(&initial).contains("Enter a name"));
+    document.set_control_value(node, "Ada".into());
+    let styles = css::Cascade::default().compute(&document, &[]);
+    let mut tree = build_render_tree(&document, &styles);
+    let updated = layout(
+        Size::new(400.0, 300.0),
+        &mut tree,
+        LayoutOpts {
+            font_system: &mut FontSystem::new(),
+            images: &Images::default(),
+        },
+    );
+    assert!(text(&updated).contains("Ada"));
+    assert!(!text(&updated).contains("Enter a name"));
+    let rect = bbox(&document, &updated, "x").content_box;
+    assert_eq!(
+        updated
+            .hit_element(rect.x + 3.0, rect.y + 3.0, &ScrollOffsets::default())
+            .unwrap()
+            .node,
+        node
+    );
+}
 
 #[test]
 fn border_box_and_min_max_constraints() {

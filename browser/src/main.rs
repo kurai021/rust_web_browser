@@ -1,4 +1,4 @@
-//! `browser` binary — Phase 4 (plan/10 §10.2.11, plan/14 Phase 4).
+//! `browser` binary — Phase 5 (plan/10 §10.2.11, plan/14 Phase 5).
 //!
 //! `browser [url] [--profile-dir p] [--software-render] [--perf] [--headless-test url]`
 //! (`--headless-test` is a test harness only, never a product).
@@ -26,7 +26,7 @@ struct Args {
 fn print_help() {
     print!(
         "browser {VERSION}\n\
-         Graphical web browser in Rust (Phase 4: flow layout and GPU paint)\n\
+         Graphical web browser in Rust (Phase 5: JavaScript and DOM events)\n\
          \n\
          Usage: browser [url] [options]\n\
          \n\
@@ -115,7 +115,10 @@ fn run_headless(url_text: &str, perf: bool) -> ExitCode {
             })
             .await?;
         let bytes = fetched.bytes.len();
-        let page = shell::page::load_page(&client, fetched).await;
+        let loaded = shell::scripts::load_scripts(&client, fetched, Default::default(), None)
+            .await
+            .map_err(|e| net::Error::Transport(e.to_string()))?;
+        let page = loaded.page;
         let styles = page.computed_styles(Default::default());
         let article =
             shell::article::article_from_styled_document(&page.document, &page.url, &styles);

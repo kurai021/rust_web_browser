@@ -9,3 +9,6 @@ crates/css/fuzz/target/
 crates/paint/fuzz/corpus/
 crates/paint/fuzz/artifacts/
 crates/paint/fuzz/target/
+crates/js/fuzz/corpus/
+crates/js/fuzz/artifacts/
+crates/js/fuzz/target/

@@ -76,6 +76,24 @@ SVG font fallback adds maintained-policy notices for the newer transitive
 rustybuzz/ttf-parser versions under the same documented maintenance exceptions.
 No vulnerability exemption was added; cargo-audit/cargo-deny remain enforced.
 
+## Phase 5 language/policy auxiliaries and test data (2026-10-09)
+
+| Dependency / data | License | Use |
+|---|---|---|
+| regex 1.13.1 | MIT OR Apache-2.0 | Bounded regex auxiliary; JS parsing/evaluation remain owned |
+| time 0.3.55 | MIT OR Apache-2.0 | Date/calendar/ISO auxiliary, promoted from existing dependency tree |
+| serde_json 1.0.151 | MIT OR Apache-2.0 | Approved JSON auxiliary reused in the own interpreter |
+| sha2 0.10.9 | MIT OR Apache-2.0 | CSP SHA-256/384/512 hashing; no own cryptography |
+| wayland-client 0.31.15 (dev) | MIT | Explicit GUI-test pointer; existing winit dependency reused |
+| wayland-protocols-wlr 0.3.12 (dev) | MIT | Virtual-pointer test bindings; not a product input service |
+| Test262 adapted inputs | BSD-3-Clause | Eight sources; notices/license under js/tests/test262 |
+| WPT DOM/events adapted inputs | BSD-3-Clause | Notices/license/provenance under dom_bindings/tests/wpt |
+
+Other additions reuse approved `thiserror`, `url`, `base64`, Criterion and
+libfuzzer-sys. No external JS engine or copyleft-only dependency was added.
+The resolved workspace has 499 dependencies; cargo-audit reports no vulnerabilities
+and cargo-deny passes, with the existing maintenance-only exceptions retained.
+
 ## Copyleft exception registry
 
 | Crate | Version | License | Anti-overengineering justification |

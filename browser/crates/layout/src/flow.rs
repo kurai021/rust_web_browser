@@ -642,6 +642,11 @@ impl Engine<'_> {
         if !node.style.visible {
             return;
         }
+        self.result.targets.push(TargetRegion {
+            element: node.element,
+            rect,
+            ancestors: ancestors.to_vec(),
+        });
         let RenderKind::Replaced(ref replaced) = node.kind else {
             return;
         };
@@ -660,7 +665,15 @@ impl Engine<'_> {
                 self.placeholder(box_index, rect, "[video]", node.style.clone())
             }
             Replaced::Input { label } => {
-                self.placeholder(box_index, rect, label, node.style.clone())
+                let shaped = self.shaper.shape(label, &node.style);
+                self.emit_text(
+                    box_index,
+                    label.clone(),
+                    &shaped,
+                    (rect.x + 3.0, rect.y + shaped.ascent + 3.0),
+                    rect,
+                    &node.style.clone(),
+                );
             }
         }
         if let Some(href) = &node.href {
@@ -758,6 +771,7 @@ enum PieceKind {
 }
 #[derive(Clone)]
 struct Piece {
+    element: ElementId,
     kind: PieceKind,
     style: Arc<ComputedStyle>,
     href: Option<Url>,
@@ -824,6 +838,7 @@ impl Engine<'_> {
                         if ch == '\n' && newlines {
                             *pending_space = false;
                             out.push(Piece {
+                                element: node.element,
                                 kind: PieceKind::Break,
                                 style: node.style.clone(),
                                 href: None,
@@ -856,6 +871,7 @@ impl Engine<'_> {
             RenderKind::Break => {
                 *pending_space = false;
                 out.push(Piece {
+                    element: node.element,
                     kind: PieceKind::Break,
                     style: node.style.clone(),
                     href: None,
@@ -878,6 +894,7 @@ impl Engine<'_> {
                 let (m, _, _) = self.edges(node, width);
                 let rect = self.result.boxes[b].border_box;
                 out.push(Piece {
+                    element: node.element,
                     kind: PieceKind::Atomic(b, m),
                     style: node.style.clone(),
                     href: node.href.clone(),
@@ -918,6 +935,7 @@ impl Engine<'_> {
         }
         let strut = self.shaper.shape("Mg", &node.style);
         out.push(Piece {
+            element: node.element,
             kind: PieceKind::Spacer,
             style: node.style.clone(),
             href: None,
@@ -946,6 +964,7 @@ impl Engine<'_> {
         let ascent = shaped.ascent;
         let descent = shaped.descent;
         out.push(Piece {
+            element: node.element,
             kind: PieceKind::Text { text, shaped },
             style: node.style.clone(),
             href: node.href.clone(),
@@ -1138,6 +1157,13 @@ impl Engine<'_> {
                 w,
                 piece.ascent + piece.descent,
             );
+            if piece.style.visible {
+                self.result.targets.push(TargetRegion {
+                    element: piece.element,
+                    rect,
+                    ancestors: ancestors.to_vec(),
+                });
+            }
             for &ancestor in &piece.ancestors {
                 inline_rects
                     .entry(ancestor)
@@ -1282,6 +1308,14 @@ impl Engine<'_> {
                 let mut a = outer.to_vec();
                 a.extend_from_slice(&hit.ancestors);
                 hit.ancestors = a;
+            }
+        }
+        for target in &mut self.result.targets {
+            if target.ancestors.first() == Some(&index) {
+                target.rect = target.rect.translate(dx, dy);
+                let mut a = outer.to_vec();
+                a.extend_from_slice(&target.ancestors);
+                target.ancestors = a;
             }
         }
         for child in children {

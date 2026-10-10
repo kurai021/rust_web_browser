@@ -1,0 +1,15 @@
+html { font-family: sans-serif; color: #172033; background-color: #edf2f7; }
+body { margin: 0; }
+main { max-width: 720px; margin: 24px auto; padding: 0 16px; }
+header { background-color: #17345d; color: white; padding: 20px; border-radius: 8px; }
+h1 { margin: 0; font-size: 32px; }
+section { background-color: white; padding: 18px; border: 1px solid #ccd6e4; margin: 20px 0; }
+h2 { margin: 0 0 12px; font-size: 23px; }
+button { background-color: #dceafa; color: #17345d; border: 1px solid #91a8c5; margin: 4px; padding: 6px 12px; }
+input { width: 240px; margin: 4px; }
+output { font-size: 22px; margin: 10px 0; }
+nav { padding: 12px; background-color: #d5f5e6; }
+li { margin: 8px 0; }
+.completed span { text-decoration: line-through; color: #64748b; }
+#timer { color: #047857; }
+@media(max-width:500px) { main { margin: 12px auto; padding: 0 8px; } input { width: 180px; } }

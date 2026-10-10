@@ -1,4 +1,4 @@
-//! Phase 4 window: existing chrome, progressive flow layout and GPU/CPU paint.
+//! Phase 5 window: page scripting/events alongside retained GPU/CPU painting.
 //!
 //! winit chrome, wgpu compositing and the matching softbuffer fallback.
 //! Network, image decoding, page layout and glyph preparation stay on workers.
@@ -55,9 +55,9 @@ fn welcome_article() -> Article {
     Article {
         title: Some("Welcome".to_owned()),
         blocks: vec![
-            Block::Heading { level: 1, text: "browser — Phase 4".to_owned(), links: Vec::new() },
+            Block::Heading { level: 1, text: "browser — Phase 5".to_owned(), links: Vec::new() },
             Block::Paragraph {
-                text: "This window renders nested flow layout, shaped text and images using GPU painting with a software fallback.".to_owned(),
+                text: "This window runs the in-house JavaScript interpreter with DOM events, input controls and timers, alongside GPU/software painting.".to_owned(),
                 links: Vec::new(),
             },
             Block::Heading { level: 2, text: "Try".to_owned(), links: Vec::new() },
@@ -150,6 +150,10 @@ pub struct ShellApp {
     navigation_started: Option<std::time::Instant>,
     painted_navigation: bool,
     preview_seen: bool,
+    script_ready: bool,
+    dom_focused: Option<html::NodeId>,
+    script_dialog: Option<String>,
+    script_console: Vec<String>,
     load: LoadState,
     pending_history: bool,
     scroll_y: f32,
@@ -229,6 +233,10 @@ impl ShellApp {
             navigation_started: None,
             painted_navigation: false,
             preview_seen: false,
+            script_ready: false,
+            dom_focused: None,
+            script_dialog: None,
+            script_console: Vec::new(),
             load: LoadState::Idle,
             pending_history: false,
             scroll_y: 0.0,
@@ -362,6 +370,10 @@ impl ShellApp {
         self.navigation_started = Some(std::time::Instant::now());
         self.painted_navigation = false;
         self.preview_seen = false;
+        self.script_ready = false;
+        self.dom_focused = None;
+        self.script_dialog = None;
+        self.script_console.clear();
         self.load = LoadState::Loading {
             url: url.clone(),
             downloaded: 0,
@@ -564,6 +576,9 @@ impl ShellApp {
     fn on_fetch_event(&mut self, event: FetchEvent) {
         let id = match &event {
             FetchEvent::Started { id, .. }
+            | FetchEvent::ScriptPage { id, .. }
+            | FetchEvent::ScriptError { id, .. }
+            | FetchEvent::Navigate { id, .. }
             | FetchEvent::Progress { id, .. }
             | FetchEvent::Preview { id, .. }
             | FetchEvent::Done { id, .. }
@@ -576,6 +591,32 @@ impl ShellApp {
             return;
         }
         match event {
+            FetchEvent::ScriptPage {
+                page,
+                styles,
+                focused,
+                console,
+                ..
+            } => {
+                self.page = Some(page);
+                self.styles = styles;
+                self.dom_focused = focused;
+                self.script_console = console;
+                self.refresh_styled_article();
+            }
+            FetchEvent::ScriptError {
+                message, stopped, ..
+            } => {
+                self.script_console.push(message.clone());
+                if stopped {
+                    self.script_dialog = Some(message);
+                    self.script_ready = false;
+                }
+            }
+            FetchEvent::Navigate { url, .. } => {
+                self.omnibox.set_text(url.as_str());
+                self.start_fetch(url, false, true);
+            }
             FetchEvent::Started { url, .. } => {
                 self.load = LoadState::Loading {
                     url,
@@ -598,6 +639,7 @@ impl ShellApp {
                 }
             }
             FetchEvent::Done { url, result, .. } => {
+                self.script_ready = result.is_ok();
                 self.load = LoadState::Idle;
                 match result {
                     Ok((page, styles)) => self.show_document(&url, page, styles),
@@ -856,6 +898,9 @@ impl ShellApp {
 
     fn on_key(&mut self, event: &KeyEvent) {
         if event.state == ElementState::Released {
+            if !self.omnibox_focused && self.script_ready {
+                self.send_dom_key(event, false);
+            }
             return;
         }
         let ctrl = self.modifiers.control_key();
@@ -956,6 +1001,39 @@ impl ShellApp {
     }
 
     fn on_key_viewport(&mut self, event: &KeyEvent) {
+        if self.script_dialog.is_some()
+            && matches!(
+                event.logical_key,
+                Key::Named(NamedKey::Enter | NamedKey::Escape)
+            )
+        {
+            self.script_dialog = None;
+            self.request_redraw();
+            return;
+        }
+        if self.script_ready {
+            if matches!(event.logical_key, Key::Named(NamedKey::Tab)) {
+                if let Some(fetcher) = &self.fetcher {
+                    fetcher.send(Command::DomEvent {
+                        id: self.navigation_id,
+                        event: crate::script_worker::DomCommand::Tab {
+                            reverse: self.modifiers.shift_key(),
+                        },
+                    });
+                }
+                return;
+            }
+            if self.dom_focused.is_some()
+                || matches!(
+                    event.logical_key,
+                    Key::Character(_)
+                        | Key::Named(NamedKey::Backspace | NamedKey::Delete | NamedKey::Enter)
+                )
+            {
+                self.send_dom_key(event, true);
+                return;
+            }
+        }
         match &event.logical_key {
             Key::Named(NamedKey::PageDown) => {
                 self.scroll_by(self.viewport_h() * 0.9);
@@ -975,6 +1053,32 @@ impl ShellApp {
                 self.stop_or_reload();
             }
             _ => {}
+        }
+    }
+    fn send_dom_key(&self, event: &KeyEvent, pressed: bool) {
+        if let Some(fetcher) = &self.fetcher {
+            let key = match &event.logical_key {
+                Key::Character(s) => s.to_string(),
+                Key::Named(k) => format!("{k:?}"),
+                _ => String::new(),
+            };
+            fetcher.send(Command::DomEvent {
+                id: self.navigation_id,
+                event: crate::script_worker::DomCommand::Key {
+                    node: None,
+                    key,
+                    pressed,
+                    text: if pressed && !self.modifiers.control_key() && !self.modifiers.alt_key() {
+                        event
+                            .text
+                            .as_ref()
+                            .map(|s| s.to_string())
+                            .filter(|s| !s.chars().any(char::is_control))
+                    } else {
+                        None
+                    },
+                },
+            });
         }
     }
 
@@ -1030,6 +1134,10 @@ impl ShellApp {
     }
 
     fn on_click(&mut self) {
+        if self.script_dialog.take().is_some() {
+            self.request_redraw();
+            return;
+        }
         let (mx, my) = (self.mouse_x as i32, self.mouse_y as i32);
         // Toolbar buttons.
         let layout = self.toolbar_layout();
@@ -1065,6 +1173,33 @@ impl ShellApp {
         let (vx, vy, vw, vh) = self.viewport_rect();
         if mx >= vx && mx < vx + vw - SCROLLBAR_W && my >= vy && my < vy + vh {
             let content_y = my as f32 - vy as f32 + self.scroll_y - self.page_origin.1;
+            if self.script_ready {
+                if let Some(flow) = &self.flow {
+                    if let Some(element) = flow.hit_element(
+                        (mx as f32 - vx as f32 + self.scroll_x) / self.zoom,
+                        content_y / self.zoom,
+                        &self.scroll_offsets,
+                    ) {
+                        let mut node = element.node;
+                        if let Some(page) = &self.page {
+                            if let Some(n) = page.document.try_get(node) {
+                                if matches!(n.data, html::NodeData::Text(_)) {
+                                    node = n.parent.unwrap_or(node);
+                                }
+                            }
+                        }
+                        if let Some(fetcher) = &self.fetcher {
+                            fetcher.send(Command::DomEvent {
+                                id: self.navigation_id,
+                                event: crate::script_worker::DomCommand::Click(node),
+                            });
+                        }
+                        self.omnibox_focused = false;
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
             if let Some(href) = self.hit_link(
                 mx as f32 - vx as f32 - self.page_origin.0 + self.scroll_x,
                 content_y,
@@ -1267,6 +1402,18 @@ impl ShellApp {
         );
         self.status_text
             .draw(fs, cache, &mut canvas, PAD, h as i32 - STATUS_H + 5);
+        let dialog_rect = self
+            .script_dialog
+            .as_ref()
+            .map(|_| (16, TOOLBAR_H + 20, (w as i32 - 32).max(40), 150));
+        if let (Some(message), Some((x, y, dw, dh))) = (&self.script_dialog, dialog_rect) {
+            canvas.fill_rect(x, y, dw, dh, 0xfff3cd);
+            canvas.fill_rect(x, y, dw, 3, 0xb45309);
+            let mut text = TextBuffer::with_metrics(fs, 16.0, cosmic_text::Wrap::Word);
+            text.set_text(fs,&format!("Long-running script stopped\n{message}\n\nStop script — click this dialog or press Enter/Escape."));
+            text.set_size(fs, (dw - 24).max(1) as f32, (dh - 16) as f32);
+            text.draw(fs, cache, &mut canvas, x + 12, y + 10);
+        }
         window.pre_present_notify();
         if let Some(gpu) = &mut self.gpu {
             let window_clip = layout::Rect::new(0.0, 0.0, w as f32, h as f32);
@@ -1287,6 +1434,11 @@ impl ShellApp {
                 (0, h as i32 - STATUS_H, w as i32, STATUS_H),
                 (vx + vw - SCROLLBAR_W, vy, SCROLLBAR_W, vh),
             ] {
+                if let Some(q) = chrome_quad(&self.pixels, w, h, rect) {
+                    quads.push((q, window_clip));
+                }
+            }
+            if let Some(rect) = dialog_rect {
                 if let Some(q) = chrome_quad(&self.pixels, w, h, rect) {
                     quads.push((q, window_clip));
                 }
@@ -1582,6 +1734,12 @@ impl ApplicationHandler<Wake> for ShellApp {
                 self.size = size;
                 self.content_measured_for = None;
                 self.queue_restyle();
+                if let Some(fetcher) = &self.fetcher {
+                    fetcher.send(Command::DomEvent {
+                        id: self.navigation_id,
+                        event: crate::script_worker::DomCommand::Resize(self.environment()),
+                    });
+                }
                 self.request_redraw();
             }
             WindowEvent::ThemeChanged(theme) => {

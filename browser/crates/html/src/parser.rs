@@ -163,6 +163,16 @@ impl Parser {
         enforce_attr_budget(&mut document, self.opts.max_attr_len);
         Some(document)
     }
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+    /// A blocking-script host returns the mutated arena before parsing resumes.
+    /// Node identities stay stable for the builder's open-element stack.
+    pub fn replace_document(&mut self, document: Document) {
+        if let Some(tree) = &mut self.tree {
+            *tree.document_mut() = document;
+        }
+    }
 
     /// Pause token consumption (blocking `<script>` with scripting on).
     /// Buffered input waits; already-emitted tokens are unaffected.
@@ -182,12 +192,23 @@ impl Parser {
     /// End of input: decode the tail, drain all tokens, return the document.
     #[must_use]
     pub fn finish(mut self) -> Document {
-        self.finished_input = true;
-        self.decode_available(true);
-        self.tokenizer.finish_input();
+        if !self.finished_input {
+            self.finished_input = true;
+            self.decode_available(true);
+            self.tokenizer.finish_input();
+        }
         self.suspended = false;
         self.drive();
         self.into_document()
+    }
+    /// Signal real EOF without consuming the parser, retaining script pauses.
+    pub fn end_input(&mut self) {
+        if !self.finished_input {
+            self.finished_input = true;
+            self.decode_available(true);
+            self.tokenizer.finish_input();
+        }
+        self.drive();
     }
 
     /// Decode whatever is buffered (determining the encoding first).

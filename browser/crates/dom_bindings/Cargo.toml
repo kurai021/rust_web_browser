@@ -9,5 +9,13 @@ license.workspace = true
 default = ["simd"]
 simd = []
 
+[dependencies]
+js = { path = "../js", version = "0.1.0" }
+html = { path = "../html", version = "0.1.0" }
+css = { path = "../css", version = "0.1.0" }
+url = "2"
+base64 = "0.22"
+sha2 = "0.10"
+
 [lints]
 workspace = true

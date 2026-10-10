@@ -293,13 +293,14 @@ impl Builder<'_> {
                         if self.dom.get_attribute(id, "type") == Some("hidden") {
                             return None;
                         }
+                        let value = self.dom.control_value(id);
                         Some(Replaced::Input {
-                            label: self
-                                .dom
-                                .get_attribute(id, "value")
-                                .or_else(|| self.dom.get_attribute(id, "placeholder"))
-                                .unwrap_or("[input]")
-                                .to_owned(),
+                            label: if value.is_empty() {
+                                self.dom.get_attribute(id, "placeholder").unwrap_or("")
+                            } else {
+                                value
+                            }
+                            .to_owned(),
                         })
                     }
                     _ => None,

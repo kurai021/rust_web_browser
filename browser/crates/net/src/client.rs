@@ -74,6 +74,7 @@ pub struct Fetched {
     pub content_type: Option<String>,
     /// Decoded body bytes (capped by [`FetchOptions::max_body_bytes`]).
     pub bytes: Vec<u8>,
+    pub script_policies: Vec<String>,
 }
 
 /// Headers shared with the streaming HTML consumer before EOF.
@@ -82,6 +83,7 @@ pub struct ResponseHead {
     pub url: Url,
     pub status: u16,
     pub content_type: Option<String>,
+    pub script_policies: Vec<String>,
 }
 
 /// HTTPS client with HSTS state.
@@ -95,7 +97,7 @@ impl Client {
     /// Build a client. Fails only when the TLS stack cannot initialize.
     pub fn new(options: FetchOptions) -> Result<Self, Error> {
         let inner = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(options.max_redirects))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(options.connect_timeout)
             .timeout(options.total_timeout)
             .cookie_store(true)
@@ -152,16 +154,68 @@ impl Client {
         max_bytes: usize,
         on_chunk: &mut (dyn FnMut(&ResponseHead, &[u8], Progress) + Send),
     ) -> Result<Fetched, Error> {
-        let max_bytes = max_bytes.min(self.options.max_body_bytes);
-        let url = self.effective_url(url)?;
-        let request = self
-            .inner
-            .get(url.clone())
-            .header(USER_AGENT, USER_AGENT_VALUE);
-        let response = tokio::time::timeout(self.options.first_byte_timeout, request.send())
+        self.fetch_checked(url, max_bytes, on_chunk, None).await
+    }
+    /// Check every active-resource redirect before connecting to its target.
+    pub async fn fetch_script(
+        &self,
+        url: &Url,
+        max_bytes: usize,
+        allow: &(dyn Fn(&Url) -> bool + Send + Sync),
+    ) -> Result<Fetched, Error> {
+        self.fetch_checked(url, max_bytes, &mut |_, _, _| {}, Some(allow))
             .await
-            .map_err(|_| Error::Timeout("time to first byte exceeded".to_owned()))?
+    }
+    async fn fetch_checked(
+        &self,
+        url: &Url,
+        max_bytes: usize,
+        on_chunk: &mut (dyn FnMut(&ResponseHead, &[u8], Progress) + Send),
+        allow: Option<&(dyn Fn(&Url) -> bool + Send + Sync)>,
+    ) -> Result<Fetched, Error> {
+        let max_bytes = max_bytes.min(self.options.max_body_bytes);
+        let mut url = self.effective_url(url)?;
+        let started = std::time::Instant::now();
+        let mut redirects = 0;
+        let response = loop {
+            if allow.is_some_and(|allow| !allow(&url)) {
+                return Err(Error::Transport("active resource blocked by policy".into()));
+            }
+            let remaining = self.options.total_timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::Timeout("total request deadline exceeded".into()));
+            }
+            let request = self
+                .inner
+                .get(url.clone())
+                .header(USER_AGENT, USER_AGENT_VALUE)
+                .timeout(remaining);
+            let response = tokio::time::timeout(
+                self.options.first_byte_timeout.min(remaining),
+                request.send(),
+            )
+            .await
+            .map_err(|_| Error::Timeout("time to first byte exceeded".into()))?
             .map_err(|e| map_reqwest(&e))?;
+            self.note_hsts(&url, &response);
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                if redirects >= self.options.max_redirects {
+                    return Err(Error::TooManyRedirects);
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| Error::Transport("redirect has no valid Location".into()))?;
+                url = self.effective_url(
+                    &url.join(location)
+                        .map_err(|_| Error::InvalidUrl(location.into()))?,
+                )?;
+                redirects += 1;
+                continue;
+            }
+            break response;
+        };
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
@@ -175,10 +229,17 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let total = response.content_length();
+        let script_policies = response
+            .headers()
+            .get_all("content-security-policy")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect::<Vec<_>>();
         let head = ResponseHead {
             url: final_url.clone(),
             status,
             content_type: content_type.clone(),
+            script_policies: script_policies.clone(),
         };
 
         let mut bytes = Vec::new();
@@ -198,6 +259,7 @@ impl Client {
             status,
             content_type,
             bytes,
+            script_policies,
         })
     }
 

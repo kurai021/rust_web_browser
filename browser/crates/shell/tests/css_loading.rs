@@ -93,6 +93,7 @@ async fn import_depth_is_bounded_before_opening_another_connection() {
     });
     let client = Client::new(FetchOptions::default()).unwrap();
     let fetched = net::Fetched {
+        script_policies: Vec::new(),
         url: format!("http://{address}/").parse().unwrap(),
         status: 200,
         content_type: Some("text/html".into()),

@@ -7,13 +7,14 @@
 //! the request (plan/04 cancellation rule).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::fonts::{load_fonts, FontAsset};
 use crate::images::load_images;
-use crate::page::{load_page_from_document, Page};
+use crate::page::Page;
 use css::Environment;
 use net::{Client, Error, FetchOptions, Progress, UserInput};
 use tokio::task::JoinHandle as TokioHandle;
@@ -22,6 +23,10 @@ use url::Url;
 /// Commands from the UI thread to the worker.
 #[derive(Debug)]
 pub enum Command {
+    DomEvent {
+        id: u64,
+        event: crate::script_worker::DomCommand,
+    },
     /// Load `url`. Aborts anything in flight. `allow_downgrade` enables the
     /// https→http fallback for bare-host input (plan/04 §4.3.3).
     Navigate {
@@ -46,8 +51,27 @@ pub enum Command {
 /// Events from the worker to the UI thread.
 #[derive(Debug)]
 pub enum FetchEvent {
+    ScriptPage {
+        id: u64,
+        page: Arc<Page>,
+        styles: css::ComputedStyles,
+        focused: Option<html::NodeId>,
+        console: Vec<String>,
+    },
+    ScriptError {
+        id: u64,
+        message: String,
+        stopped: bool,
+    },
+    Navigate {
+        id: u64,
+        url: Url,
+    },
     /// A fetch started (progress bar on).
-    Started { id: u64, url: Url },
+    Started {
+        id: u64,
+        url: Url,
+    },
     /// Body progress update.
     Progress {
         id: u64,
@@ -85,7 +109,9 @@ pub enum FetchEvent {
         styles: css::ComputedStyles,
     },
     /// Nothing in flight anymore after a stop.
-    Stopped { id: u64 },
+    Stopped {
+        id: u64,
+    },
 }
 
 /// Handle held by the UI thread.
@@ -93,6 +119,7 @@ pub struct Fetcher {
     commands: Sender<Command>,
     events: Receiver<FetchEvent>,
     worker: Option<JoinHandle<()>>,
+    active_script: Arc<AtomicU64>,
 }
 
 impl Fetcher {
@@ -107,14 +134,17 @@ impl Fetcher {
     ) -> Self {
         let (commands_tx, commands_rx) = channel::<Command>();
         let (events_tx, events_rx) = channel::<FetchEvent>();
+        let active_script = Arc::new(AtomicU64::new(0));
+        let token = active_script.clone();
         let worker = std::thread::Builder::new()
             .name("net-worker".to_owned())
-            .spawn(move || worker_main(commands_rx, events_tx, wake, options, profile_dir))
+            .spawn(move || worker_main(commands_rx, events_tx, wake, options, profile_dir, token))
             .expect("net worker thread spawns");
         Self {
             commands: commands_tx,
             events: events_rx,
             worker: Some(worker),
+            active_script,
         }
     }
 
@@ -127,11 +157,21 @@ impl Fetcher {
 
     /// Send a command (no-op when the worker is gone).
     pub fn send(&self, command: Command) {
+        match &command {
+            Command::Navigate { id, .. } => {
+                self.active_script.store(*id, Ordering::Relaxed);
+            }
+            Command::Stop { .. } | Command::Shutdown => {
+                self.active_script.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         let _ = self.commands.send(command);
     }
 
     /// Stop the worker thread (also aborts any in-flight fetch).
     pub fn shutdown(mut self) {
+        self.active_script.fetch_add(1, Ordering::Relaxed);
         let _ = self.commands.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -149,6 +189,7 @@ fn worker_main(
     wake: Arc<dyn Fn() + Send + Sync>,
     options: FetchOptions,
     profile_dir: Option<PathBuf>,
+    active_script: Arc<AtomicU64>,
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -158,6 +199,18 @@ fn worker_main(
         .build()
         .expect("tokio runtime builds");
     let client = Arc::new(Client::new(options).expect("TLS stack initializes"));
+    let scripts = match crate::script_worker::ScriptWorker::spawn(
+        client.clone(),
+        events.clone(),
+        wake.clone(),
+        active_script,
+    ) {
+        Ok(worker) => Arc::new(std::sync::Mutex::new(worker)),
+        Err(error) => {
+            eprintln!("browser: script worker failed: {error}");
+            return;
+        }
+    };
     if let Some(path) = hsts_path(&profile_dir) {
         let loaded = net::HstsStore::load_from(&path);
         *client.hsts() = loaded;
@@ -173,6 +226,10 @@ fn worker_main(
 
     while let Ok(command) = commands.recv() {
         match command {
+            Command::DomEvent { id, event } => scripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .event(id, event),
             Command::Navigate {
                 id,
                 url,
@@ -185,6 +242,7 @@ fn worker_main(
                 let events = events.clone();
                 let wake = Arc::clone(&wake);
                 let profile_dir = profile_dir.clone();
+                let scripts = scripts.clone();
                 in_flight = Some(runtime.spawn(async move {
                     let _ = events.send(FetchEvent::Started {
                         id,
@@ -251,47 +309,20 @@ fn worker_main(
                             },
                         )
                         .await;
-                    let result = match result {
-                        Ok(fetched) => {
-                            let document = parser.map(html::Parser::finish).unwrap_or_else(|| {
-                                html::parse_full(&fetched.bytes, &fetched.url, Default::default())
-                            });
-                            let page =
-                                Arc::new(load_page_from_document(&client, fetched, document).await);
-                            let styles = page.computed_styles(environment);
-                            Ok((page, styles))
-                        }
-                        Err(err) => Err(err),
-                    };
-                    let resource_page = result
-                        .as_ref()
-                        .ok()
-                        .map(|(page, styles)| (page.clone(), styles.clone()));
                     persist_hsts(&client, &profile_dir);
-                    let _ = events.send(FetchEvent::Done { id, url, result });
-                    wake();
-                    if let Some((page, styles)) = resource_page {
-                        let fonts = async {
-                            let assets = load_fonts(&client, &page, environment).await;
-                            if !assets.is_empty() {
-                                let _ = events.send(FetchEvent::Fonts {
-                                    id,
-                                    page: page.clone(),
-                                    assets,
-                                });
-                                wake();
-                            }
-                        };
-                        let images = load_images(&client, &page, &styles, |url, success| {
-                            let _ = events.send(FetchEvent::Image {
+                    match result {
+                        Ok(fetched) => scripts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .initialize(id, fetched, environment),
+                        Err(error) => {
+                            let _ = events.send(FetchEvent::Done {
                                 id,
-                                page: page.clone(),
                                 url,
-                                success,
+                                result: Err(error),
                             });
                             wake();
-                        });
-                        tokio::join!(fonts, images);
+                        }
                     }
                 }));
             }
@@ -345,6 +376,7 @@ fn worker_main(
                 abort_in_flight(&mut in_flight);
                 abort_in_flight(&mut restyling);
                 persist_hsts(&client, &profile_dir);
+                scripts.lock().unwrap_or_else(|e| e.into_inner()).shutdown();
                 break;
             }
         }

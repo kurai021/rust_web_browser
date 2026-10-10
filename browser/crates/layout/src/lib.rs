@@ -117,6 +117,12 @@ pub struct HitRegion {
     /// Overflow ancestors, outermost first. Scroll transforms are paint-only.
     pub ancestors: Vec<usize>,
 }
+#[derive(Debug, Clone)]
+pub struct TargetRegion {
+    pub element: ElementId,
+    pub rect: Rect,
+    pub ancestors: Vec<usize>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStats {
@@ -132,6 +138,7 @@ pub struct LayoutResult {
     pub boxes: Vec<LayoutBox>,
     pub roots: Vec<usize>,
     pub hits: Vec<HitRegion>,
+    pub targets: Vec<TargetRegion>,
     pub content_size: Size,
     pub viewport: Size,
     pub stats: LayoutStats,
@@ -140,6 +147,41 @@ pub struct LayoutResult {
 pub type ScrollOffsets = HashMap<ElementId, (f32, f32)>;
 
 impl LayoutResult {
+    pub fn hit_element(&self, x: f32, y: f32, offsets: &ScrollOffsets) -> Option<ElementId> {
+        fn local(
+            result: &LayoutResult,
+            x: f32,
+            y: f32,
+            ancestors: &[usize],
+            offsets: &ScrollOffsets,
+        ) -> Option<(f32, f32)> {
+            let (mut x, mut y) = (x, y);
+            for &i in ancestors {
+                let b = &result.boxes[i];
+                if b.overflow != Overflow::Visible && !b.padding_box.contains(x, y) {
+                    return None;
+                }
+                if matches!(b.overflow, Overflow::Auto | Overflow::Scroll) {
+                    let (dx, dy) = offsets.get(&b.element).copied().unwrap_or_default();
+                    x += dx;
+                    y += dy;
+                }
+            }
+            Some((x, y))
+        }
+        for target in self.targets.iter().rev() {
+            if let Some((px, py)) = local(self, x, y, &target.ancestors, offsets) {
+                if target.rect.contains(px, py) {
+                    return Some(target.element);
+                }
+            }
+        }
+        self.boxes
+            .iter()
+            .rev()
+            .find(|b| !b.anonymous && b.style.visible && b.border_box.contains(x, y))
+            .map(|b| b.element)
+    }
     /// Links use the same overflow clips and nested offsets as painting.
     pub fn hit_link(&self, x: f32, y: f32, offsets: &ScrollOffsets) -> Option<Url> {
         self.hits.iter().rev().find_map(|hit| {

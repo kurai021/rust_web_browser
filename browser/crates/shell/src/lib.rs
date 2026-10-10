@@ -13,6 +13,8 @@ pub mod images;
 pub mod layout_worker;
 pub mod omnibox;
 pub mod page;
+pub mod script_worker;
+pub mod scripts;
 pub mod text;
 pub mod viewport;
 

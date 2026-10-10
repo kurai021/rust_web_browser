@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("fixture_png={data_url}");
     let head = net::ResponseHead {
+        script_policies: Vec::new(),
         url: "http://localhost/flow/index.html".parse()?,
         status: 200,
         content_type: Some("text/html".into()),

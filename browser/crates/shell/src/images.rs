@@ -49,7 +49,6 @@ pub async fn load_images(
         {
             break;
         }
-        requests.attempted.insert(url.clone());
         let cap = MAX_IMAGE_BYTES.min(MAX_PAGE_IMAGE_BYTES - requests.bytes);
         let bytes = if url.scheme() == "data" {
             data_image(&url).filter(|b| b.len() <= cap)
@@ -73,6 +72,9 @@ pub async fn load_images(
             None
         };
         let success = image.is_some();
+        // Cancellation must leave a cache miss retryable for the next DOM
+        // revision; only completed attempts become negative cache entries.
+        requests.attempted.insert(url.clone());
         page.image_cache.insert(url.clone(), image);
         drop(requests);
         on_ready(url, success);

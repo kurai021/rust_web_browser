@@ -91,9 +91,11 @@ pub enum Truncated {
 }
 
 /// The parsed document: arena plus indexes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Document {
     nodes: Vec<Node>,
+    free_nodes: Vec<NodeId>,
+    controls: HashMap<NodeId, ControlState>,
     /// First `id="…"` element per id (document order wins).
     id_index: HashMap<String, NodeId>,
     /// `<template>` element → its inert contents fragment.
@@ -107,6 +109,21 @@ pub struct Document {
     /// Document address (navigation URL, used as base URL later).
     pub url: Option<url::Url>,
 }
+impl Default for Document {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ControlState {
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub validation_message: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct DomError(pub &'static str);
 
 /// A recoverable spec parse error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,11 +135,56 @@ pub struct ParseError {
 }
 
 impl Document {
+    /// Conservative owned-arena accounting for the per-page scripting cap.
+    /// This measures retained capacities, not the operating system's RSS.
+    pub fn retained_bytes(&self) -> usize {
+        let mut bytes = self.nodes.capacity().saturating_mul(256);
+        for node in &self.nodes {
+            bytes = bytes.saturating_add(node.children.capacity().saturating_mul(8));
+            let payload = match &node.data {
+                NodeData::Text(s) | NodeData::Comment(s) => s.capacity(),
+                NodeData::DocumentType {
+                    name,
+                    public_id,
+                    system_id,
+                } => name
+                    .capacity()
+                    .saturating_add(public_id.capacity())
+                    .saturating_add(system_id.capacity()),
+                NodeData::Element(el) => el.attributes.iter().fold(
+                    el.tag_name
+                        .capacity()
+                        .saturating_add(el.attributes.capacity().saturating_mul(64)),
+                    |n, a| {
+                        n.saturating_add(a.name.capacity())
+                            .saturating_add(a.value.capacity())
+                    },
+                ),
+                _ => 0,
+            };
+            bytes = bytes.saturating_add(payload);
+        }
+        for state in self.controls.values() {
+            bytes = bytes
+                .saturating_add(128)
+                .saturating_add(state.validation_message.capacity())
+                .saturating_add(state.value.as_ref().map_or(0, String::capacity));
+        }
+        for name in self.id_index.keys() {
+            bytes = bytes.saturating_add(64).saturating_add(name.capacity());
+        }
+        bytes
+            .saturating_add(self.errors.capacity().saturating_mul(32))
+            .saturating_add(self.free_nodes.capacity().saturating_mul(8))
+            .saturating_add(self.template_contents.capacity().saturating_mul(32))
+    }
     /// Empty document with just a `#document` root.
     #[must_use]
     pub fn new() -> Self {
         let mut doc = Self {
             nodes: Vec::new(),
+            free_nodes: Vec::new(),
+            controls: HashMap::new(),
             id_index: HashMap::new(),
             template_contents: HashMap::new(),
             quirks_mode: QuirksMode::default(),
@@ -158,6 +220,14 @@ impl Document {
 
     /// Create a node with no parent yet; caller must attach it.
     pub fn create_node(&mut self, data: NodeData) -> NodeId {
+        if let Some(id) = self.free_nodes.pop() {
+            self.nodes[id] = Node {
+                data,
+                parent: None,
+                children: Vec::new(),
+            };
+            return id;
+        }
         let id = self.nodes.len();
         self.nodes.push(Node {
             data,
@@ -301,23 +371,36 @@ impl Document {
     /// First element with `id="…"`.
     #[must_use]
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.id_index.get(id).copied()
+        self.elements_from(self.root())
+            .into_iter()
+            .find(|&node| self.get_attribute(node, "id") == Some(id))
     }
 
     /// All elements with this tag name, in document order.
     #[must_use]
     pub fn get_elements_by_tag_name(&self, tag: &str) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        self.collect_tag(self.root(), tag, &mut out);
-        out
+        self.elements_from(self.root())
+            .into_iter()
+            .filter(|&id| tag == "*" || self.is_element_named(id, tag))
+            .collect()
     }
 
     /// All elements carrying this class (whitespace-separated match).
     #[must_use]
     pub fn get_elements_by_class_name(&self, class: &str) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        self.collect_class(self.root(), class, &mut out);
-        out
+        let classes: Vec<_> = class.split_ascii_whitespace().collect();
+        self.elements_from(self.root())
+            .into_iter()
+            .filter(|&id| {
+                !classes.is_empty()
+                    && classes.iter().all(|c| {
+                        self.get_attribute(id, "class")
+                            .unwrap_or("")
+                            .split_ascii_whitespace()
+                            .any(|v| v == *c)
+                    })
+            })
+            .collect()
     }
 
     /// Concatenated descendant text (spec `textContent`).
@@ -337,8 +420,8 @@ impl Document {
     /// True for `<tag>` in the HTML namespace.
     #[must_use]
     pub fn is_element_named(&self, id: NodeId, tag: &str) -> bool {
-        match &self.nodes[id].data {
-            NodeData::Element(el) => el.namespace == Namespace::Html && el.tag_name == tag,
+        match self.nodes.get(id).map(|n| &n.data) {
+            Some(NodeData::Element(el)) => el.namespace == Namespace::Html && el.tag_name == tag,
             _ => false,
         }
     }
@@ -346,14 +429,256 @@ impl Document {
     /// Attribute value, if present.
     #[must_use]
     pub fn get_attribute(&self, id: NodeId, name: &str) -> Option<&str> {
-        match &self.nodes[id].data {
-            NodeData::Element(el) => el
+        match self.nodes.get(id).map(|n| &n.data) {
+            Some(NodeData::Element(el)) => el
                 .attributes
                 .iter()
                 .find(|attr| attr.name == name)
                 .map(|attr| attr.value.as_str()),
             _ => None,
         }
+    }
+
+    pub fn try_get(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.get(id)
+    }
+    pub fn elements_from(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
+            if matches!(node.data, NodeData::Element(_)) {
+                out.push(id);
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        out
+    }
+    pub fn contains(&self, parent: NodeId, child: NodeId) -> bool {
+        let mut current = Some(child);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = current {
+            if id == parent {
+                return true;
+            }
+            if !seen.insert(id) {
+                break;
+            }
+            current = self.nodes.get(id).and_then(|n| n.parent);
+        }
+        false
+    }
+    pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) -> Result<(), DomError> {
+        if value.len() > crate::DEFAULT_MAX_ATTR_LEN {
+            return Err(DomError("attribute value limit"));
+        }
+        let Some(Node {
+            data: NodeData::Element(el),
+            ..
+        }) = self.nodes.get_mut(id)
+        else {
+            return Err(DomError("attribute target is not element"));
+        };
+        let name = if el.namespace == Namespace::Html {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_owned()
+        };
+        if let Some(attr) = el.attributes.iter_mut().find(|a| a.name == name) {
+            attr.value = value.into();
+        } else {
+            el.attributes.push(Attribute {
+                name,
+                value: value.into(),
+            });
+        }
+        Ok(())
+    }
+    pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> Result<(), DomError> {
+        let Some(Node {
+            data: NodeData::Element(el),
+            ..
+        }) = self.nodes.get_mut(id)
+        else {
+            return Err(DomError("attribute target is not element"));
+        };
+        el.attributes.retain(|a| a.name != name);
+        Ok(())
+    }
+    pub fn append_checked(
+        &mut self,
+        parent: NodeId,
+        child: NodeId,
+        before: Option<NodeId>,
+    ) -> Result<(), DomError> {
+        if parent >= self.nodes.len() || child >= self.nodes.len() {
+            return Err(DomError("unknown node"));
+        }
+        if parent == child
+            || self.contains(child, parent)
+            || matches!(self.nodes[child].data, NodeData::Document)
+        {
+            return Err(DomError("HierarchyRequestError"));
+        }
+        if !matches!(
+            self.nodes[parent].data,
+            NodeData::Element(_) | NodeData::Document | NodeData::DocumentFragment
+        ) {
+            return Err(DomError("HierarchyRequestError"));
+        }
+        if let Some(before) = before {
+            if self.nodes.get(before).and_then(|n| n.parent) != Some(parent) {
+                return Err(DomError("NotFoundError"));
+            }
+        }
+        if matches!(self.nodes[child].data, NodeData::DocumentFragment) {
+            let children = self.children_of(child);
+            for c in children {
+                self.append_checked(parent, c, before)?;
+            }
+            return Ok(());
+        }
+        let mut depth = 0;
+        let mut current = Some(parent);
+        while let Some(id) = current {
+            depth += 1;
+            if depth > crate::DEFAULT_MAX_DEPTH {
+                return Err(DomError("DOM depth limit"));
+            }
+            current = self.nodes[id].parent;
+        }
+        if let Some(before) = before {
+            self.insert_before(parent, child, before)
+        } else {
+            self.append_child(parent, child)
+        }
+        Ok(())
+    }
+    pub fn set_text_content(&mut self, id: NodeId, value: &str) -> Result<(), DomError> {
+        if value.len() > 8 * 1024 * 1024 {
+            return Err(DomError("DOM text limit"));
+        }
+        let Some(node) = self.nodes.get_mut(id) else {
+            return Err(DomError("unknown node"));
+        };
+        if matches!(node.data, NodeData::Text(_) | NodeData::Comment(_)) {
+            node.data = if matches!(node.data, NodeData::Text(_)) {
+                NodeData::Text(value.into())
+            } else {
+                NodeData::Comment(value.into())
+            };
+            return Ok(());
+        }
+        let children = std::mem::take(&mut node.children);
+        for child in children {
+            self.nodes[child].parent = None;
+        }
+        if !value.is_empty() {
+            let child = self.create_node(NodeData::Text(value.into()));
+            self.append_child(id, child);
+        }
+        Ok(())
+    }
+    pub fn control_value(&self, id: NodeId) -> &str {
+        self.controls
+            .get(&id)
+            .and_then(|s| s.value.as_deref())
+            .or_else(|| self.get_attribute(id, "value"))
+            .unwrap_or("")
+    }
+    pub fn control_checked(&self, id: NodeId) -> bool {
+        self.controls
+            .get(&id)
+            .and_then(|s| s.checked)
+            .unwrap_or_else(|| self.get_attribute(id, "checked").is_some())
+    }
+    pub fn set_control_value(&mut self, id: NodeId, value: String) {
+        self.controls.entry(id).or_default().value = Some(value);
+    }
+    pub fn set_control_checked(&mut self, id: NodeId, value: bool) {
+        self.controls.entry(id).or_default().checked = Some(value);
+    }
+    pub fn control_state_mut(&mut self, id: NodeId) -> &mut ControlState {
+        self.controls.entry(id).or_default()
+    }
+    pub fn control_state(&self, id: NodeId) -> Option<&ControlState> {
+        self.controls.get(&id)
+    }
+    /// Copy fragment/nodes into this arena while retaining detached ownership.
+    pub fn import_node(
+        &mut self,
+        other: &Document,
+        source: NodeId,
+        deep: bool,
+    ) -> Result<NodeId, DomError> {
+        if self.node_count() >= crate::DEFAULT_MAX_NODES {
+            return Err(DomError("DOM node limit"));
+        }
+        let node = other
+            .try_get(source)
+            .ok_or(DomError("unknown source node"))?;
+        let root = self.create_node(node.data.clone());
+        let mut stack = vec![(source, root, 0usize)];
+        while let Some((old, new, depth)) = stack.pop() {
+            if !deep {
+                break;
+            }
+            if depth >= crate::DEFAULT_MAX_DEPTH {
+                return Err(DomError("DOM depth limit"));
+            }
+            for &child in &other.get(old).children {
+                if self.node_count() >= crate::DEFAULT_MAX_NODES {
+                    return Err(DomError("DOM node limit"));
+                }
+                let id = self.create_node(other.get(child).data.clone());
+                self.append_child(new, id);
+                stack.push((child, id, depth + 1));
+            }
+        }
+        Ok(root)
+    }
+    pub fn sweep_detached(&mut self, roots: &std::collections::HashSet<NodeId>) {
+        let mut marked = std::collections::HashSet::new();
+        let mut work = vec![self.root()];
+        work.extend(roots.iter().copied());
+        while let Some(id) = work.pop() {
+            if !marked.insert(id) {
+                continue;
+            }
+            if let Some(n) = self.nodes.get(id) {
+                work.extend(n.children.iter().copied());
+                if let Some(p) = n.parent {
+                    work.push(p);
+                }
+                if let Some(fragment) = self.template_contents(id) {
+                    work.push(fragment);
+                }
+            }
+        }
+        let free = self
+            .free_nodes
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        for id in 1..self.nodes.len() {
+            if !marked.contains(&id) && !free.contains(&id) {
+                self.nodes[id] = Node {
+                    data: NodeData::DocumentFragment,
+                    parent: None,
+                    children: Vec::new(),
+                };
+                self.controls.remove(&id);
+                self.template_contents.remove(&id);
+                self.free_nodes.push(id);
+            }
+        }
+        self.id_index.retain(|_, id| marked.contains(id));
     }
 
     /// Serialize in html5lib tree-construction format (`| <html>` lines)
@@ -393,31 +718,6 @@ impl Document {
             stack.extend(children);
         }
         None
-    }
-
-    fn collect_tag(&self, id: NodeId, tag: &str, out: &mut Vec<NodeId>) {
-        if self.is_element_named(id, tag) {
-            out.push(id);
-        }
-        for &child in &self.nodes[id].children.clone() {
-            self.collect_tag(child, tag, out);
-        }
-    }
-
-    fn collect_class(&self, id: NodeId, class: &str, out: &mut Vec<NodeId>) {
-        if let NodeData::Element(el) = &self.nodes[id].data {
-            if el.namespace == Namespace::Html {
-                let has = el.attributes.iter().any(|attr| {
-                    attr.name == "class" && attr.value.split_whitespace().any(|c| c == class)
-                });
-                if has {
-                    out.push(id);
-                }
-            }
-        }
-        for &child in &self.nodes[id].children.clone() {
-            self.collect_class(child, class, out);
-        }
     }
 
     fn push_text(&self, id: NodeId, out: &mut String) {
