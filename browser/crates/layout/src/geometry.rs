@@ -52,7 +52,12 @@ impl Rect {
         )
     }
     pub fn translate(self, x: f32, y: f32) -> Self {
-        Self::new(self.x + x, self.y + y, self.width, self.height)
+        Self::new(
+            (self.x + x).clamp(-crate::MAX_EXTENT, crate::MAX_EXTENT),
+            (self.y + y).clamp(-crate::MAX_EXTENT, crate::MAX_EXTENT),
+            self.width,
+            self.height,
+        )
     }
     pub fn inset(self, e: Edges) -> Self {
         Self::new(

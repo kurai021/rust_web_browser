@@ -66,6 +66,7 @@ pub enum BackgroundImage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
+    pub layout: crate::layout_values::LayoutStyle,
     pub color: Color,
     pub background_color: Color,
     pub background_image: Option<BackgroundImage>,
@@ -277,6 +278,7 @@ impl ComputedStyle {
             },
         );
         Self {
+            layout: crate::layout_values::LayoutStyle::from_properties(&properties),
             color,
             background_color,
             background_image,
@@ -324,6 +326,8 @@ const INHERITED: &[&str] = &[
     "text-transform",
     "visibility",
     "direction",
+    "border-collapse",
+    "border-spacing",
 ];
 pub(crate) fn inherited(name: &str) -> bool {
     INHERITED.contains(&name)
@@ -377,6 +381,35 @@ fn build_initial_properties() -> Properties {
         ("border-radius", "0px"),
         ("content", "normal"),
         ("direction", "ltr"),
+        ("flex-direction", "row"),
+        ("flex-wrap", "nowrap"),
+        ("flex-grow", "0"),
+        ("flex-shrink", "1"),
+        ("flex-basis", "auto"),
+        ("order", "0"),
+        ("justify-content", "normal"),
+        ("align-content", "normal"),
+        ("align-items", "normal"),
+        ("align-self", "auto"),
+        ("justify-items", "normal"),
+        ("justify-self", "auto"),
+        ("row-gap", "normal"),
+        ("column-gap", "normal"),
+        ("grid-template-columns", "none"),
+        ("grid-template-rows", "none"),
+        ("grid-template-areas", "none"),
+        ("grid-auto-columns", "auto"),
+        ("grid-auto-rows", "auto"),
+        ("grid-auto-flow", "row"),
+        ("grid-row-start", "auto"),
+        ("grid-row-end", "auto"),
+        ("grid-column-start", "auto"),
+        ("grid-column-end", "auto"),
+        ("grid-area-name", "auto"),
+        ("border-collapse", "separate"),
+        ("border-spacing", "0px"),
+        ("table-layout", "auto"),
+        ("vertical-align", "baseline"),
     ] {
         map.insert(name.into(), tokenize_all(value));
     }
@@ -412,6 +445,39 @@ pub(crate) fn affected_properties(name: &str) -> Vec<String> {
         return vec![name.to_owned()];
     }
     match name {
+        "inset" => SIDES.iter().map(|s| (*s).into()).collect(),
+        "flex" => ["flex-grow", "flex-shrink", "flex-basis"]
+            .map(String::from)
+            .to_vec(),
+        "flex-flow" => ["flex-direction", "flex-wrap"].map(String::from).to_vec(),
+        "gap" => ["row-gap", "column-gap"].map(String::from).to_vec(),
+        "place-items" => ["align-items", "justify-items"].map(String::from).to_vec(),
+        "place-content" => ["align-content", "justify-content"]
+            .map(String::from)
+            .to_vec(),
+        "place-self" => ["align-self", "justify-self"].map(String::from).to_vec(),
+        "grid-column" => ["grid-column-start", "grid-column-end"]
+            .map(String::from)
+            .to_vec(),
+        "grid-row" => ["grid-row-start", "grid-row-end"]
+            .map(String::from)
+            .to_vec(),
+        "grid-area" => [
+            "grid-area-name",
+            "grid-row-start",
+            "grid-column-start",
+            "grid-row-end",
+            "grid-column-end",
+        ]
+        .map(String::from)
+        .to_vec(),
+        "grid-template" | "grid" => [
+            "grid-template-rows",
+            "grid-template-columns",
+            "grid-template-areas",
+        ]
+        .map(String::from)
+        .to_vec(),
         "margin" | "padding" => SIDES.iter().map(|side| format!("{name}-{side}")).collect(),
         "border-width" | "border-color" | "border-style" => SIDES
             .iter()
@@ -464,9 +530,148 @@ pub(crate) fn expand_property(name: &str, tokens: &[Token]) -> Option<Vec<(Strin
         return valid_longhand(name, tokens).then(|| vec![(name.into(), tokens.to_vec())]);
     }
     let parts = components(tokens);
+    if matches!(name, "gap" | "place-items" | "place-content" | "place-self") {
+        if !(1..=2).contains(&parts.len()) {
+            return None;
+        }
+        let vals = [parts[0], *parts.get(1).unwrap_or(&parts[0])];
+        return keys
+            .into_iter()
+            .zip(vals)
+            .map(|(k, v)| valid_longhand(&k, v).then_some((k, v.to_vec())))
+            .collect();
+    }
+    if name == "flex-flow" {
+        if !(1..=2).contains(&parts.len()) {
+            return None;
+        }
+        let mut out = vec![
+            ("flex-direction".into(), tokenize_all("row")),
+            ("flex-wrap".into(), tokenize_all("nowrap")),
+        ];
+        let mut seen = [false; 2];
+        for p in parts {
+            let i = if valid_longhand("flex-direction", p) {
+                0
+            } else if valid_longhand("flex-wrap", p) {
+                1
+            } else {
+                return None;
+            };
+            if seen[i] {
+                return None;
+            }
+            seen[i] = true;
+            out[i].1 = p.to_vec();
+        }
+        return Some(out);
+    }
+    if name == "flex" {
+        let mut g = tokenize_all("1");
+        let mut s = tokenize_all("1");
+        let mut b = tokenize_all("0%");
+        match keyword(tokens).as_deref() {
+            Some("none") => {
+                g = tokenize_all("0");
+                s = tokenize_all("0");
+                b = tokenize_all("auto");
+            }
+            Some("auto") => b = tokenize_all("auto"),
+            _ => {
+                if parts.is_empty() || parts.len() > 3 {
+                    return None;
+                }
+                let mut nums = 0;
+                let mut basis = false;
+                for p in parts {
+                    if valid_longhand("flex-grow", p) && nums < 2 {
+                        if nums == 0 {
+                            g = p.to_vec();
+                        } else {
+                            s = p.to_vec();
+                        }
+                        nums += 1;
+                    } else if valid_longhand("flex-basis", p) && !basis {
+                        b = p.to_vec();
+                        basis = true;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+        return Some(vec![
+            ("flex-grow".into(), g),
+            ("flex-shrink".into(), s),
+            ("flex-basis".into(), b),
+        ]);
+    }
+    if matches!(name, "grid-row" | "grid-column" | "grid-area") {
+        let p = crate::syntax::split_top_level(tokens, &Token::Delim('/'));
+        if name == "grid-area"
+            && p.len() == 1
+            && keyword(tokens).is_some()
+            && keyword(tokens).as_deref() != Some("auto")
+        {
+            return Some(
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        (
+                            k,
+                            if i == 0 {
+                                tokens.to_vec()
+                            } else {
+                                tokenize_all("auto")
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        let target = if name == "grid-area" {
+            &keys[1..]
+        } else {
+            &keys[..]
+        };
+        if p.len() > target.len() || p.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        if name == "grid-area" {
+            out.push((keys[0].clone(), tokenize_all("auto")));
+        }
+        for (i, k) in target.iter().enumerate() {
+            let v = p.get(i).copied().unwrap_or(&[]);
+            let v = if v.is_empty() {
+                tokenize_all("auto")
+            } else {
+                v.to_vec()
+            };
+            if !valid_longhand(k, &v) {
+                return None;
+            }
+            out.push((k.clone(), v));
+        }
+        return Some(out);
+    }
+    if matches!(name, "grid" | "grid-template") {
+        let p = crate::syntax::split_top_level(tokens, &Token::Delim('/'));
+        if p.len() != 2
+            || !valid_longhand("grid-template-rows", p[0])
+            || !valid_longhand("grid-template-columns", p[1])
+        {
+            return None;
+        }
+        return Some(vec![
+            ("grid-template-rows".into(), p[0].to_vec()),
+            ("grid-template-columns".into(), p[1].to_vec()),
+            ("grid-template-areas".into(), tokenize_all("none")),
+        ]);
+    }
     if matches!(
         name,
-        "margin" | "padding" | "border-width" | "border-style" | "border-color"
+        "margin" | "padding" | "border-width" | "border-style" | "border-color" | "inset"
     ) {
         if !(1..=4).contains(&parts.len()) {
             return None;
@@ -637,6 +842,9 @@ pub(crate) fn expand_property(name: &str, tokens: &[Token]) -> Option<Vec<(Strin
 }
 
 fn valid_longhand(name: &str, value: &[Token]) -> bool {
+    if let Some(valid) = crate::layout_values::valid(name, value) {
+        return valid;
+    }
     let kw = keyword(value).unwrap_or_default();
     match name {
         "color" | "background-color" | "text-decoration-color" => parse_color(value).is_some(),
@@ -659,6 +867,7 @@ fn valid_longhand(name: &str, value: &[Token]) -> bool {
                 | "inline-flex"
                 | "inline-grid"
                 | "table"
+                | "inline-table"
                 | "table-row"
                 | "table-cell"
                 | "table-row-group"

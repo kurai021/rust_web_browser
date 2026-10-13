@@ -1,0 +1,25 @@
+html { font-family:sans-serif; color:#172033; background:#edf2f7; }
+body { margin:0; padding-top:70px; }
+header { position:fixed; top:0; left:0; right:0; height:56px; box-sizing:border-box; padding:8px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; background:#17345d; color:white; z-index:20; }
+nav { display:flex; flex-wrap:wrap; gap:16px; }
+header a { color:white; }
+main { max-width:960px; margin:16px auto; padding:0 20px; }
+h1 { font-size:30px; margin:0 0 12px; } h2 { font-size:23px; margin:0 0 12px; } h3 { margin:0 0 8px; }
+section { background:white; border:1px solid #ccd6e4; padding:18px; margin:20px 0; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
+article { background:#dceafa; padding:16px; border:1px solid #91a8c5; }
+button { padding:6px 12px; }
+.dashboard { display:grid; grid-template-columns:160px 1fr; grid-template-rows:36px auto 30px; grid-template-areas:'header header' 'side main' 'footer footer'; gap:10px; }
+.banner { grid-area:header; background:#d5f5e6; padding:8px; box-sizing:border-box; }
+aside { grid-area:side; background:#e1e8f2; padding:12px; }
+.panel { grid-area:main; position:relative; min-height:100px; background:#e8f0fa; padding:44px 16px 16px; }
+.badge { position:absolute; top:8px; right:8px; background:#17345d; color:white; padding:4px 8px; font-size:12px; }
+footer { grid-area:footer; background:#d5f5e6; padding:6px; box-sizing:border-box; }
+.float-block { overflow:auto; }
+.floating { float:left; width:120px; height:70px; margin:0 16px 8px 0; background:#d5f5e6; padding:10px; box-sizing:border-box; }
+.cleared { clear:both; }
+.stack { position:relative; height:90px; } .stack div { position:absolute; width:150px; height:65px; padding:8px; color:white; }
+.red { top:0; left:0; background:#a72c3a; z-index:3; } .blue { top:20px; left:90px; background:#174d99; z-index:1; }
+table { width:100%; border-spacing:0; table-layout:fixed; } td,th { padding:8px; border:1px solid #91a8c5; } th { background:#dceafa; } td { vertical-align:middle; }
+.acid { display:grid; grid-template:40px 40px / 40px 40px; gap:2px; width:82px; background:white; } .acid div { background:green; }
+@media(max-width:600px) { header { position:static; height:auto; flex-direction:column; align-items:start; } body { padding-top:0; } main { padding:0 10px; } .dashboard { grid-template-columns:100px 1fr; } .cards { grid-template-columns:1fr; } }

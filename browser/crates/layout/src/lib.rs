@@ -3,10 +3,12 @@
 
 mod flow;
 pub mod geometry;
+mod stacking;
 pub mod text;
 mod tree;
+pub use stacking::PaintCommand;
 
-pub use flow::layout;
+pub use flow::{layout, LayoutCache};
 pub use geometry::{Edges, Rect, Size};
 pub use tree::{build_render_tree, ElementId, RenderKind, RenderNode, RenderTree, Replaced};
 
@@ -71,6 +73,7 @@ pub struct Glyph {
     pub x: i32,
     pub y: i32,
     pub color: css::values::Color,
+    pub position: (f32, f32),
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +103,11 @@ pub struct LayoutBox {
     pub anonymous: bool,
     pub style: Arc<ComputedStyle>,
     pub border_box: Rect,
+    /// Unshifted normal-flow position; relative offsets do not move siblings.
+    pub flow_box: Rect,
+    pub fixed: bool,
+    pub parent: Option<usize>,
+    pub formatting_context: usize,
     pub padding_box: Rect,
     pub content_box: Rect,
     pub border: Edges,
@@ -116,12 +124,14 @@ pub struct HitRegion {
     pub href: Url,
     /// Overflow ancestors, outermost first. Scroll transforms are paint-only.
     pub ancestors: Vec<usize>,
+    pub fixed: bool,
 }
 #[derive(Debug, Clone)]
 pub struct TargetRegion {
     pub element: ElementId,
     pub rect: Rect,
     pub ancestors: Vec<usize>,
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,6 +141,9 @@ pub struct LayoutStats {
     pub glyphs: usize,
     pub depth_fallbacks: usize,
     pub truncated: bool,
+    pub reused_boxes: usize,
+    pub reused_subtrees: usize,
+    pub dirty_nodes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -142,63 +155,120 @@ pub struct LayoutResult {
     pub content_size: Size,
     pub viewport: Size,
     pub stats: LayoutStats,
+    pub paint_order: Vec<PaintCommand>,
+    pub paint_rank: Vec<usize>,
 }
 
 pub type ScrollOffsets = HashMap<ElementId, (f32, f32)>;
 
 impl LayoutResult {
     pub fn hit_element(&self, x: f32, y: f32, offsets: &ScrollOffsets) -> Option<ElementId> {
-        fn local(
-            result: &LayoutResult,
-            x: f32,
-            y: f32,
-            ancestors: &[usize],
-            offsets: &ScrollOffsets,
-        ) -> Option<(f32, f32)> {
-            let (mut x, mut y) = (x, y);
-            for &i in ancestors {
-                let b = &result.boxes[i];
-                if b.overflow != Overflow::Visible && !b.padding_box.contains(x, y) {
-                    return None;
-                }
-                if matches!(b.overflow, Overflow::Auto | Overflow::Scroll) {
-                    let (dx, dy) = offsets.get(&b.element).copied().unwrap_or_default();
-                    x += dx;
-                    y += dy;
+        self.hit_element_scrolled(x, y, (0.0, 0.0), offsets)
+    }
+    fn local_point(
+        &self,
+        x: f32,
+        y: f32,
+        scroll: (f32, f32),
+        fixed: bool,
+        ancestors: &[usize],
+        offsets: &ScrollOffsets,
+    ) -> Option<(f32, f32)> {
+        let (mut x, mut y) = if fixed {
+            (x - scroll.0, y - scroll.1)
+        } else {
+            (x, y)
+        };
+        let start = if fixed {
+            ancestors
+                .iter()
+                .position(|&i| self.boxes[i].fixed)
+                .unwrap_or(ancestors.len())
+        } else {
+            0
+        };
+        for &i in &ancestors[start..] {
+            let b = &self.boxes[i];
+            if b.overflow != Overflow::Visible && !b.padding_box.contains(x, y) {
+                return None;
+            }
+            if matches!(b.overflow, Overflow::Auto | Overflow::Scroll) {
+                let (dx, dy) = offsets.get(&b.element).copied().unwrap_or_default();
+                x += dx;
+                y += dy;
+            }
+        }
+        Some((x, y))
+    }
+    fn rank(&self, i: usize) -> usize {
+        self.paint_rank.get(i).copied().unwrap_or(i)
+    }
+    pub fn hit_element_scrolled(
+        &self,
+        x: f32,
+        y: f32,
+        scroll: (f32, f32),
+        offsets: &ScrollOffsets,
+    ) -> Option<ElementId> {
+        let mut found = None;
+        for (i, b) in self.boxes.iter().enumerate() {
+            if b.anonymous || !b.style.visible {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut p = b.parent;
+            while let Some(i) = p {
+                path.push(i);
+                p = self.boxes[i].parent;
+            }
+            path.reverse();
+            if let Some((x, y)) = self.local_point(x, y, scroll, b.fixed, &path, offsets) {
+                if b.border_box.contains(x, y) {
+                    let key = (self.rank(i), 0usize, i);
+                    if found.as_ref().is_none_or(|(old, _)| key > *old) {
+                        found = Some((key, b.element));
+                    }
                 }
             }
-            Some((x, y))
         }
-        for target in self.targets.iter().rev() {
-            if let Some((px, py)) = local(self, x, y, &target.ancestors, offsets) {
-                if target.rect.contains(px, py) {
-                    return Some(target.element);
+        for (n, target) in self.targets.iter().enumerate() {
+            if let Some((x, y)) =
+                self.local_point(x, y, scroll, target.fixed, &target.ancestors, offsets)
+            {
+                if target.rect.contains(x, y) {
+                    let owner = target.ancestors.last().copied().unwrap_or(0);
+                    let key = (self.rank(owner), 1, n);
+                    if found.as_ref().is_none_or(|(old, _)| key > *old) {
+                        found = Some((key, target.element));
+                    }
                 }
             }
         }
-        self.boxes
-            .iter()
-            .rev()
-            .find(|b| !b.anonymous && b.style.visible && b.border_box.contains(x, y))
-            .map(|b| b.element)
+        found.map(|(_, e)| e)
     }
     /// Links use the same overflow clips and nested offsets as painting.
     pub fn hit_link(&self, x: f32, y: f32, offsets: &ScrollOffsets) -> Option<Url> {
-        self.hits.iter().rev().find_map(|hit| {
-            let (mut px, mut py) = (x, y);
-            for &index in &hit.ancestors {
-                let b = &self.boxes[index];
-                if b.overflow != Overflow::Visible && !b.padding_box.contains(px, py) {
-                    return None;
-                }
-                if matches!(b.overflow, Overflow::Scroll | Overflow::Auto) {
-                    let (dx, dy) = offsets.get(&b.element).copied().unwrap_or_default();
-                    px += dx;
-                    py += dy;
-                }
-            }
-            hit.rect.contains(px, py).then(|| hit.href.clone())
-        })
+        self.hit_link_scrolled(x, y, (0.0, 0.0), offsets)
+    }
+    pub fn hit_link_scrolled(
+        &self,
+        x: f32,
+        y: f32,
+        scroll: (f32, f32),
+        offsets: &ScrollOffsets,
+    ) -> Option<Url> {
+        self.hits
+            .iter()
+            .enumerate()
+            .filter_map(|(n, h)| {
+                let (x, y) = self.local_point(x, y, scroll, h.fixed, &h.ancestors, offsets)?;
+                h.rect.contains(x, y).then_some((
+                    (self.rank(h.ancestors.last().copied().unwrap_or(0)), n),
+                    h.href.clone(),
+                ))
+            })
+            .max_by_key(|(k, _)| *k)
+            .map(|(_, url)| url)
     }
 
     /// Scroll the deepest overflow container under the pointer. No layout.

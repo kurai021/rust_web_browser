@@ -41,6 +41,8 @@ impl LayoutWorker {
                 let mut generation = None;
                 let mut rasterizer = Rasterizer::default();
                 let mut passes = 0;
+                let mut cache = layout::LayoutCache::default();
+                let mut navigation = None;
                 while let Ok(mut request) = rx.recv() {
                     while let Ok(newer) = rx.try_recv() {
                         request = newer;
@@ -52,17 +54,23 @@ impl LayoutWorker {
                         ));
                         generation = Some(request.font_generation);
                         rasterizer.clear();
+                        cache.clear();
+                    }
+                    if navigation != Some(request.navigation) {
+                        cache.clear();
+                        navigation = Some(request.navigation);
                     }
                     let Some(fonts) = &mut fonts else {
                         continue;
                     };
                     let started = std::time::Instant::now();
-                    let (layout, scene) = crate::viewport::layout_page(
+                    let (layout, scene) = crate::viewport::layout_page_cached(
                         &request.page,
                         &request.styles,
                         request.viewport,
                         fonts,
                         &mut rasterizer,
+                        &mut cache,
                     );
                     passes += 1;
                     let ready = Ready {

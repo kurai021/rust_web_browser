@@ -1,4 +1,4 @@
-//! Phase 5 window: page scripting/events alongside retained GPU/CPU painting.
+//! Phase 6 window: advanced/incremental layout and retained GPU/CPU painting.
 //!
 //! winit chrome, wgpu compositing and the matching softbuffer fallback.
 //! Network, image decoding, page layout and glyph preparation stay on workers.
@@ -55,7 +55,7 @@ fn welcome_article() -> Article {
     Article {
         title: Some("Welcome".to_owned()),
         blocks: vec![
-            Block::Heading { level: 1, text: "browser — Phase 5".to_owned(), links: Vec::new() },
+            Block::Heading { level: 1, text: "browser — Phase 6".to_owned(), links: Vec::new() },
             Block::Paragraph {
                 text: "This window runs the in-house JavaScript interpreter with DOM events, input controls and timers, alongside GPU/software painting.".to_owned(),
                 links: Vec::new(),
@@ -1175,9 +1175,10 @@ impl ShellApp {
             let content_y = my as f32 - vy as f32 + self.scroll_y - self.page_origin.1;
             if self.script_ready {
                 if let Some(flow) = &self.flow {
-                    if let Some(element) = flow.hit_element(
+                    if let Some(element) = flow.hit_element_scrolled(
                         (mx as f32 - vx as f32 + self.scroll_x) / self.zoom,
                         content_y / self.zoom,
+                        (self.scroll_x / self.zoom, self.scroll_y / self.zoom),
                         &self.scroll_offsets,
                     ) {
                         let mut node = element.node;
@@ -1216,7 +1217,12 @@ impl ShellApp {
     /// Link under viewport-content point `(x, y)` (content coords).
     fn hit_link(&mut self, x: f32, y: f32) -> Option<Url> {
         if let Some(flow) = &self.flow {
-            return flow.hit_link(x / self.zoom, y / self.zoom, &self.scroll_offsets);
+            return flow.hit_link_scrolled(
+                x / self.zoom,
+                y / self.zoom,
+                (self.scroll_x / self.zoom, self.scroll_y / self.zoom),
+                &self.scroll_offsets,
+            );
         }
         for block in &mut self.blocks {
             if y >= block.y && y < block.y + block.height {
@@ -1488,7 +1494,8 @@ impl ShellApp {
                 );
                 self.painted_navigation = true;
             }
-            eprintln!("PERF frame={} renderer={} layout_passes={} layout_ms={:.3} frame_ms={:.3} scroll={:.1} zoom={:.2}", self.frames, if self.gpu.is_some() { "gpu" } else { "software" }, self.layout_passes, self.layout_ms, frame_started.elapsed().as_secs_f64() * 1000.0, self.scroll_y, self.zoom);
+            let stats = self.flow.as_ref().map(|f| &f.stats);
+            eprintln!("PERF frame={} renderer={} layout_passes={} layout_ms={:.3} frame_ms={:.3} scroll={:.1} zoom={:.2} dirty_nodes={} reused_boxes={} reused_subtrees={}", self.frames, if self.gpu.is_some() { "gpu" } else { "software" }, self.layout_passes, self.layout_ms, frame_started.elapsed().as_secs_f64() * 1000.0, self.scroll_y, self.zoom,stats.map_or(0,|s|s.dirty_nodes),stats.map_or(0,|s|s.reused_boxes),stats.map_or(0,|s|s.reused_subtrees));
         }
     }
 

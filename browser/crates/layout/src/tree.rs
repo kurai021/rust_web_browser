@@ -1,6 +1,7 @@
 //! Render tree generation and anonymous block/inline splitting.
 
 use crate::MAX_BOX_DEPTH;
+use css::layout_values::{Float, Mode};
 use css::selectors::PseudoElement;
 use css::style::Display;
 use css::{ComputedStyle, ComputedStyles};
@@ -14,7 +15,7 @@ pub struct ElementId {
     pub pseudo: Option<PseudoElement>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Replaced {
     Image {
         url: Option<Url>,
@@ -31,7 +32,7 @@ pub enum Replaced {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RenderKind {
     Block,
     Inline,
@@ -49,8 +50,23 @@ pub struct RenderNode {
     pub style: Arc<ComputedStyle>,
     pub children: Vec<usize>,
     pub href: Option<Url>,
+    pub span: [usize; 2],
+    pub dirty: bool,
 }
 impl RenderNode {
+    pub fn out_of_flow(&self) -> bool {
+        !matches!(
+            self.kind,
+            RenderKind::Text(_) | RenderKind::Break | RenderKind::AnonymousBlock
+        ) && self.style.layout.position.out_of_flow()
+    }
+    pub fn floating(&self) -> bool {
+        !matches!(
+            self.kind,
+            RenderKind::Text(_) | RenderKind::Break | RenderKind::AnonymousBlock
+        ) && self.style.layout.float != Float::None
+            && !self.out_of_flow()
+    }
     pub fn is_block(&self) -> bool {
         matches!(self.kind, RenderKind::Block | RenderKind::AnonymousBlock)
             || (matches!(self.kind, RenderKind::Replaced(_))
@@ -146,6 +162,8 @@ impl Builder<'_> {
                             style: node.style.clone(),
                             href: node.href.clone(),
                             children: Vec::new(),
+                            span: [1, 1],
+                            dirty: true,
                         });
                         node.children.push(child);
                         Vec::new()
@@ -175,6 +193,8 @@ impl Builder<'_> {
                                 style: marker,
                                 href: None,
                                 children: Vec::new(),
+                                span: [1, 1],
+                                dirty: true,
                             });
                             node.children.push(child);
                         }
@@ -239,6 +259,8 @@ impl Builder<'_> {
             style: inherited,
             children: Vec::new(),
             href,
+            span: [1, 1],
+            dirty: true,
         };
         match &self.dom.get(id).data {
             NodeData::Text(text) => {
@@ -255,6 +277,18 @@ impl Builder<'_> {
                     return None;
                 }
                 node.style = self.styles.get(id).cloned().unwrap_or(node.style);
+                node.span = ["rowspan", "colspan"].map(|name| {
+                    self.dom
+                        .get_attribute(id, name)
+                        .or_else(|| {
+                            (name == "colspan")
+                                .then(|| self.dom.get_attribute(id, "span"))
+                                .flatten()
+                        })
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, 128)
+                });
                 if node.style.display == Display::None {
                     return None;
                 }
@@ -310,14 +344,20 @@ impl Builder<'_> {
                 } else if el.tag_name == "br" {
                     RenderKind::Break
                 } else {
-                    match node.style.display {
-                        Display::Block
-                        | Display::ListItem
-                        | Display::Table
-                        | Display::Flex
-                        | Display::Grid => RenderKind::Block,
-                        Display::InlineBlock => RenderKind::InlineBlock,
-                        _ => RenderKind::Inline,
+                    if node.style.layout.inline && node.style.layout.mode != Mode::Flow {
+                        RenderKind::InlineBlock
+                    } else if node.out_of_flow() || node.floating() {
+                        RenderKind::Block
+                    } else {
+                        match node.style.display {
+                            Display::Block
+                            | Display::ListItem
+                            | Display::Table
+                            | Display::Flex
+                            | Display::Grid => RenderKind::Block,
+                            Display::InlineBlock => RenderKind::InlineBlock,
+                            _ => RenderKind::Inline,
+                        }
                     }
                 };
             }
@@ -339,6 +379,8 @@ impl Builder<'_> {
                     style: style.clone(),
                     href: node.href.clone(),
                     children: Vec::new(),
+                    span: [1, 1],
+                    dirty: true,
                 });
                 let generated = RenderNode {
                     element,
@@ -350,6 +392,8 @@ impl Builder<'_> {
                     style: style.clone(),
                     href: node.href.clone(),
                     children: vec![text],
+                    span: [1, 1],
+                    dirty: true,
                 };
                 node.children.extend(self.normalize(generated));
             }
@@ -357,12 +401,51 @@ impl Builder<'_> {
     }
     fn normalize(&mut self, mut node: RenderNode) -> Vec<usize> {
         let children = std::mem::take(&mut node.children);
+        if !matches!(node.kind, RenderKind::AnonymousBlock)
+            && matches!(node.style.layout.mode, Mode::Flex | Mode::Grid)
+        {
+            for child in children {
+                if matches!(&self.tree.nodes[child].kind,RenderKind::Text(s) if s.trim().is_empty())
+                {
+                    continue;
+                }
+                if matches!(
+                    self.tree.nodes[child].kind,
+                    RenderKind::Text(_) | RenderKind::Break
+                ) {
+                    let element = self.tree.nodes[child].element;
+                    let anonymous = self.insert(RenderNode {
+                        element,
+                        kind: RenderKind::AnonymousBlock,
+                        style: node.style.clone(),
+                        children: vec![child],
+                        href: None,
+                        span: [1, 1],
+                        dirty: true,
+                    });
+                    node.children.push(anonymous);
+                } else {
+                    if matches!(
+                        self.tree.nodes[child].kind,
+                        RenderKind::Inline | RenderKind::InlineBlock
+                    ) {
+                        self.tree.nodes[child].kind = RenderKind::Block;
+                    }
+                    node.children.push(child);
+                }
+            }
+            return vec![self.insert(node)];
+        }
         if (node.is_block() || matches!(node.kind, RenderKind::InlineBlock))
-            && children.iter().any(|&id| self.tree.nodes[id].is_block())
+            && children.iter().any(|&id| {
+                self.tree.nodes[id].is_block()
+                    && !self.tree.nodes[id].out_of_flow()
+                    && !self.tree.nodes[id].floating()
+            })
         {
             let mut inline = Vec::new();
             for id in children {
-                if self.tree.nodes[id].is_block() {
+                if self.tree.nodes[id].is_block() && !self.tree.nodes[id].out_of_flow() {
                     self.flush_anonymous(&mut node, &mut inline);
                     node.children.push(id);
                 } else {
@@ -404,6 +487,8 @@ impl Builder<'_> {
             style: node.style.clone(),
             href: node.href.clone(),
             children: std::mem::take(inline),
+            span: [1, 1],
+            dirty: true,
         });
         node.children.push(id);
     }

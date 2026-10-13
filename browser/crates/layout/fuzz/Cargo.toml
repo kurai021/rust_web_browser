@@ -1,0 +1,26 @@
+[package]
+name = "layout-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+layout = { path = ".." }
+css = { path = "../../css" }
+html = { path = "../../html" }
+cosmic-text = "0.12"
+url = "2"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "layout"
+path = "fuzz_targets/layout.rs"
+test = false
+doc = false
+bench = false

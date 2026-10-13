@@ -13,9 +13,26 @@ pub fn layout_page(
     fonts: &mut FontSystem,
     rasterizer: &mut Rasterizer,
 ) -> (LayoutResult, Scene) {
+    layout_page_cached(
+        page,
+        styles,
+        viewport,
+        fonts,
+        rasterizer,
+        &mut layout::LayoutCache::default(),
+    )
+}
+pub fn layout_page_cached(
+    page: &Page,
+    styles: &ComputedStyles,
+    viewport: Size,
+    fonts: &mut FontSystem,
+    rasterizer: &mut Rasterizer,
+    cache: &mut layout::LayoutCache,
+) -> (LayoutResult, Scene) {
     let mut tree = layout::build_render_tree(&page.document, styles);
     let images = page.image_cache.snapshot();
-    let result = layout::layout(
+    let result = cache.layout(
         viewport,
         &mut tree,
         LayoutOpts {

@@ -49,6 +49,8 @@ pub enum DisplayItem {
         opacity: f32,
     },
     EndStackingContext,
+    FixedViewport,
+    EndFixedViewport,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,17 +59,23 @@ pub struct DisplayList {
 }
 
 pub fn build_display_list(layout: &LayoutResult) -> DisplayList {
-    enum Walk {
-        Box(usize),
-        Item(DisplayItem),
-    }
-    fn walk(result: &LayoutResult, index: usize, list: &mut DisplayList) -> Vec<Walk> {
+    fn fixed(result: &LayoutResult, index: usize) -> bool {
         let b = &result.boxes[index];
+        b.fixed
+            && (b.style.layout.position == css::layout_values::Position::Fixed
+                || b.parent.is_none_or(|p| !result.boxes[p].fixed))
+            && !b.anonymous
+    }
+    fn start(result: &LayoutResult, index: usize, list: &mut DisplayList, effects_only: bool) {
+        let b = &result.boxes[index];
+        if fixed(result, index) {
+            list.items.push(DisplayItem::FixedViewport);
+        }
         if !b.anonymous {
             list.items.push(DisplayItem::StackingContext {
                 opacity: b.style.opacity,
             });
-            if b.style.visible {
+            if b.style.visible && !effects_only {
                 list.items.push(DisplayItem::FillRect {
                     rect: b.border_box,
                     color: b.style.background_color,
@@ -125,51 +133,60 @@ pub fn build_display_list(layout: &LayoutResult) -> DisplayList {
             }),
             Overflow::Visible => {}
         }
-        let mut tail = Vec::new();
-        for content in &b.content {
-            match content {
-                Content::Box(i) => tail.push(Walk::Box(*i)),
-                Content::Text(run) => tail.push(Walk::Item(DisplayItem::TextRun(run.clone()))),
-                Content::Image { rect, image } => {
-                    if b.style.visible {
-                        tail.push(Walk::Item(DisplayItem::Image {
-                            rect: *rect,
-                            image: image.clone(),
-                        }));
-                    }
-                }
-                Content::Decoration { rect, color } => {
-                    tail.push(Walk::Item(DisplayItem::FillRect {
-                        rect: *rect,
-                        color: *color,
-                        radius: 0.0,
-                    }))
-                }
-            }
-        }
+    }
+    fn end(result: &LayoutResult, index: usize, list: &mut DisplayList, effects_only: bool) {
+        let b = &result.boxes[index];
         match b.overflow {
-            Overflow::Hidden => tail.push(Walk::Item(DisplayItem::EndClip)),
-            Overflow::Scroll | Overflow::Auto => tail.push(Walk::Item(DisplayItem::EndScrollFrame)),
+            Overflow::Hidden => list.items.push(DisplayItem::EndClip),
+            Overflow::Scroll | Overflow::Auto => list.items.push(DisplayItem::EndScrollFrame),
             Overflow::Visible => {}
         }
-        if matches!(b.overflow, Overflow::Scroll | Overflow::Auto) {
-            tail.push(Walk::Item(DisplayItem::ScrollBars {
+        if !effects_only && matches!(b.overflow, Overflow::Scroll | Overflow::Auto) {
+            list.items.push(DisplayItem::ScrollBars {
                 element: b.element,
                 rect: b.padding_box,
                 size: b.scroll_size,
-            }));
+            });
         }
         if !b.anonymous {
-            tail.push(Walk::Item(DisplayItem::EndStackingContext));
+            list.items.push(DisplayItem::EndStackingContext);
         }
-        tail
+        if fixed(result, index) {
+            list.items.push(DisplayItem::EndFixedViewport);
+        }
     }
     let mut list = DisplayList::default();
-    let mut work: Vec<_> = layout.roots.iter().rev().map(|&i| Walk::Box(i)).collect();
-    while let Some(next) = work.pop() {
-        match next {
-            Walk::Box(index) => work.extend(walk(layout, index, &mut list).into_iter().rev()),
-            Walk::Item(item) => list.items.push(item),
+    let fallback = if layout.paint_order.is_empty() {
+        layout.stacking_commands()
+    } else {
+        Vec::new()
+    };
+    let order = if layout.paint_order.is_empty() {
+        &fallback
+    } else {
+        &layout.paint_order
+    };
+    for cmd in order {
+        match *cmd {
+            layout::PaintCommand::Start(i) => start(layout, i, &mut list, false),
+            layout::PaintCommand::End(i) => end(layout, i, &mut list, false),
+            layout::PaintCommand::EffectsStart(i) => start(layout, i, &mut list, true),
+            layout::PaintCommand::EffectsEnd(i) => end(layout, i, &mut list, true),
+            layout::PaintCommand::Item(i, c) => match &layout.boxes[i].content[c] {
+                Content::Text(run) => list.items.push(DisplayItem::TextRun(run.clone())),
+                Content::Image { rect, image } if layout.boxes[i].style.visible => {
+                    list.items.push(DisplayItem::Image {
+                        rect: *rect,
+                        image: image.clone(),
+                    })
+                }
+                Content::Decoration { rect, color } => list.items.push(DisplayItem::FillRect {
+                    rect: *rect,
+                    color: *color,
+                    radius: 0.0,
+                }),
+                _ => {}
+            },
         }
     }
     list
@@ -217,6 +234,7 @@ enum SceneItem {
         size: Size,
     },
     Pop,
+    FixedViewport,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -303,6 +321,12 @@ impl Scene {
                 SceneItem::Opacity(alpha) => {
                     stack.push(state);
                     state.alpha *= alpha.clamp(0.0, 1.0);
+                }
+                SceneItem::FixedViewport => {
+                    stack.push(state);
+                    state.x = viewport.x;
+                    state.y = viewport.y;
+                    state.clip = viewport;
                 }
                 SceneItem::ScrollBars {
                     element,
@@ -534,6 +558,7 @@ impl Rasterizer {
                 DisplayItem::StackingContext { opacity } => {
                     items.push(SceneItem::Opacity(*opacity))
                 }
+                DisplayItem::FixedViewport => items.push(SceneItem::FixedViewport),
                 DisplayItem::ScrollBars {
                     element,
                     rect,
@@ -546,6 +571,7 @@ impl Rasterizer {
                 DisplayItem::EndClip
                 | DisplayItem::EndScrollFrame
                 | DisplayItem::EndStackingContext => items.push(SceneItem::Pop),
+                DisplayItem::EndFixedViewport => items.push(SceneItem::Pop),
             }
         }
         Scene { items }

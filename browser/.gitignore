@@ -12,3 +12,6 @@ crates/paint/fuzz/target/
 crates/js/fuzz/corpus/
 crates/js/fuzz/artifacts/
 crates/js/fuzz/target/
+crates/layout/fuzz/corpus/
+crates/layout/fuzz/artifacts/
+crates/layout/fuzz/target/

@@ -2,9 +2,22 @@
 
 use crate::text::{Shaped, Shaper};
 use crate::*;
+use css::layout_values::{Align, Clear, Float, Mode, Position};
 use css::style::{BackgroundImage, TextAlign, WhiteSpace};
 use css::values::{Length, LengthContext, SizeValue};
 use std::sync::Arc;
+mod cache;
+mod flex;
+mod grid;
+mod positioned;
+pub use cache::LayoutCache;
+mod table;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct UsedSize {
+    width: Option<f32>,
+    height: Option<f32>,
+}
 
 #[derive(Clone, Copy, Default)]
 struct MarginSet {
@@ -38,6 +51,14 @@ struct Margins {
 }
 
 pub fn layout(viewport: Size, tree: &mut RenderTree, opts: LayoutOpts<'_>) -> LayoutResult {
+    perform(viewport, tree, opts, None)
+}
+fn perform<'a>(
+    viewport: Size,
+    tree: &'a RenderTree,
+    opts: LayoutOpts<'a>,
+    cache: Option<&'a mut LayoutCache>,
+) -> LayoutResult {
     let viewport = Size::new(
         finite(viewport.width).max(1.0),
         finite(viewport.height).max(1.0),
@@ -52,6 +73,12 @@ pub fn layout(viewport: Size, tree: &mut RenderTree, opts: LayoutOpts<'_>) -> La
             ..LayoutResult::default()
         },
         margins: Vec::new(),
+        used: vec![UsedSize::default(); tree.nodes.len()],
+        positioned: Vec::new(),
+        inline_owner: None,
+        float_regions: HashMap::new(),
+        cache,
+        measuring: false,
     };
     engine.result.stats.depth_fallbacks = engine.tree.depth_fallbacks;
     engine
@@ -72,13 +99,14 @@ pub fn layout(viewport: Size, tree: &mut RenderTree, opts: LayoutOpts<'_>) -> La
             false,
         );
         if !m.through {
-            cursor = engine.result.boxes[index].border_box.bottom();
+            cursor = engine.result.boxes[index].flow_box.bottom();
             pending = m.after;
         } else {
             pending = pending.merge(m.before).merge(m.after);
         }
         engine.result.roots.push(index);
     }
+    engine.layout_positioned();
     let mut right = viewport.width;
     let mut bottom = cursor + pending.value();
     // Visible overflow contributes to document scroll extents, clipped content
@@ -94,6 +122,7 @@ pub fn layout(viewport: Size, tree: &mut RenderTree, opts: LayoutOpts<'_>) -> La
     }
     engine.result.content_size = Size::new(finite(right).max(0.0), finite(bottom).max(0.0));
     engine.result.stats.boxes = engine.result.boxes.len();
+    engine.result.finalize_paint();
     engine.result
 }
 
@@ -124,8 +153,178 @@ struct Engine<'a> {
     viewport: Size,
     result: LayoutResult,
     margins: Vec<Margins>,
+    used: Vec<UsedSize>,
+    positioned: Vec<positioned::Pending>,
+    inline_owner: Option<usize>,
+    float_regions: HashMap<usize, Vec<(Rect, Float)>>,
+    cache: Option<&'a mut LayoutCache>,
+    measuring: bool,
 }
 impl Engine<'_> {
+    fn item(
+        &mut self,
+        index: usize,
+        rect: Rect,
+        top: f32,
+        height: Option<f32>,
+        ancestors: &[usize],
+        used: UsedSize,
+    ) -> usize {
+        let old = self.used[index];
+        self.used[index] = used;
+        self.compute_margins(index, rect.width, true);
+        let result = self.block(index, rect, top, height, ancestors, false);
+        self.used[index] = old;
+        result
+    }
+    fn measure(
+        &mut self,
+        index: usize,
+        width: f32,
+        height: Option<f32>,
+        used: UsedSize,
+    ) -> (Size, f32) {
+        if let Some(result) = self.cached_measure(index, width, height, used) {
+            return result;
+        }
+        let measuring = self.measuring;
+        self.measuring = true;
+        let boxes = self.result.boxes.len();
+        let hits = self.result.hits.len();
+        let targets = self.result.targets.len();
+        let stats = self.result.stats.clone();
+        let pending = self.positioned.len();
+        let b = self.item(
+            index,
+            Rect::new(0.0, 0.0, width, height.unwrap_or(0.0)),
+            0.0,
+            height,
+            &[],
+            used,
+        );
+        let rect = self.result.boxes[b].border_box;
+        let baseline = self.result.boxes[b]
+            .content
+            .iter()
+            .find_map(|c| match c {
+                Content::Text(t) => t.glyphs.first().map(|g| g.y as f32 - rect.y),
+                _ => None,
+            })
+            .unwrap_or(rect.height);
+        self.result.boxes.truncate(boxes);
+        self.result.hits.truncate(hits);
+        self.result.targets.truncate(targets);
+        self.result.stats = stats;
+        self.positioned.truncate(pending);
+        self.float_regions.retain(|&k, _| k < boxes);
+        self.measuring = measuring;
+        self.save_measure(index, width, height, used, (rect.size(), baseline));
+        (rect.size(), baseline)
+    }
+    fn intrinsic_sizes(&mut self, index: usize) -> (f32, f32) {
+        let node = &self.tree.nodes[index];
+        match &node.kind {
+            RenderKind::Text(text) => {
+                let max = text
+                    .lines()
+                    .map(|s| self.shaper.shape(s, &node.style).width)
+                    .fold(0.0, f32::max);
+                let min = if matches!(node.style.white_space, WhiteSpace::Pre | WhiteSpace::NoWrap)
+                {
+                    max
+                } else {
+                    text.split_whitespace()
+                        .map(|s| self.shaper.shape(s, &node.style).width)
+                        .fold(0.0, f32::max)
+                };
+                (min, max)
+            }
+            RenderKind::Replaced(r) => {
+                let w = self.replaced_size(node, r, self.viewport.width, None).width;
+                (w, w)
+            }
+            _ => {
+                let (mut min, mut max) = (0.0f32, 0.0f32);
+                let block_children = node.children.iter().any(|&i| self.tree.nodes[i].is_block());
+                for &c in &node.children {
+                    if self.tree.nodes[c].out_of_flow() {
+                        continue;
+                    }
+                    let (a, b) = self.intrinsic_sizes(c);
+                    min = min.max(a);
+                    if block_children
+                        && (node.style.layout.mode != Mode::Flex || node.style.layout.column)
+                    {
+                        max = max.max(b);
+                    } else {
+                        max += b;
+                    }
+                }
+                if node.style.layout.mode == Mode::Flex && !node.style.layout.column {
+                    let count = node
+                        .children
+                        .iter()
+                        .filter(|&&c| !self.tree.nodes[c].out_of_flow())
+                        .count();
+                    max += node.style.layout.gap[1]
+                        .resolve(self.ctx(&node.style, self.viewport.width))
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                        * count.saturating_sub(1) as f32;
+                }
+                let (m, p, b) = self.edges(node, self.viewport.width);
+                let extra = m.horizontal() + p.horizontal() + b.horizontal();
+                if let Some(w) = node
+                    .style
+                    .width
+                    .resolve(self.ctx(&node.style, self.viewport.width))
+                {
+                    let w = if node.style.border_box {
+                        w - p.horizontal() - b.horizontal()
+                    } else {
+                        w
+                    };
+                    min = min.min(w.max(0.0));
+                    max = w.max(0.0);
+                }
+                (finite(min + extra).max(0.0), finite(max + extra).max(0.0))
+            }
+        }
+    }
+    fn constrained_content(&self, index: usize, value: f32, basis: f32, vertical: bool) -> f32 {
+        let node = &self.tree.nodes[index];
+        let (_, p, b) = self.edges(node, basis);
+        let inset = if vertical {
+            p.vertical() + b.vertical()
+        } else {
+            p.horizontal() + b.horizontal()
+        };
+        let adjust = |n: f32| {
+            if node.style.border_box {
+                (n - inset).max(0.0)
+            } else {
+                n.max(0.0)
+            }
+        };
+        let min = if vertical {
+            &node.style.min_height
+        } else {
+            &node.style.min_width
+        };
+        let max = if vertical {
+            &node.style.max_height
+        } else {
+            &node.style.max_width
+        };
+        let mut n = value.max(0.0);
+        if let Some(v) = max.resolve(self.ctx(&node.style, basis)) {
+            n = n.min(adjust(v));
+        }
+        if let Some(v) = min.resolve(self.ctx(&node.style, basis)) {
+            n = n.max(adjust(v));
+        }
+        finite(n)
+    }
     fn ctx(&self, style: &ComputedStyle, basis: f32) -> LengthContext {
         LengthContext {
             font_size: style.font_size,
@@ -144,20 +343,24 @@ impl Engine<'_> {
             return (Edges::default(), Edges::default(), Edges::default());
         }
         let ctx = self.ctx(&node.style, width);
-        (
+        let mut result = (
             Edges::from_array(std::array::from_fn(|i| {
-                node.style.margin[i].resolve(ctx).unwrap_or(0.0)
+                finite(node.style.margin[i].resolve(ctx).unwrap_or(0.0))
             })),
             Edges::from_array(std::array::from_fn(|i| {
-                node.style.padding[i].resolve(ctx).unwrap_or(0.0).max(0.0)
+                finite(node.style.padding[i].resolve(ctx).unwrap_or(0.0)).max(0.0)
             })),
             Edges::from_array(std::array::from_fn(|i| {
-                node.style.border_width[i]
-                    .resolve(ctx)
-                    .unwrap_or(0.0)
-                    .max(0.0)
+                finite(node.style.border_width[i].resolve(ctx).unwrap_or(0.0)).max(0.0)
             })),
-        )
+        );
+        if node.style.layout.mode == Mode::Cell && node.style.layout.border_collapse {
+            result.2.top *= 0.5;
+            result.2.right *= 0.5;
+            result.2.bottom *= 0.5;
+            result.2.left *= 0.5;
+        }
+        result
     }
     fn content_width(
         &self,
@@ -231,20 +434,32 @@ impl Engine<'_> {
     fn compute_margins(&mut self, index: usize, width: f32, root: bool) {
         let node = &self.tree.nodes[index];
         let (content_width, margin, padding, border) = self.content_width(node, width, None);
+        let content_width = self.used[index].width.unwrap_or(content_width);
         for &child in &node.children {
             if self.tree.nodes[child].is_block() {
                 self.compute_margins(child, content_width, false);
             }
         }
+        if let Some(m) = self.margin_cached(index, width, root) {
+            self.margins[index] = m;
+            return;
+        }
         let ctx = self.ctx(&node.style, width);
         let auto_height = matches!(node.kind, RenderKind::AnonymousBlock)
             || matches!(node.style.height, SizeValue::Auto);
         let min_zero = node.style.min_height.resolve(ctx).unwrap_or(0.0) <= 0.0;
-        let block_children = node.children.iter().all(|&i| self.tree.nodes[i].is_block());
+        let block_children = node.children.iter().all(|&i| {
+            self.tree.nodes[i].is_block()
+                && !self.tree.nodes[i].out_of_flow()
+                && !self.tree.nodes[i].floating()
+        });
+        let ordinary =
+            node.style.layout.mode == Mode::Flow && !node.floating() && !node.out_of_flow();
         let mut m = Margins {
             before: MarginSet::new(margin.top),
             after: MarginSet::new(margin.bottom),
-            through: auto_height
+            through: ordinary
+                && auto_height
                 && min_zero
                 && padding.vertical() + border.vertical() == 0.0
                 && !self.has_inline_ink(index)
@@ -253,11 +468,13 @@ impl Engine<'_> {
                     .iter()
                     .filter(|&&i| self.tree.nodes[i].is_block())
                     .all(|&i| self.margins[i].through),
-            top_child: !root
+            top_child: ordinary
+                && !root
                 && overflow(&node.style) == Overflow::Visible
                 && padding.top + border.top == 0.0
                 && block_children,
-            bottom_child: !root
+            bottom_child: ordinary
+                && !root
                 && overflow(&node.style) == Overflow::Visible
                 && padding.bottom + border.bottom == 0.0
                 && auto_height
@@ -288,9 +505,41 @@ impl Engine<'_> {
             m.after = both;
         }
         self.margins[index] = m;
+        self.save_margin(index, width, root, m);
     }
 
     fn block(
+        &mut self,
+        index: usize,
+        containing: Rect,
+        top: f32,
+        parent_height: Option<f32>,
+        ancestors: &[usize],
+        atomic: bool,
+    ) -> usize {
+        if let Some(root) =
+            self.cached_block(index, containing, top, parent_height, ancestors, atomic)
+        {
+            return root;
+        }
+        let start = self.result.boxes.len();
+        let lines = self.result.stats.lines;
+        let glyphs = self.result.stats.glyphs;
+        let root = self.block_raw(index, containing, top, parent_height, ancestors, atomic);
+        self.save_block(
+            index,
+            containing,
+            top,
+            parent_height,
+            ancestors,
+            atomic,
+            start,
+            lines,
+            glyphs,
+        );
+        root
+    }
+    fn block_raw(
         &mut self,
         index: usize,
         containing: Rect,
@@ -313,7 +562,25 @@ impl Engine<'_> {
         };
         let (mut width, mut margin, padding, border) =
             self.content_width(node, containing.width, shrink);
+        if node.style.layout.mode == Mode::Table
+            && matches!(node.style.width, SizeValue::Auto)
+            && self.used[index].width.is_none()
+        {
+            width = self.table_intrinsic(index, containing.width).min(
+                (containing.width
+                    - margin.left
+                    - margin.right
+                    - padding.horizontal()
+                    - border.horizontal())
+                .max(0.0),
+            );
+            margin = self.edges(node, containing.width).0;
+        }
         let inset = padding.add_edges(border);
+        if let Some(forced) = self.used[index].width {
+            width = self.constrained_content(index, forced, containing.width, false);
+            margin = self.edges(node, containing.width).0;
+        }
         let height_ctx = self.ctx(&node.style, parent_height.unwrap_or(0.0));
         let height_value = |value: &SizeValue| {
             if parent_height.is_none()
@@ -335,10 +602,13 @@ impl Engine<'_> {
         } else {
             height_value(&node.style.height)
         };
+        specified_height = self.used[index].height.or(specified_height);
         let replaced_size = if let RenderKind::Replaced(replaced) = &node.kind {
             let size = self.replaced_size(node, replaced, containing.width, parent_height);
             width = size.width;
             specified_height = Some(size.height);
+            width = self.used[index].width.unwrap_or(width);
+            specified_height = self.used[index].height.or(specified_height);
             if !atomic {
                 let (raw_margin, _, _) = self.edges(node, containing.width);
                 margin = raw_margin;
@@ -364,9 +634,34 @@ impl Engine<'_> {
             x + inset.left,
             y + inset.top,
             width,
-            replaced_size.map_or(0.0, |s| s.height),
+            if replaced_size.is_some() {
+                specified_height.unwrap_or(0.0)
+            } else {
+                0.0
+            },
         );
         let box_index = self.result.boxes.len();
+        let parent = ancestors.last().copied();
+        let new_context = parent.is_none()
+            || atomic
+            || node.floating()
+            || node.out_of_flow()
+            || overflow(&node.style) != Overflow::Visible
+            || matches!(
+                node.style.layout.mode,
+                Mode::Flex | Mode::Grid | Mode::Table | Mode::Cell
+            )
+            || parent.is_some_and(|i| {
+                matches!(
+                    self.result.boxes[i].style.layout.mode,
+                    Mode::Flex | Mode::Grid
+                )
+            });
+        let formatting_context = if new_context {
+            box_index
+        } else {
+            parent.map_or(box_index, |p| self.result.boxes[p].formatting_context)
+        };
         let radius = Length::parse(&css::token::tokenize_all(
             &node.style.get_property_value("border-radius"),
         ))
@@ -384,6 +679,10 @@ impl Engine<'_> {
             anonymous: matches!(node.kind, RenderKind::AnonymousBlock),
             style: node.style.clone(),
             border_box: Rect::new(x, y, width + inset.horizontal(), 0.0),
+            flow_box: Rect::default(),
+            fixed: false,
+            parent,
+            formatting_context,
             padding_box: Rect::default(),
             content_box: content,
             border,
@@ -408,12 +707,63 @@ impl Engine<'_> {
         let m = self.margins[index];
         if replaced_size.is_some() {
             self.emit_replaced(index, box_index, content, &child_ancestors);
-        } else if node.children.iter().any(|&i| self.tree.nodes[i].is_block()) {
+        } else if !matches!(node.kind, RenderKind::AnonymousBlock)
+            && node.style.layout.mode == Mode::Flex
+        {
+            cursor += self.flex(
+                index,
+                box_index,
+                content,
+                specified_height,
+                &child_ancestors,
+            );
+        } else if !matches!(node.kind, RenderKind::AnonymousBlock)
+            && node.style.layout.mode == Mode::Grid
+        {
+            cursor += self.grid(
+                index,
+                box_index,
+                content,
+                specified_height,
+                &child_ancestors,
+            );
+        } else if !matches!(node.kind, RenderKind::AnonymousBlock)
+            && node.style.layout.mode == Mode::Table
+        {
+            cursor += self.table(
+                index,
+                box_index,
+                content,
+                specified_height,
+                &child_ancestors,
+            );
+        } else if node.children.iter().any(|&i| {
+            self.tree.nodes[i].is_block()
+                && !self.tree.nodes[i].out_of_flow()
+                && !self.tree.nodes[i].floating()
+        }) {
             let mut first = true;
             for &child in &node.children {
                 if self.result.stats.truncated {
                     break;
                 }
+                if self.tree.nodes[child].out_of_flow() {
+                    self.defer_positioned(child, box_index, (content.x, cursor), &child_ancestors);
+                    continue;
+                }
+                if self.tree.nodes[child].floating() {
+                    self.place_float(
+                        child,
+                        box_index,
+                        content,
+                        cursor,
+                        specified_height,
+                        &child_ancestors,
+                    );
+                    continue;
+                }
+                cursor =
+                    self.clearance(box_index, cursor, self.tree.nodes[child].style.layout.clear);
                 let cm = self.margins[child];
                 let child_top = if first && m.top_child {
                     cursor
@@ -441,7 +791,7 @@ impl Engine<'_> {
                         pending = pending.merge(cm.before).merge(cm.after);
                     }
                 } else {
-                    cursor = self.result.boxes[child_box].border_box.bottom();
+                    cursor = self.result.boxes[child_box].flow_box.bottom();
                     pending = cm.after;
                     first = false;
                 }
@@ -451,6 +801,14 @@ impl Engine<'_> {
             }
         } else {
             cursor += self.inline(index, box_index, content, &child_ancestors);
+        }
+        if overflow(&node.style) != Overflow::Visible || atomic || node.floating() {
+            if let Some(floats) = self.float_regions.get(&box_index) {
+                cursor = floats
+                    .iter()
+                    .map(|(r, _)| r.bottom())
+                    .fold(cursor, f32::max);
+            }
         }
         let natural_height = (cursor - content.y).max(0.0);
         let mut height = specified_height.unwrap_or(natural_height);
@@ -492,27 +850,34 @@ impl Engine<'_> {
         }
         let b = &mut self.result.boxes[box_index];
         b.border_box = border_box;
+        b.flow_box = border_box;
         b.padding_box = padding_box;
         b.content_box.height = height;
         b.scroll_size = Size::new(
             finite(right - padding_box.x).max(0.0),
             finite(bottom - padding_box.y).max(0.0),
         );
+        if !matches!(node.kind, RenderKind::AnonymousBlock)
+            && node.style.layout.position == Position::Relative
+        {
+            let ctx = self.ctx(&node.style, containing.width);
+            let hc = self.ctx(&node.style, parent_height.unwrap_or(0.0));
+            let dx = node.style.layout.inset[3]
+                .resolve(ctx)
+                .or_else(|| node.style.layout.inset[1].resolve(ctx).map(|n| -n))
+                .unwrap_or(0.0);
+            let dy = node.style.layout.inset[0]
+                .resolve(hc)
+                .or_else(|| node.style.layout.inset[2].resolve(hc).map(|n| -n))
+                .unwrap_or(0.0);
+            self.shift_box(box_index, dx, dy);
+            self.result.boxes[box_index].flow_box = border_box;
+        }
         box_index
     }
 
     fn intrinsic_width(&mut self, index: usize) -> f32 {
-        let node = &self.tree.nodes[index];
-        match &node.kind {
-            RenderKind::Text(text) => self.shaper.shape(text, &node.style).width,
-            RenderKind::Replaced(r) => self.replaced_size(node, r, self.viewport.width, None).width,
-            _ => node
-                .children
-                .iter()
-                .map(|&i| self.intrinsic_width(i))
-                .sum::<f32>()
-                .clamp(0.0, MAX_EXTENT),
-        }
+        self.intrinsic_sizes(index).1
     }
     fn replaced_size(
         &mut self,
@@ -646,6 +1011,7 @@ impl Engine<'_> {
             element: node.element,
             rect,
             ancestors: ancestors.to_vec(),
+            fixed: false,
         });
         let RenderKind::Replaced(ref replaced) = node.kind else {
             return;
@@ -681,6 +1047,7 @@ impl Engine<'_> {
                 rect,
                 href: href.clone(),
                 ancestors: ancestors.to_vec(),
+                fixed: false,
             });
         }
     }
@@ -733,12 +1100,23 @@ impl Engine<'_> {
             .iter()
             .take(count)
             .map(|g| {
-                let p = g.physical((x, baseline), 1.0);
+                let position = (
+                    finite(g.x + g.font_size * g.x_offset + x),
+                    finite(g.y - g.font_size * g.y_offset + baseline),
+                );
+                let (key, gx, gy) = CacheKey::new(
+                    g.font_id,
+                    g.glyph_id,
+                    g.font_size,
+                    (position.0, position.1.trunc()),
+                    g.cache_key_flags,
+                );
                 Glyph {
-                    key: p.cache_key,
-                    x: p.x,
-                    y: p.y,
+                    key,
+                    x: gx,
+                    y: gy,
                     color,
+                    position,
                 }
             })
             .collect();
@@ -794,6 +1172,27 @@ impl Engine<'_> {
         pending_space: &mut bool,
     ) {
         let node = &self.tree.nodes[index];
+        if node.out_of_flow() {
+            if let Some(owner) = self.inline_owner {
+                self.defer_positioned(
+                    index,
+                    owner,
+                    (
+                        self.result.boxes[owner].content_box.x,
+                        self.result.boxes[owner].content_box.y,
+                    ),
+                    &[],
+                );
+            }
+            return;
+        }
+        if node.floating() {
+            if let Some(owner) = self.inline_owner {
+                let rect = self.result.boxes[owner].content_box;
+                self.place_float(index, owner, rect, rect.y, None, &[owner]);
+            }
+            return;
+        }
         if out.len() >= MAX_GLYPHS {
             self.result.stats.truncated = true;
             return;
@@ -987,27 +1386,41 @@ impl Engine<'_> {
         let node = &self.tree.nodes[index];
         let mut pieces = Vec::new();
         let mut pending = false;
+        let old_owner = self.inline_owner.replace(box_index);
         for &child in &node.children {
             self.pieces(child, containing.width, &[], &mut pieces, &mut pending);
         }
+        self.inline_owner = old_owner;
         let mut line = Vec::new();
         let mut width = 0.0;
         let mut y = containing.y;
+        let (mut line_x, mut available) = self.float_line(
+            box_index,
+            containing,
+            y,
+            node.style.line_height.pixels(node.style.font_size),
+        );
         let mut trailing_break = false;
         for piece in pieces {
             if matches!(piece.kind, PieceKind::Break) {
                 y += self.line(
                     box_index,
                     &mut line,
-                    containing.x,
+                    line_x,
                     y,
-                    containing.width,
+                    available,
                     &node.style,
                     ancestors,
                     false,
                     true,
                 );
                 width = 0.0;
+                (line_x, available) = self.float_line(
+                    box_index,
+                    containing,
+                    y,
+                    node.style.line_height.pixels(node.style.font_size),
+                );
                 trailing_break = true;
                 continue;
             }
@@ -1017,10 +1430,7 @@ impl Engine<'_> {
             }
             // Only spaces/atomic boundaries are legal word-wrap opportunities.
             // Styling a substring does not introduce an artificial break.
-            if piece.can_wrap
-                && !piece.space
-                && width + piece.width > containing.width
-                && !line.is_empty()
+            if piece.can_wrap && !piece.space && width + piece.width > available && !line.is_empty()
             {
                 let opportunity = line.iter().rposition(|p: &Piece| {
                     p.can_wrap && (p.space || matches!(p.kind, PieceKind::Atomic(..)))
@@ -1030,15 +1440,21 @@ impl Engine<'_> {
                     y += self.line(
                         box_index,
                         &mut line,
-                        containing.x,
+                        line_x,
                         y,
-                        containing.width,
+                        available,
                         &node.style,
                         ancestors,
                         true,
                         false,
                     );
                     line.append(&mut tail);
+                    (line_x, available) = self.float_line(
+                        box_index,
+                        containing,
+                        y,
+                        node.style.line_height.pixels(node.style.font_size),
+                    );
                     width = line.iter().map(|p| p.width).sum();
                 }
             }
@@ -1049,9 +1465,9 @@ impl Engine<'_> {
             y += self.line(
                 box_index,
                 &mut line,
-                containing.x,
+                line_x,
                 y,
-                containing.width,
+                available,
                 &node.style,
                 ancestors,
                 false,
@@ -1162,6 +1578,7 @@ impl Engine<'_> {
                     element: piece.element,
                     rect,
                     ancestors: ancestors.to_vec(),
+                    fixed: false,
                 });
             }
             for &ancestor in &piece.ancestors {
@@ -1226,6 +1643,7 @@ impl Engine<'_> {
                         rect,
                         href: href.clone(),
                         ancestors: ancestors.to_vec(),
+                        fixed: false,
                     });
                 }
             }
@@ -1254,6 +1672,10 @@ impl Engine<'_> {
                 anonymous: false,
                 style: n.style.clone(),
                 border_box: rect,
+                flow_box: rect,
+                fixed: false,
+                parent: Some(box_index),
+                formatting_context: self.result.boxes[box_index].formatting_context,
                 padding_box: rect.inset(border),
                 content_box: rect.inset(border.add_edges(padding)),
                 border,
@@ -1272,10 +1694,50 @@ impl Engine<'_> {
         height
     }
     fn translate_box(&mut self, index: usize, dx: f32, dy: f32, outer: &[usize]) {
+        let mut regions = Vec::new();
+        for (i, hit) in self.result.hits.iter().enumerate() {
+            if hit.ancestors.contains(&index) {
+                regions.push(i);
+            }
+        }
+        let mut targets = Vec::new();
+        for (i, hit) in self.result.targets.iter().enumerate() {
+            if hit.ancestors.contains(&index) {
+                targets.push(i);
+            }
+        }
+        self.shift_geometry(index, dx, dy);
+        if let Some(parent) = outer.last() {
+            self.result.boxes[index].parent = Some(*parent);
+        }
+        for i in regions {
+            let h = &mut self.result.hits[i];
+            h.rect = h.rect.translate(dx, dy);
+            if !outer.is_empty() {
+                let mut a = outer.to_vec();
+                a.extend_from_slice(&h.ancestors);
+                h.ancestors = a;
+            }
+        }
+        for i in targets {
+            let h = &mut self.result.targets[i];
+            h.rect = h.rect.translate(dx, dy);
+            if !outer.is_empty() {
+                let mut a = outer.to_vec();
+                a.extend_from_slice(&h.ancestors);
+                h.ancestors = a;
+            }
+        }
+    }
+    fn shift_box(&mut self, index: usize, dx: f32, dy: f32) {
+        self.translate_box(index, finite(dx), finite(dy), &[]);
+    }
+    fn shift_geometry(&mut self, index: usize, dx: f32, dy: f32) {
         let b = &mut self.result.boxes[index];
         b.border_box = b.border_box.translate(dx, dy);
         b.padding_box = b.padding_box.translate(dx, dy);
         b.content_box = b.content_box.translate(dx, dy);
+        b.flow_box = b.flow_box.translate(dx, dy);
         let children = b
             .content
             .iter()
@@ -1292,8 +1754,18 @@ impl Engine<'_> {
                 Content::Text(t) => {
                     t.rect = t.rect.translate(dx, dy);
                     for g in &mut t.glyphs {
-                        g.x += dx as i32;
-                        g.y += dy as i32;
+                        g.position.0 = finite(g.position.0 + dx);
+                        g.position.1 = finite(g.position.1 + dy);
+                        let (key, x, y) = CacheKey::new(
+                            g.key.font_id,
+                            g.key.glyph_id,
+                            f32::from_bits(g.key.font_size_bits),
+                            (g.position.0, g.position.1.trunc()),
+                            g.key.flags,
+                        );
+                        g.key = key;
+                        g.x = x;
+                        g.y = y;
                     }
                 }
                 Content::Image { rect, .. } | Content::Decoration { rect, .. } => {
@@ -1302,24 +1774,8 @@ impl Engine<'_> {
                 _ => {}
             }
         }
-        for hit in &mut self.result.hits {
-            if hit.ancestors.first() == Some(&index) {
-                hit.rect = hit.rect.translate(dx, dy);
-                let mut a = outer.to_vec();
-                a.extend_from_slice(&hit.ancestors);
-                hit.ancestors = a;
-            }
-        }
-        for target in &mut self.result.targets {
-            if target.ancestors.first() == Some(&index) {
-                target.rect = target.rect.translate(dx, dy);
-                let mut a = outer.to_vec();
-                a.extend_from_slice(&target.ancestors);
-                target.ancestors = a;
-            }
-        }
         for child in children {
-            self.translate_box(child, dx, dy, &[]);
+            self.shift_geometry(child, dx, dy);
         }
     }
 }

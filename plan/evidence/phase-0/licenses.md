@@ -94,6 +94,14 @@ libfuzzer-sys. No external JS engine or copyleft-only dependency was added.
 The resolved workspace has 499 dependencies; cargo-audit reports no vulnerabilities
 and cargo-deny passes, with the existing maintenance-only exceptions retained.
 
+## Phase 6 reused dependencies and test data (2026-10-13)
+
+No new product or auxiliary library. Layout remains owned Rust code; shaping,
+painting and transport reuse the existing approved dependencies. The standalone
+layout fuzz harness reuses libfuzzer-sys/cosmic-text/url only for verification.
+Two WPT flex reftest inputs are BSD-3-Clause; contributor/Intel/Shiyou Tan notices,
+provenance and license are retained under `browser/crates/paint/tests/wpt/`.
+
 ## Copyleft exception registry
 
 | Crate | Version | License | Anti-overengineering justification |

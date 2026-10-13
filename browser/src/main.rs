@@ -1,4 +1,4 @@
-//! `browser` binary — Phase 5 (plan/10 §10.2.11, plan/14 Phase 5).
+//! `browser` binary — Phase 6 (plan/10 §10.2.11, plan/14 Phase 6).
 //!
 //! `browser [url] [--profile-dir p] [--software-render] [--perf] [--headless-test url]`
 //! (`--headless-test` is a test harness only, never a product).
@@ -26,7 +26,7 @@ struct Args {
 fn print_help() {
     print!(
         "browser {VERSION}\n\
-         Graphical web browser in Rust (Phase 5: JavaScript and DOM events)\n\
+         Graphical web browser in Rust (Phase 6: advanced layout and page scripting)\n\
          \n\
          Usage: browser [url] [options]\n\
          \n\

@@ -1,9 +1,9 @@
-# browser — Graphical web browser in Rust (Phase 5)
+# browser — Graphical web browser in Rust (Phase 6)
 
 Sealed theoretical framework in `../plan/` (see `../plan/SEALED.md`, v1.2).
 Sequential phased implementation per `../plan/14-roadmap-phases.md`.
 
-## Current status: Phase 5 — In-house JavaScript MVP and DOM scripting
+## Current status: Phase 6 — Advanced and incremental layout
 
 Cargo workspace with 12 component crates. `net`, `html`, `css`, `layout`,
 `paint` and `shell` now render nested block/inline flow, shaped text, generated
@@ -21,12 +21,20 @@ it when navigation changes. Classic blocking/defer scripts run with basic CSP,
 nonce/hash and redirect/mixed-content checks. Script resource exhaustion stops
 that page's scripts and displays a visible notice while navigation stays usable.
 
+The owned layout engine now implements relative/absolute/fixed positioning,
+stacking contexts, float/clear, flex lines, grid tracks/areas/auto-placement and
+basic table rows/cells/spans. The layout worker retains a bounded subtree and
+measurement cache: DOM/style changes mark ancestor dependencies dirty, reuse
+compatible siblings, and translate retained geometry including glyph positions.
+Resize/fonts/navigation invalidate the relevant cache state. Painting and hit
+testing consume the same stacking traversal; fixed layers stay in the viewport.
+
 Start the graphical browser with `cargo run -- https://example.com/`.
 `--software-render` forces software presentation; GPU initialization is otherwise
 asynchronous with fallback on failure. `--perf` prints local frame/layout and
 first-paint counters. `--headless-test` is only the test harness and now fetches,
 executes initial classic scripts, lays out and paints HTML/CSS/images, reporting
-a deterministic pixel hash. Flex/grid/positioning/tables are Phase 6. The measured
+a deterministic pixel hash. Daily-driver Web APIs are Phase 7. The measured
 language/DOM surface and current compatibility boundaries are documented in
 `crates/js/README.md`, `crates/dom_bindings/README.md` and the Phase 5 evidence.
 
@@ -96,11 +104,24 @@ Node is a test oracle only. The explicit `wayland_input` example is an optional
 GUI-test pointer for compositors exposing the virtual-pointer protocol; it is
 not a product input service. No external JS engine is embedded.
 
+Serve `crates/shell/tests/fixtures/advanced-demo/` for the Phase 6 workshop:
+fixed flex navbar, responsive grid cards, named dashboard areas, float/clear,
+z-index layers, table spans and a small acid-like grid. The card button exercises
+JS mutation and incremental layout counters in `--perf` output.
+
+```sh
+python -m http.server 8766 --bind 127.0.0.1 --directory crates/shell/tests/fixtures/advanced-demo
+cargo run --release -- http://127.0.0.1:8766/ --perf
+cargo run --release -p shell --example phase6_probe
+cargo test -p layout --test advanced --test incremental
+cargo test -p paint --test wpt_adapted
+```
+
 Phase 4 is the measured Stage A implementation described in `crates/layout/README.md`
 and `crates/paint/README.md`. GIF/WebP decode their first frame. SVG-as-image
 uses local font fallback and rejects external resource references. Resource
 caps fail to visible alt/placeholder content rather than blocking the UI.
 
 CI lives at the repository root `.github/workflows/ci.yml`; Cargo commands
-run inside `browser/`. Current evidence is under `../plan/evidence/phase-5/`;
+run inside `browser/`. Current evidence is under `../plan/evidence/phase-6/`;
 the retained Stage A graphics evidence remains in `../plan/evidence/phase-4/`.
