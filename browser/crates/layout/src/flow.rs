@@ -888,6 +888,11 @@ impl Engine<'_> {
     ) -> Size {
         let ctx = self.ctx(&node.style, width);
         let (attrs_w, attrs_h, intrinsic) = match replaced {
+            Replaced::Canvas { width, height, .. } => (
+                *width,
+                *height,
+                Size::new(width.unwrap_or(300.0), height.unwrap_or(150.0)),
+            ),
             Replaced::Image {
                 url,
                 width,
@@ -974,6 +979,11 @@ impl Engine<'_> {
         };
         let (mut w, mut h) = match (w, h) {
             (Some(w), Some(h)) => (w, h),
+            (Some(w), None)
+                if matches!(replaced, Replaced::Input { .. }) && ratio_value.is_empty() =>
+            {
+                (w, intrinsic.height)
+            }
             (Some(w), None) => (w, w / ratio.max(0.001)),
             (None, Some(h)) => (h * ratio, h),
             _ => (intrinsic.width, intrinsic.height),
@@ -1017,6 +1027,21 @@ impl Engine<'_> {
             return;
         };
         match replaced {
+            Replaced::Canvas { bitmap, .. } => {
+                if let Some(bitmap) = bitmap {
+                    if bitmap.width > 0 && bitmap.height > 0 {
+                        let image = std::sync::Arc::new(crate::RasterImage {
+                            id: (1 << 63) | bitmap.id,
+                            width: bitmap.width,
+                            height: bitmap.height,
+                            rgba: bitmap.pixels.clone(),
+                        });
+                        self.result.boxes[box_index]
+                            .content
+                            .push(Content::Image { rect, image });
+                    }
+                }
+            }
             Replaced::Image { url, alt, .. } => {
                 if let Some(image) = url.as_ref().and_then(|u| self.images.get(u)) {
                     self.result.boxes[box_index].content.push(Content::Image {

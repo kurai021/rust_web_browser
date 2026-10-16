@@ -1,7 +1,7 @@
 //! Classic blocking/defer script loader using the existing parser and transport.
 use crate::page::{load_page_from_document, Page};
 use css::Environment;
-use dom_bindings::{policy::Policy, DomRuntime};
+use dom_bindings::policy::Policy;
 use html::{Document, NodeId};
 use js::{ErrorKind, JsError};
 use net::{Client, Fetched};
@@ -11,6 +11,7 @@ use std::sync::{
     Arc,
 };
 use url::Url;
+use web_api::{PageRuntime, RuntimeConfig};
 
 const MAX_SCRIPT_REQUESTS: usize = 64;
 const MAX_SCRIPT_BYTES: usize = 8 * 1024 * 1024;
@@ -23,19 +24,154 @@ pub(crate) async fn wait_cancelled(active: &Option<(Arc<AtomicU64>, u64)>) {
     }
 }
 pub struct LoadedScripts {
-    pub runtime: DomRuntime,
+    pub runtime: PageRuntime,
     pub page: Arc<Page>,
     pub errors: Vec<String>,
+    headless_services: Option<web_api::services::Services>,
 }
 impl LoadedScripts {
+    pub fn register_images(&mut self) -> Result<(), JsError> {
+        let document = self.runtime.document();
+        for node in document
+            .get_elements_by_tag_name("img")
+            .into_iter()
+            .take(crate::images::MAX_IMAGE_REQUESTS)
+        {
+            let Some(url) = document
+                .get_attribute(node, "src")
+                .and_then(|src| self.runtime.url().join(src).ok())
+            else {
+                continue;
+            };
+            let Some(image) = self.page.image_cache.get(&url) else {
+                continue;
+            };
+            let Some(image) = image else {
+                self.runtime
+                    .image_error(node, &url, document.image_epoch(node))?;
+                continue;
+            };
+            let tainted = self
+                .page
+                .image_taint
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&url)
+                .copied()
+                .unwrap_or_else(|| {
+                    url.scheme() != "data" && !web_api::same_origin(&self.runtime.url(), &url)
+                });
+            self.runtime.image_at(
+                node,
+                &url,
+                document.image_epoch(node),
+                web_api::runtime::CanvasImage {
+                    width: image.width,
+                    height: image.height,
+                    pixels: image.rgba.clone(),
+                    tainted,
+                },
+            )?;
+        }
+        Ok(())
+    }
+    pub fn snapshot(&self) -> Arc<Page> {
+        let mut page = (*self.page).clone();
+        page.document = Arc::new(self.runtime.document());
+        page.url = self.runtime.url();
+        Arc::new(page)
+    }
     pub fn runtime_environment(&self) -> Environment {
         self.runtime.current_environment()
     }
     pub fn set_navigation(&mut self, url: Url) {
         if matches!(url.scheme(), "http" | "https") {
-            self.runtime.request_navigation(url);
+            if let Err(error) = self.runtime.navigate(url, false) {
+                self.errors.push(error.to_string());
+            }
         }
     }
+}
+pub fn headless_config(
+    client: &Client,
+    directory: Option<std::path::PathBuf>,
+) -> web_api::Result<RuntimeConfig> {
+    let profile = Arc::new(web_api::storage::Profile::open(directory.clone())?);
+    if let Some(dir) = directory {
+        client
+            .cookies
+            .load(&dir.join("cookies.json"))
+            .map_err(|e| web_api::ApiError::new("DataError", e.to_string()))?;
+        *client.hsts() = net::HstsStore::load_from(&dir.join("hsts.json"));
+    }
+    Ok(RuntimeConfig {
+        profile,
+        cookies: client.cookies.clone(),
+        session: format!("headless-{}", std::process::id()),
+        ..Default::default()
+    })
+}
+/// Bounded headless service checkpoint. Native permissions are denied explicitly.
+pub async fn settle(
+    client: Arc<Client>,
+    loaded: &mut LoadedScripts,
+    budget: std::time::Duration,
+) -> Result<(), JsError> {
+    let mut services = loaded.headless_services.take().unwrap_or_else(|| {
+        web_api::services::Services::new(client, tokio::runtime::Handle::current())
+    });
+    let start = std::time::Instant::now();
+    loop {
+        for command in loaded.runtime.commands() {
+            match services
+                .dispatch(command)
+                .map_err(|e| JsError::new(ErrorKind::Error, e.to_string()))?
+            {
+                Some(web_api::WebCommand::Permission { id, name, .. }) => {
+                    loaded
+                        .runtime
+                        .complete(web_api::WebCompletion::Permission {
+                            id,
+                            name,
+                            decision: "denied".into(),
+                        })?
+                }
+                Some(web_api::WebCommand::Clipboard { id, .. }) => {
+                    loaded.runtime.complete(web_api::WebCompletion::Clipboard {
+                        id,
+                        result: Err(web_api::ApiError::new(
+                            "NotAllowedError",
+                            "headless clipboard disabled",
+                        )),
+                    })?
+                }
+                Some(web_api::WebCommand::Notice(message)) => {
+                    loaded.runtime.handle().console(message)
+                }
+                Some(web_api::WebCommand::Popup { .. }) => loaded
+                    .runtime
+                    .handle()
+                    .console("Headless popup blocked".into()),
+                _ => {}
+            }
+        }
+        for _ in 0..128 {
+            let Some(completion) = services.poll() else {
+                break;
+            };
+            loaded.runtime.complete(completion)?;
+        }
+        loaded.runtime.poll_timers()?;
+        if start.elapsed() >= budget
+            || services.is_idle() && !loaded.runtime.has_pending() && !loaded.runtime.has_timers()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    loaded.headless_services = Some(services);
+    loaded.page = loaded.snapshot();
+    Ok(())
 }
 struct Loader<'a> {
     client: &'a Client,
@@ -88,7 +224,7 @@ impl Loader<'_> {
             let allow =
                 |resource: &Url| self.policy.external_allowed(self.document, resource, nonce);
             let fetched = tokio::select! {
-                fetched = self.client.fetch_script(&url, MAX_SCRIPT_BYTES - self.bytes, &allow) => fetched,
+                fetched = self.client.fetch_script_for(self.document, &url, MAX_SCRIPT_BYTES - self.bytes, &allow) => fetched,
                 _ = wait_cancelled(&self.active) => return Err(JsError::new(ErrorKind::Cancelled, "navigation cancelled")),
             };
             let fetched = fetched.map_err(|e| JsError::new(ErrorKind::Error, e.to_string()))?;
@@ -122,6 +258,19 @@ pub async fn load_scripts(
     environment: Environment,
     active: Option<(Arc<AtomicU64>, u64)>,
 ) -> Result<LoadedScripts, JsError> {
+    let config = RuntimeConfig {
+        cookies: client.cookies.clone(),
+        ..Default::default()
+    };
+    load_scripts_configured(client, fetched, environment, active, config).await
+}
+pub async fn load_scripts_configured(
+    client: &Client,
+    fetched: Fetched,
+    environment: Environment,
+    active: Option<(Arc<AtomicU64>, u64)>,
+    config: RuntimeConfig,
+) -> Result<LoadedScripts, JsError> {
     let mut parser = html::Parser::new(
         fetched.url.clone(),
         Box::new(html::NullSink),
@@ -133,12 +282,13 @@ pub async fn load_scripts(
     parser.push(&fetched.bytes);
     let initial = parser.snapshot().unwrap_or_default();
     let policy = Policy::parse(&fetched.script_policies, &initial);
-    let mut runtime = DomRuntime::new(
+    let mut runtime = PageRuntime::new(
         initial,
         fetched.url.clone(),
         Vec::new(),
         environment,
         policy.clone(),
+        config,
     )?;
     runtime.vm.limits.navigation = active.clone();
     let mut loader = Loader {
@@ -236,5 +386,6 @@ pub async fn load_scripts(
         runtime,
         page: Arc::new(page),
         errors,
+        headless_services: None,
     })
 }

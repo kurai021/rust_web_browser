@@ -18,6 +18,9 @@ let result = layout(viewport, &mut tree, LayoutOpts { font_system, images });
 - Replaced images with intrinsic/attribute/CSS dimensions and aspect ratios;
   video/input placeholders. CSS dimension attributes are presentational hints,
   so author width/height:auto can restore natural sizing.
+- Phase 7 canvas elements carry immutable document bitmaps into the same retained
+  image path. Password controls paint masked labels. Layout box/scroll geometry
+  also feeds observer checkpoints on the script worker.
 - Visible/hidden/auto/scroll overflow, nested clipping and two-axis offsets.
   Hit-testing applies exactly the same ancestor clips/offsets as paint.
 - 512-depth flatten-to-block fallback, finite extents and a one-million-glyph

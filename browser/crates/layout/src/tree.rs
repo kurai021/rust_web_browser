@@ -17,6 +17,11 @@ pub struct ElementId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Replaced {
+    Canvas {
+        width: Option<f32>,
+        height: Option<f32>,
+        bitmap: Option<html::CanvasBitmap>,
+    },
     Image {
         url: Option<Url>,
         alt: String,
@@ -306,6 +311,11 @@ impl Builder<'_> {
                         .map(|n| n.min(crate::MAX_EXTENT))
                 };
                 let replaced = match el.tag_name.as_str() {
+                    "canvas" => Some(Replaced::Canvas {
+                        width: Some(dim("width").unwrap_or(300.0)),
+                        height: Some(dim("height").unwrap_or(150.0)),
+                        bitmap: self.dom.canvas_bitmap(id).cloned(),
+                    }),
                     "img" => Some(Replaced::Image {
                         url: self
                             .dom
@@ -330,11 +340,15 @@ impl Builder<'_> {
                         let value = self.dom.control_value(id);
                         Some(Replaced::Input {
                             label: if value.is_empty() {
-                                self.dom.get_attribute(id, "placeholder").unwrap_or("")
+                                self.dom
+                                    .get_attribute(id, "placeholder")
+                                    .unwrap_or("")
+                                    .to_owned()
+                            } else if self.dom.get_attribute(id, "type") == Some("password") {
+                                "•".repeat(value.chars().count().min(4096))
                             } else {
-                                value
-                            }
-                            .to_owned(),
+                                value.to_owned()
+                            },
                         })
                     }
                     _ => None,

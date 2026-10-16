@@ -203,3 +203,96 @@ fn tab_input_keyup_and_button_activation_use_the_persistent_realm() {
     );
     worker.shutdown();
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_completion_updates_the_live_page_and_publishes_same_document_history() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let amount = stream.read(&mut request).await.unwrap();
+        assert!(amount > 0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nContent-Length:12\r\nConnection:close\r\n\r\n{\"value\":42}").await.unwrap();
+    });
+    let (tx, rx) = mpsc::channel();
+    let active = Arc::new(AtomicU64::new(1));
+    let mut worker = ScriptWorker::spawn(
+        Arc::new(Client::new(Default::default()).unwrap()),
+        tx,
+        Arc::new(|| {}),
+        active,
+    )
+    .unwrap();
+    worker.initialize(1,fetched(&url,"<output id=result>waiting</output><script>fetch('/api').then(r=>r.json()).then(data=>{document.getElementById('result').textContent=data.value;history.pushState({page:2},'', '/view');});</script>"),Default::default());
+    receive(
+        &rx,
+        |e| matches!(e,FetchEvent::SameDocument{url,back:true,..}if url.path()=="/view"),
+    );
+    receive(
+        &rx,
+        |e| matches!(e,FetchEvent::ScriptPage{page,..}if page.document.text_content(page.document.get_element_by_id("result").unwrap())=="42"),
+    );
+    worker.event(1, DomCommand::HistoryGo(-1));
+    receive(
+        &rx,
+        |e| matches!(e,FetchEvent::SameDocument{url,forward:true,..}if url.path()=="/"),
+    );
+    worker.shutdown();
+    server.await.unwrap();
+}
+#[test]
+fn native_prompt_and_permission_response_do_not_need_javascript_on_ui_thread() {
+    let (tx, rx) = mpsc::channel();
+    let active = Arc::new(AtomicU64::new(1));
+    let mut worker = ScriptWorker::spawn(
+        Arc::new(Client::new(Default::default()).unwrap()),
+        tx,
+        Arc::new(|| {}),
+        active,
+    )
+    .unwrap();
+    worker.initialize(1,fetched("https://example.test/","<button id=b>ask</button><output id=result>before</output><script>var answer=prompt('Name?','default');document.getElementById('result').textContent=answer;document.getElementById('b').onclick=()=>Notification.requestPermission().then(permission=>document.getElementById('result').textContent=permission);</script>"),Default::default());
+    let FetchEvent::Dialog { request, reply, .. } =
+        receive(&rx, |e| matches!(e, FetchEvent::Dialog { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(request.origin, "https://example.test");
+    reply.send(Some("native".into())).unwrap();
+    let FetchEvent::ScriptPage { page, .. } =
+        receive(&rx, |e| matches!(e, FetchEvent::ScriptPage { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        page.document
+            .text_content(page.document.get_element_by_id("result").unwrap()),
+        "native"
+    );
+    worker.event(
+        1,
+        DomCommand::Click(page.document.get_element_by_id("b").unwrap()),
+    );
+    let FetchEvent::WebRequest {
+        command: web_api::WebCommand::Permission { id, name, gesture },
+        ..
+    } = receive(&rx, |e| matches!(e, FetchEvent::WebRequest { .. }))
+    else {
+        unreachable!()
+    };
+    assert!(gesture);
+    assert_eq!(name, "notifications");
+    worker.decision(
+        1,
+        id,
+        name,
+        "once".into(),
+        shell::web_ui::Action::Permission,
+    );
+    receive(
+        &rx,
+        |e| matches!(e,FetchEvent::ScriptPage{page,..}if page.document.text_content(page.document.get_element_by_id("result").unwrap())=="granted"),
+    );
+    worker.shutdown();
+}

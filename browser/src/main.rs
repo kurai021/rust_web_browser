@@ -1,4 +1,4 @@
-//! `browser` binary — Phase 6 (plan/10 §10.2.11, plan/14 Phase 6).
+//! `browser` binary — Phase 7 (plan/09, plan/14 Phase 7).
 //!
 //! `browser [url] [--profile-dir p] [--software-render] [--perf] [--headless-test url]`
 //! (`--headless-test` is a test harness only, never a product).
@@ -26,12 +26,12 @@ struct Args {
 fn print_help() {
     print!(
         "browser {VERSION}\n\
-         Graphical web browser in Rust (Phase 6: advanced layout and page scripting)\n\
+         Graphical web browser in Rust (Phase 7: dynamic-page Web API subsets)\n\
          \n\
          Usage: browser [url] [options]\n\
          \n\
          Options:\n  \
-           --profile-dir <dir>    Profile directory (HSTS cache)\n  \
+           --profile-dir <dir>    HSTS, cookies, storage and site permissions\n  \
            --software-render      Force the software display-list backend\n  \
            --perf                 Local performance counters\n  \
            --headless-test <url>  Load/layout/paint without a window (test harness)\n  \
@@ -86,7 +86,7 @@ fn classify_startup(text: &str) -> Result<(url::Url, bool), String> {
     }
 }
 
-fn run_headless(url_text: &str, perf: bool) -> ExitCode {
+fn run_headless(url_text: &str, perf: bool, profile_dir: Option<PathBuf>) -> ExitCode {
     let (url, allow_downgrade) = match classify_startup(url_text) {
         Ok(target) => target,
         Err(query) => {
@@ -104,7 +104,11 @@ fn run_headless(url_text: &str, perf: bool) -> ExitCode {
         .expect("tokio runtime builds");
     let started = std::time::Instant::now();
     let result = runtime.block_on(async {
-        let client = net::Client::new(FetchOptions::default()).expect("TLS stack initializes");
+        let client = std::sync::Arc::new(
+            net::Client::new(FetchOptions::default()).expect("TLS stack initializes"),
+        );
+        let config = shell::scripts::headless_config(&client, profile_dir.clone())
+            .map_err(|e| net::Error::Transport(e.to_string()))?;
         let mut last = 0usize;
         let fetched = client
             .fetch_with_http_fallback(&url, allow_downgrade, &mut |progress: Progress| {
@@ -115,23 +119,84 @@ fn run_headless(url_text: &str, perf: bool) -> ExitCode {
             })
             .await?;
         let bytes = fetched.bytes.len();
-        let loaded = shell::scripts::load_scripts(&client, fetched, Default::default(), None)
-            .await
-            .map_err(|e| net::Error::Transport(e.to_string()))?;
-        let page = loaded.page;
-        let styles = page.computed_styles(Default::default());
-        let article =
-            shell::article::article_from_styled_document(&page.document, &page.url, &styles);
+        let mut loaded = shell::scripts::load_scripts_configured(
+            &client,
+            fetched,
+            Default::default(),
+            None,
+            config.clone(),
+        )
+        .await
+        .map_err(|e| net::Error::Transport(e.to_string()))?;
+        shell::scripts::settle(
+            client.clone(),
+            &mut loaded,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .map_err(|e| net::Error::Transport(e.to_string()))?;
+        let mut page = loaded.snapshot();
+        let mut styles = page.computed_styles(Default::default());
         let assets = shell::fonts::load_fonts(&client, &page, Default::default()).await;
         shell::images::load_images(&client, &page, &styles, |_, _| {}).await;
+        loaded
+            .register_images()
+            .map_err(|e| net::Error::Transport(e.to_string()))?;
+        page = loaded.snapshot();
+        styles = page.computed_styles(Default::default());
         let mut fonts = cosmic_text::FontSystem::new();
         shell::fonts::install_fonts(&mut fonts, &assets);
-        let frame = shell::viewport::headless_frame(
+        let mut frame = shell::viewport::headless_frame(
             &page,
             &styles,
             layout::Size::new(800.0, 600.0),
             &mut fonts,
         );
+        let before = loaded.runtime.revision();
+        let boxes = shell::viewport::web_geometry(&frame.layout, &Default::default());
+        loaded
+            .runtime
+            .geometry(boxes, shell::viewport::observer_viewport(800.0, 600.0))
+            .map_err(|e| net::Error::Transport(e.to_string()))?;
+        if before != loaded.runtime.revision() {
+            shell::scripts::settle(
+                client.clone(),
+                &mut loaded,
+                std::time::Duration::from_millis(250),
+            )
+            .await
+            .map_err(|e| net::Error::Transport(e.to_string()))?;
+            page = loaded.snapshot();
+            styles = page.computed_styles(Default::default());
+            shell::images::load_images(&client, &page, &styles, |_, _| {}).await;
+            loaded
+                .register_images()
+                .map_err(|e| net::Error::Transport(e.to_string()))?;
+            page = loaded.snapshot();
+            styles = page.computed_styles(Default::default());
+            frame = shell::viewport::headless_frame(
+                &page,
+                &styles,
+                layout::Size::new(800.0, 600.0),
+                &mut fonts,
+            );
+        }
+        let article =
+            shell::article::article_from_styled_document(&page.document, &page.url, &styles);
+        config
+            .profile
+            .close_session(&config.session)
+            .map_err(|e| net::Error::Transport(e.to_string()))?;
+        if let Some(dir) = &profile_dir {
+            client
+                .cookies
+                .save(&dir.join("cookies.json"))
+                .map_err(|e| net::Error::Transport(e.to_string()))?;
+            client
+                .hsts()
+                .save_to(&dir.join("hsts.json"))
+                .map_err(|e| net::Error::Transport(e.to_string()))?;
+        }
         Ok::<_, net::Error>((page, article, bytes, frame))
     });
     match result {
@@ -179,7 +244,7 @@ fn run(argv: &[String]) -> ExitCode {
     };
 
     if let Some(url) = &args.headless_test {
-        return run_headless(url, args.perf);
+        return run_headless(url, args.perf, profile_dir_of(&args));
     }
 
     let (start_url, start_allow_downgrade, start_search) = match &args.url {

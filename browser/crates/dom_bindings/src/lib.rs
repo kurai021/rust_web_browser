@@ -1,6 +1,9 @@
 //! Per-page Level 1 host bindings. No network/files/other contexts are exposed.
 mod host;
 pub mod policy;
+pub use css;
+pub use html;
+pub use js;
 
 use css::{ComputedStyles, Environment, Stylesheet};
 use html::{Document, NodeId};
@@ -122,7 +125,80 @@ pub struct DomRuntime {
     pub vm: Vm,
     state: Rc<RefCell<State>>,
 }
+#[derive(Clone)]
+pub struct DomHandle {
+    state: Rc<RefCell<State>>,
+}
+impl DomHandle {
+    pub fn with_document<T>(&self, f: impl FnOnce(&Document) -> T) -> T {
+        f(&self.state.borrow().document)
+    }
+    pub fn observe_mutations(&self, enabled: bool) {
+        self.state.borrow_mut().document.observe_mutations(enabled);
+    }
+    pub fn take_mutations(&self) -> Result<Vec<html::Mutation>, html::DomError> {
+        self.state.borrow_mut().document.take_mutations()
+    }
+    pub fn document(&self) -> Document {
+        self.state.borrow().document.clone()
+    }
+    pub fn update_document<T>(&self, f: impl FnOnce(&mut Document) -> T) -> T {
+        let mut state = self.state.borrow_mut();
+        let value = f(&mut state.document);
+        state.changed();
+        value
+    }
+    pub fn url(&self) -> Url {
+        self.state.borrow().url.clone()
+    }
+    pub fn set_url(&self, url: Url) {
+        let mut state = self.state.borrow_mut();
+        state.document.url = Some(url.clone());
+        state.url = url;
+        state.changed();
+    }
+    pub fn policy(&self) -> policy::Policy {
+        self.state.borrow().policy.clone()
+    }
+    pub fn changed(&self) {
+        self.state.borrow_mut().changed();
+    }
+    pub fn console(&self, line: String) {
+        let mut state = self.state.borrow_mut();
+        if state.console.len() < 1000 {
+            state.console.push(line);
+            state.changed();
+        }
+    }
+    pub fn environment(&self) -> Environment {
+        self.state.borrow().environment
+    }
+    pub fn revision(&self) -> u64 {
+        self.state.borrow().revision
+    }
+    pub fn timestamp(&self) -> f64 {
+        self.state.borrow().started.elapsed().as_secs_f64() * 1000.0
+    }
+    pub fn node_host(&self, node: NodeId) -> u64 {
+        node_host(node, 0)
+    }
+    pub fn node_id(&self, id: u64) -> Option<NodeId> {
+        node_id(id)
+            .filter(|&node| id % 8 == 0 && self.state.borrow().document.try_get(node).is_some())
+    }
+}
 impl DomRuntime {
+    pub fn handle(&self) -> DomHandle {
+        DomHandle {
+            state: self.state.clone(),
+        }
+    }
+    pub fn set_extension(&mut self, extension: Box<dyn HostHooks>) {
+        self.vm.replace_host(host::DomHost {
+            state: self.state.clone(),
+            extension: Some(extension),
+        });
+    }
     pub fn new(
         document: Document,
         url: Url,
@@ -157,6 +233,7 @@ impl DomRuntime {
         let mut vm = Vm::new(NullHost);
         let host = host::DomHost {
             state: state.clone(),
+            extension: None,
         };
         host::install(&mut vm, &state)?;
         vm.replace_host(host);
@@ -194,6 +271,9 @@ impl DomRuntime {
     pub fn current_environment(&self) -> Environment {
         self.state.borrow().environment
     }
+    pub fn has_timers(&self) -> bool {
+        !self.state.borrow().timers.is_empty()
+    }
     pub fn request_navigation(&mut self, url: Url) {
         self.state.borrow_mut().navigation = Some(url);
     }
@@ -210,6 +290,19 @@ impl DomRuntime {
         let result = self.vm.eval_source(source);
         let result = result.and_then(|value| self.drain_queued().map(|()| value));
         self.finish_task(result)
+    }
+    pub fn call(
+        &mut self,
+        function: JsValue,
+        this: JsValue,
+        args: Vec<JsValue>,
+    ) -> Result<JsValue, JsError> {
+        let result = self.vm.call(function, this, args);
+        let result = result.and_then(|v| self.drain_queued().map(|()| v));
+        self.finish_task(result)
+    }
+    pub fn stop(&mut self, error: JsError) -> Result<(), JsError> {
+        self.finish_task(Err(error))
     }
     fn finish_task<T>(&mut self, result: Result<T, JsError>) -> Result<T, JsError> {
         if result.as_ref().is_err_and(JsError::is_resource_limit) {
@@ -234,6 +327,32 @@ impl DomRuntime {
         let result = self
             .dispatch_one(target, name, key)
             .and_then(|allowed| self.drain_queued().map(|()| allowed));
+        self.finish_task(result)
+    }
+    pub fn dispatch_detail(
+        &mut self,
+        target: NodeId,
+        name: &str,
+        detail: JsValue,
+    ) -> Result<bool, JsError> {
+        if self.is_stopped() {
+            return Ok(false);
+        }
+        let event = self.state.borrow_mut().make_event(
+            name.into(),
+            target,
+            false,
+            false,
+            detail,
+            String::new(),
+        );
+        let event = self.vm.host_object(event, "Event")?;
+        let this = self.vm.host_object(node_host(target, 0), "Element")?;
+        let function = self.vm.native("host:dispatchEvent")?;
+        let result = self
+            .vm
+            .call(function, this, vec![event])
+            .map(|v| v.truthy());
         self.finish_task(result)
     }
     fn dispatch_one(&mut self, target: NodeId, name: &str, key: &str) -> Result<bool, JsError> {

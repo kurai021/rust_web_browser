@@ -5,6 +5,7 @@ use js::{ErrorKind, HostResult};
 
 pub(crate) struct DomHost {
     pub state: Rc<RefCell<State>>,
+    pub extension: Option<Box<dyn HostHooks>>,
 }
 fn error(message: impl Into<String>) -> JsError {
     JsError::new(ErrorKind::TypeError, message)
@@ -110,6 +111,8 @@ pub(crate) fn install(vm: &mut Vm, state: &Rc<RefCell<State>>) -> Result<(), JsE
         "InputEvent",
         "SubmitEvent",
         "FocusEvent",
+        "HashChangeEvent",
+        "PopStateEvent",
         "EventTarget",
         "Node",
         "Element",
@@ -128,6 +131,15 @@ pub(crate) fn install(vm: &mut Vm, state: &Rc<RefCell<State>>) -> Result<(), JsE
             }
         }
         vm.set_global(name, function)?;
+    }
+    for name in [
+        "onpopstate",
+        "onhashchange",
+        "onload",
+        "onbeforeunload",
+        "onunload",
+    ] {
+        vm.set_global(name, JsValue::Null)?;
     }
     Ok(())
 }
@@ -254,6 +266,12 @@ impl DomHost {
     }
 }
 impl HostHooks for DomHost {
+    fn fork(&self) -> Option<Box<dyn HostHooks>> {
+        Some(Box::new(Self {
+            state: self.state.clone(),
+            extension: self.extension.as_ref().and_then(|e| e.fork()),
+        }))
+    }
     fn retained_bytes(&self) -> usize {
         let state = self.state.borrow();
         let mut bytes = state
@@ -274,7 +292,7 @@ impl HostHooks for DomHost {
         for line in &state.console {
             bytes = bytes.saturating_add(line.capacity());
         }
-        bytes
+        bytes.saturating_add(self.extension.as_ref().map_or(0, |e| e.retained_bytes()))
     }
     fn print(&mut self, s: &str) {
         let mut state = self.state.borrow_mut();
@@ -287,6 +305,11 @@ impl HostHooks for DomHost {
         self.state.borrow().policy.eval_allowed()
     }
     fn get(&mut self, vm: &mut Vm, id: u64, key: &str) -> Result<Option<JsValue>, JsError> {
+        if let Some(extension) = &mut self.extension {
+            if let Some(value) = extension.get(vm, id, key)? {
+                return Ok(Some(value));
+            }
+        }
         if id == WINDOW {
             return Ok(match key {
                 "document" => Some(wrap(vm, &self.state.borrow().document, Some(0))?),
@@ -298,6 +321,14 @@ impl HostHooks for DomHost {
                 )),
                 "devicePixelRatio" => Some(JsValue::Number(1.0)),
                 "addEventListener" | "removeEventListener" | "dispatchEvent" => self.function(key),
+                key if key.starts_with("on") => Some(
+                    self.state
+                        .borrow()
+                        .listeners
+                        .iter()
+                        .find(|l| l.node == 0 && l.event == key[2..] && !l.inline)
+                        .map_or(JsValue::Null, |l| l.callback.clone()),
+                ),
                 _ => None,
             });
         }
@@ -323,6 +354,16 @@ impl HostHooks for DomHost {
                 "isTrusted" => Some(JsValue::Bool(false)),
                 "timeStamp" => Some(JsValue::Number(event.timestamp)),
                 "detail" => Some(event.detail.clone()),
+                "state" | "data" => Some(event.detail.clone()),
+                "oldURL" | "newURL" => {
+                    let detail = event.detail.clone();
+                    drop(state);
+                    return Ok(Some(if detail.object().is_some() {
+                        vm.get(detail, key)?
+                    } else {
+                        JsValue::string("")
+                    }));
+                }
                 "key" => Some(JsValue::string(&event.key)),
                 "keyCode" | "which" => Some(JsValue::Number(match event.key.as_str() {
                     "Enter" => 13.0,
@@ -360,7 +401,11 @@ impl HostHooks for DomHost {
                         },
                         ..Default::default()
                     };
-                    state.computed = Some(cascade.compute(&state.document, &state.stylesheets));
+                    let filtered = state.policy.style_document(&state.document);
+                    state.computed = Some(cascade.compute(
+                        filtered.as_ref().unwrap_or(&state.document),
+                        &state.stylesheets,
+                    ));
                 }
                 return Ok(Some(JsValue::string(
                     state
@@ -552,9 +597,15 @@ impl HostHooks for DomHost {
         Ok(Some(value))
     }
     fn set(&mut self, vm: &mut Vm, id: u64, key: &str, value: JsValue) -> Result<bool, JsError> {
-        if id == WINDOW {
+        if let Some(extension) = &mut self.extension {
+            if extension.set(vm, id, key, value.clone())? {
+                return Ok(true);
+            }
+        }
+        if id == WINDOW && !key.starts_with("on") {
             return Ok(false);
         }
+        let id = if id == WINDOW { 0 } else { id };
         if id >= EVENT_BASE {
             let mut state = self.state.borrow_mut();
             if let Some(event) = state.events.get_mut(&id) {
@@ -759,6 +810,11 @@ impl HostHooks for DomHost {
         this: JsValue,
         args: &[JsValue],
     ) -> Result<HostResult, JsError> {
+        if let Some(name) = name.strip_prefix("web:") {
+            if let Some(extension) = &mut self.extension {
+                return extension.call(vm, name, this, args);
+            }
+        }
         let host = vm.host_id(&this).unwrap_or(WINDOW);
         if (EVENT_TARGET_BASE..EVENT_BASE).contains(&host)
             && !matches!(
@@ -783,7 +839,7 @@ impl HostHooks for DomHost {
                 return Err(error("illegal DOM constructor"))
             }
             "Event" | "CustomEvent" | "MouseEvent" | "KeyboardEvent" | "InputEvent"
-            | "SubmitEvent" | "FocusEvent" => {
+            | "SubmitEvent" | "FocusEvent" | "HashChangeEvent" | "PopStateEvent" => {
                 let event = string(vm, args, 0)?;
                 let options = arg(args, 1);
                 let bubbles = if options.object().is_some() {
@@ -1454,6 +1510,11 @@ impl HostHooks for DomHost {
         true
     }
     fn finish(&mut self, _vm: &mut Vm, token: u64) -> Result<JsValue, JsError> {
+        if token >= 1 << 57 {
+            if let Some(extension) = &mut self.extension {
+                return extension.finish(_vm, token);
+            }
+        }
         let mut state = self.state.borrow_mut();
         let Some(event) = state.events.get_mut(&token) else {
             return Ok(JsValue::Bool(true));
@@ -1509,18 +1570,36 @@ impl HostHooks for DomHost {
                 roots.push(event.detail.clone());
             }
         }
+        if let Some(extension) = &self.extension {
+            roots.extend(extension.roots(live));
+        }
         roots
     }
     fn host_references(&self, live: &HashSet<u64>) -> Vec<u64> {
-        self.state
+        let mut result = self
+            .state
             .borrow()
             .events
             .iter()
             .filter(|(id, _)| live.contains(id))
             .map(|(_, event)| node_host(event.target, 0))
-            .collect()
+            .collect::<Vec<_>>();
+        result.extend(
+            self.state
+                .borrow()
+                .document
+                .mutation_roots()
+                .map(|node| node_host(node, 0)),
+        );
+        if let Some(extension) = &self.extension {
+            result.extend(extension.host_references(live));
+        }
+        result
     }
     fn sweep(&mut self, live: &HashSet<u64>) {
+        if let Some(extension) = &mut self.extension {
+            extension.sweep(live);
+        }
         let mut state = self.state.borrow_mut();
         if state.parsing {
             return;

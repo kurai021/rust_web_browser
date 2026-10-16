@@ -61,6 +61,12 @@ Promises, async/await, generators, modules and modern collection APIs belong to
 Level 2 / Phase 8. Bytecode dispatch and performance migration follow that work;
 this MVP has no own SIMD/asm kernel.
 
+Phase 7 adds a bounded data-only graph wire format for history, worker messages
+and IDB values; cyclic graphs do not share arena IDs across realms. Native host
+constructors preserve their interface prototype and reentrant host trampolines
+retain CSP during argument getters. `web_api` supplies only the native deferred
+result chaining required for page services, ahead of the complete Phase 8 model.
+
 ```sh
 cargo test -p js
 cargo test -p js --test differential -- --ignored --exact representative_language_results_match_node

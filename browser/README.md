@@ -1,9 +1,9 @@
-# browser — Graphical web browser in Rust (Phase 6)
+# browser — Graphical web browser in Rust (Phase 7)
 
 Sealed theoretical framework in `../plan/` (see `../plan/SEALED.md`, v1.2).
 Sequential phased implementation per `../plan/14-roadmap-phases.md`.
 
-## Current status: Phase 6 — Advanced and incremental layout
+## Current status: Phase 7 — Dynamic-page Web API subsets
 
 Cargo workspace with 12 component crates. `net`, `html`, `css`, `layout`,
 `paint` and `shell` now render nested block/inline flow, shaped text, generated
@@ -29,14 +29,26 @@ compatible siblings, and translate retained geometry including glyph positions.
 Resize/fonts/navigation invalidate the relevant cache state. Painting and hit
 testing consume the same stacking traversal; fixed layers stay in the viewport.
 
+`web_api::PageRuntime` now connects fetch/XHR with shared CORS/preflight rules,
+history/location, profile-backed localStorage/cookies/IndexedDB, sessionStorage,
+dedicated workers, WebSocket/SSE, layout-driven observers and CPU Canvas2D frames.
+Requests and worker messages cross bounded, cancellable service channels; VM/DOM
+identities stay on their owner thread. Canvas pixels reuse the retained image
+path in both renderers. Native origin-labelled dialogs provide Once/Always/Never
+permission choices; `about:permissions` revokes current-origin or all saved grants.
+The API inventory, quotas and explicit compatibility boundaries are in
+[`crates/web_api/README.md`](crates/web_api/README.md).
+
 Start the graphical browser with `cargo run -- https://example.com/`.
 `--software-render` forces software presentation; GPU initialization is otherwise
 asynchronous with fallback on failure. `--perf` prints local frame/layout and
 first-paint counters. `--headless-test` is only the test harness and now fetches,
-executes initial classic scripts, lays out and paints HTML/CSS/images, reporting
-a deterministic pixel hash. Daily-driver Web APIs are Phase 7. The measured
+executes classic scripts and bounded asynchronous service work, lays out and
+paints HTML/CSS/images/canvas, reporting a deterministic pixel hash. The measured
 language/DOM surface and current compatibility boundaries are documented in
 `crates/js/README.md`, `crates/dom_bindings/README.md` and the Phase 5 evidence.
+This remains experimental; complete modern JS/event-loop semantics are Phase 8,
+and the full browser/session interface is Phase 9.
 
 ## Layout
 
@@ -122,6 +134,23 @@ and `crates/paint/README.md`. GIF/WebP decode their first frame. SVG-as-image
 uses local font fallback and rejects external resource references. Resource
 caps fail to visible alt/placeholder content rather than blocking the UI.
 
+The Phase 7 workshop needs its loopback API server, rather than a static server:
+
+```sh
+cargo run -p web_api --example demo_server -- 8097
+cargo run --release -- http://127.0.0.1:8097/ --profile-dir /tmp/browser-workshop --perf
+cargo run --release -p shell --example phase7_probe -- http://127.0.0.1:8097/ /tmp/browser-probe
+cargo test -p web_api --test wpt_adapted -- --nocapture
+```
+
+The fixture exercises JSON fetch, SPA routing/back, persistent visits and login
+(`demo` / `rust`), IDB stores/indexes, worker messages, socket echo, SSE, observers,
+drawImage/text/paths and native permission controls. Its authentication is fixed
+synthetic test data. Desktop clipboard adapters use `wl-copy`/`wl-paste` on Linux
+Wayland, and notifications use `notify-send`; missing backends report an error.
+Geolocation grants return unavailable when there is no local provider and make
+no hidden location-service request. See the fixture README and Phase 7 evidence.
+
 CI lives at the repository root `.github/workflows/ci.yml`; Cargo commands
-run inside `browser/`. Current evidence is under `../plan/evidence/phase-6/`;
+run inside `browser/`. Current evidence is under `../plan/evidence/phase-7/`;
 the retained Stage A graphics evidence remains in `../plan/evidence/phase-4/`.

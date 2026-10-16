@@ -1,4 +1,4 @@
-//! Phase 6 window: advanced/incremental layout and retained GPU/CPU painting.
+//! Phase 7 window: dynamic pages, native permission chrome and retained painting.
 //!
 //! winit chrome, wgpu compositing and the matching softbuffer fallback.
 //! Network, image decoding, page layout and glyph preparation stay on workers.
@@ -55,9 +55,9 @@ fn welcome_article() -> Article {
     Article {
         title: Some("Welcome".to_owned()),
         blocks: vec![
-            Block::Heading { level: 1, text: "browser — Phase 6".to_owned(), links: Vec::new() },
+            Block::Heading { level: 1, text: "browser — Phase 7".to_owned(), links: Vec::new() },
             Block::Paragraph {
-                text: "This window runs the in-house JavaScript interpreter with DOM events, input controls and timers, alongside GPU/software painting.".to_owned(),
+                text: "Dynamic pages use the in-house JavaScript interpreter, origin-scoped Web APIs and GPU/software painting. Open about:permissions to revoke site grants.".to_owned(),
                 links: Vec::new(),
             },
             Block::Heading { level: 2, text: "Try".to_owned(), links: Vec::new() },
@@ -137,7 +137,7 @@ pub struct ShellApp {
     page_origin: (f32, f32),
     canvas_color: css::values::Color,
     blocks: Vec<BlockView>,
-    flow: Option<layout::LayoutResult>,
+    flow: Option<Arc<layout::LayoutResult>>,
     scene: paint::Scene,
     layout_worker: Option<crate::layout_worker::LayoutWorker>,
     font_generation: u64,
@@ -154,6 +154,11 @@ pub struct ShellApp {
     dom_focused: Option<html::NodeId>,
     script_dialog: Option<String>,
     script_console: Vec<String>,
+    web_dialog: Option<crate::web_ui::WebDialog>,
+    web_dialogs: std::collections::VecDeque<crate::web_ui::WebDialog>,
+    spa_back: bool,
+    spa_forward: bool,
+    observer_viewport: Option<web_api::runtime::GeometryRect>,
     load: LoadState,
     pending_history: bool,
     scroll_y: f32,
@@ -237,6 +242,11 @@ impl ShellApp {
             dom_focused: None,
             script_dialog: None,
             script_console: Vec::new(),
+            web_dialog: None,
+            web_dialogs: std::collections::VecDeque::new(),
+            spa_back: false,
+            spa_forward: false,
+            observer_viewport: None,
             load: LoadState::Idle,
             pending_history: false,
             scroll_y: 0.0,
@@ -351,6 +361,16 @@ impl ShellApp {
 
     fn navigate_input(&mut self, input: &str) {
         let trimmed = input.trim();
+        if trimmed.eq_ignore_ascii_case("about:permissions") {
+            let mut dialog=crate::web_ui::WebDialog::notice("Site permissions are origin-scoped. Revoke saved and current grants here. Camera and microphone have no backend and are denied.");
+            dialog.origin = self.page.as_ref().map_or_else(
+                || "Browser permissions".into(),
+                |p| p.url.origin().ascii_serialization(),
+            );
+            dialog.kind = crate::web_ui::Kind::Settings;
+            self.queue_web_dialog(dialog);
+            return;
+        }
         if trimmed.eq_ignore_ascii_case("about:blank") || trimmed.is_empty() {
             self.show_welcome();
             return;
@@ -374,6 +394,11 @@ impl ShellApp {
         self.dom_focused = None;
         self.script_dialog = None;
         self.script_console.clear();
+        self.web_dialog = None;
+        self.web_dialogs.clear();
+        self.spa_back = false;
+        self.spa_forward = false;
+        self.observer_viewport = None;
         self.load = LoadState::Loading {
             url: url.clone(),
             downloaded: 0,
@@ -405,6 +430,15 @@ impl ShellApp {
     }
 
     fn go_back(&mut self) {
+        if self.spa_back {
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(Command::DomEvent {
+                    id: self.navigation_id,
+                    event: crate::script_worker::DomCommand::HistoryGo(-1),
+                });
+            }
+            return;
+        }
         if let Some(url) = self.history.go_back() {
             self.omnibox.set_text(url.as_str());
             self.start_fetch(url, false, false);
@@ -412,6 +446,15 @@ impl ShellApp {
     }
 
     fn go_forward(&mut self) {
+        if self.spa_forward {
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(Command::DomEvent {
+                    id: self.navigation_id,
+                    event: crate::script_worker::DomCommand::HistoryGo(1),
+                });
+            }
+            return;
+        }
         if let Some(url) = self.history.go_forward() {
             self.omnibox.set_text(url.as_str());
             self.start_fetch(url, false, false);
@@ -576,6 +619,10 @@ impl ShellApp {
     fn on_fetch_event(&mut self, event: FetchEvent) {
         let id = match &event {
             FetchEvent::Started { id, .. }
+            | FetchEvent::WebRequest { id, .. }
+            | FetchEvent::Dialog { id, .. }
+            | FetchEvent::SameDocument { id, .. }
+            | FetchEvent::WebNavigate { id, .. }
             | FetchEvent::ScriptPage { id, .. }
             | FetchEvent::ScriptError { id, .. }
             | FetchEvent::Navigate { id, .. }
@@ -591,6 +638,24 @@ impl ShellApp {
             return;
         }
         match event {
+            FetchEvent::Dialog { request, reply, .. } => {
+                self.queue_web_dialog(crate::web_ui::WebDialog::native(request, reply))
+            }
+            FetchEvent::WebRequest {
+                origin, command, ..
+            } => self.web_request(origin, command),
+            FetchEvent::SameDocument {
+                url, back, forward, ..
+            } => {
+                self.spa_back = back;
+                self.spa_forward = forward;
+                self.omnibox.set_text(url.as_str());
+                self.update_title();
+            }
+            FetchEvent::WebNavigate { url, replace, .. } => {
+                self.omnibox.set_text(url.as_str());
+                self.start_fetch(url, false, !replace);
+            }
             FetchEvent::ScriptPage {
                 page,
                 styles,
@@ -705,6 +770,192 @@ impl ShellApp {
         self.request_redraw();
     }
 
+    fn queue_web_dialog(&mut self, dialog: crate::web_ui::WebDialog) {
+        if self.web_dialog.is_none() {
+            self.web_dialog = Some(dialog);
+        } else if self.web_dialogs.len() < 4 {
+            self.web_dialogs.push_back(dialog);
+        } else {
+            self.resolve_web_dialog(dialog, 0);
+        }
+        self.request_redraw();
+    }
+    fn web_request(&mut self, origin: String, command: web_api::WebCommand) {
+        use crate::web_ui::{Action, Kind, WebDialog};
+        match command {
+            web_api::WebCommand::Permission { id, name, .. } => {
+                let mut dialog=WebDialog::notice(format!("This page requests {name}. Choose once, always, or never. Saved grants can be revoked at about:permissions."));
+                dialog.origin = origin;
+                dialog.kind = Kind::Permission {
+                    request: id,
+                    name,
+                    action: Action::Permission,
+                };
+                self.queue_web_dialog(dialog);
+            }
+            web_api::WebCommand::Clipboard {
+                id,
+                text,
+                gesture,
+                permission,
+            } => {
+                let action = Action::Clipboard(text);
+                if !gesture || permission.as_deref() == Some("denied") {
+                    self.web_decision(id, "clipboard-read".into(), "denied".into(), action);
+                } else if permission.as_deref() == Some("granted") {
+                    self.web_decision(id, "clipboard-read".into(), "granted".into(), action);
+                } else {
+                    let mut dialog=WebDialog::notice("This page requests clipboard text access. The desktop clipboard is read or changed only after approval.");
+                    dialog.origin = origin;
+                    dialog.kind = Kind::Permission {
+                        request: id,
+                        name: "clipboard-read".into(),
+                        action,
+                    };
+                    self.queue_web_dialog(dialog);
+                }
+            }
+            web_api::WebCommand::Popup { url, gesture } => {
+                let mut dialog = WebDialog::notice(if gesture {
+                    format!("Open a separate browsing window for {url}?")
+                } else {
+                    "Popup blocked: no user gesture.".into()
+                });
+                dialog.origin = origin;
+                if gesture {
+                    dialog.kind = Kind::Popup(url);
+                }
+                self.queue_web_dialog(dialog);
+            }
+            web_api::WebCommand::Notice(message) => {
+                self.queue_web_dialog(WebDialog::notice(message))
+            }
+            web_api::WebCommand::Fullscreen { enter } => {
+                if let Some(window) = &self.window {
+                    window.set_fullscreen(if enter {
+                        Some(winit::window::Fullscreen::Borderless(None))
+                    } else {
+                        None
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    fn web_decision(
+        &self,
+        request: u64,
+        name: String,
+        decision: String,
+        action: crate::web_ui::Action,
+    ) {
+        if let Some(fetcher) = &self.fetcher {
+            fetcher.send(Command::WebDecision {
+                id: self.navigation_id,
+                request,
+                name,
+                decision,
+                action,
+            });
+        }
+    }
+    fn choose_web_dialog(&mut self, choice: usize) {
+        if let Some(dialog) = self.web_dialog.take() {
+            self.resolve_web_dialog(dialog, choice);
+        }
+        self.web_dialog = self.web_dialogs.pop_front();
+        self.request_redraw();
+    }
+    fn resolve_web_dialog(&mut self, dialog: crate::web_ui::WebDialog, choice: usize) {
+        use crate::web_ui::Kind;
+        match dialog.kind {
+            Kind::Permission {
+                request,
+                name,
+                action,
+            } => self.web_decision(
+                request,
+                name,
+                match choice {
+                    1 => "once",
+                    2 => "always",
+                    3 => "never",
+                    _ => "denied",
+                }
+                .into(),
+                action,
+            ),
+            Kind::Dialog { kind, reply } => {
+                let value = if choice > 0 || matches!(kind, web_api::runtime::DialogKind::Alert) {
+                    Some(dialog.input.text().to_owned())
+                } else {
+                    None
+                };
+                let _ = reply.send(value);
+            }
+            Kind::Popup(url) => {
+                if choice == 1 {
+                    if let Some(fetcher) = &self.fetcher {
+                        fetcher.send(Command::OpenPopup { url });
+                    }
+                }
+            }
+            Kind::Settings => {
+                if matches!(choice, 1 | 2) {
+                    if let Some(fetcher) = &self.fetcher {
+                        fetcher.send(Command::RevokePermissions {
+                            id: self.navigation_id,
+                            all: choice == 2,
+                        });
+                    }
+                }
+            }
+            Kind::Notice => {}
+        }
+    }
+    fn web_dialog_key(&mut self, event: &KeyEvent) {
+        let prompt = self.web_dialog.as_ref().is_some_and(|d| {
+            matches!(
+                d.kind,
+                crate::web_ui::Kind::Dialog {
+                    kind: web_api::runtime::DialogKind::Prompt,
+                    ..
+                }
+            )
+        });
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.choose_web_dialog(0),
+            Key::Named(NamedKey::Enter) => self.choose_web_dialog(1),
+            Key::Character(key) if !prompt => {
+                if let Ok(n) = key.parse::<usize>() {
+                    if (1..=3).contains(&n) {
+                        self.choose_web_dialog(n);
+                    }
+                }
+            }
+            _ if prompt => {
+                if let Some(dialog) = &mut self.web_dialog {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => dialog.input.backspace(),
+                        Key::Named(NamedKey::Delete) => dialog.input.delete(),
+                        Key::Named(NamedKey::ArrowLeft) => dialog.input.move_caret(-1),
+                        Key::Named(NamedKey::ArrowRight) => dialog.input.move_caret(1),
+                        _ => {
+                            if let Some(text) = &event.text {
+                                if !text.chars().any(char::is_control)
+                                    && dialog.input.text().len() + text.len() <= 4096
+                                {
+                                    dialog.input.insert(text);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
     fn show_document(&mut self, requested: &Url, page: Arc<Page>, styles: ComputedStyles) {
         if self.pending_history {
             self.history.navigate(page.url.clone());
@@ -883,13 +1134,14 @@ impl ShellApp {
                 continue;
             }
             self.content_h = result.layout.content_size.height * self.zoom;
-            self.flow = Some(result.layout);
+            self.flow = Some(Arc::new(result.layout));
             self.scene = result.scene;
             self.flow_navigation = Some(result.navigation);
             self.layout_ms = result.elapsed_ms;
             self.layout_passes = result.passes;
             self.blocks.clear();
             self.page_origin = (0.0, 0.0);
+            self.send_geometry();
             self.request_redraw();
         }
     }
@@ -938,6 +1190,28 @@ impl ShellApp {
                 }
                 _ => {}
             }
+        }
+
+        if self.web_dialog.is_some() {
+            self.web_dialog_key(event);
+            return;
+        }
+        if matches!(event.logical_key, Key::Named(NamedKey::Escape))
+            && self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.fullscreen().is_some())
+        {
+            if let Some(window) = &self.window {
+                window.set_fullscreen(None);
+            }
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(Command::DomEvent {
+                    id: self.navigation_id,
+                    event: crate::script_worker::DomCommand::ExitFullscreen,
+                });
+            }
+            return;
         }
 
         if self.omnibox_focused {
@@ -1103,6 +1377,7 @@ impl ShellApp {
                 (dx / self.zoom, dy / self.zoom),
                 &mut self.scroll_offsets,
             ) {
+                self.send_geometry();
                 self.request_redraw();
                 return;
             }
@@ -1132,8 +1407,43 @@ impl ShellApp {
     fn viewport_h(&self) -> f32 {
         (self.size.height as i32 - TOOLBAR_H - STATUS_H).max(50) as f32
     }
+    fn web_viewport(&self) -> web_api::runtime::GeometryRect {
+        web_api::runtime::GeometryRect {
+            x: (self.scroll_x / self.zoom) as f64,
+            y: (self.scroll_y / self.zoom) as f64,
+            width: (self.environment().width / self.zoom) as f64,
+            height: (self.viewport_h() / self.zoom) as f64,
+        }
+    }
+    fn send_geometry(&self) {
+        if !self.script_ready {
+            return;
+        }
+        if let (Some(fetcher), Some(flow)) = (&self.fetcher, &self.flow) {
+            fetcher.send(Command::DomEvent {
+                id: self.navigation_id,
+                event: crate::script_worker::DomCommand::Geometry {
+                    layout: flow.clone(),
+                    offsets: self.scroll_offsets.clone(),
+                    viewport: self.web_viewport(),
+                },
+            });
+        }
+    }
 
     fn on_click(&mut self) {
+        if self.web_dialog.is_some() {
+            let (x, y, w, h) = crate::web_ui::WebDialog::rect(self.size.width);
+            if self.mouse_x >= x as f64
+                && self.mouse_x < (x + w) as f64
+                && self.mouse_y >= (y + h - 44) as f64
+                && self.mouse_y < (y + h) as f64
+            {
+                let choice = (((self.mouse_x - x as f64) / (w as f64 / 3.0)) as usize + 1).min(3);
+                self.choose_web_dialog(choice);
+            }
+            return;
+        }
         if self.script_dialog.take().is_some() {
             self.request_redraw();
             return;
@@ -1251,8 +1561,8 @@ impl ShellApp {
         let mut buttons = Vec::new();
         let loading = matches!(self.load, LoadState::Loading { .. });
         for (label, enabled) in [
-            ("<", self.history.can_go_back()),
-            (">", self.history.can_go_forward()),
+            ("<", self.history.can_go_back() || self.spa_back),
+            (">", self.history.can_go_forward() || self.spa_forward),
             (if loading { "[]" } else { "R" }, true),
         ] {
             buttons.push(Button {
@@ -1318,6 +1628,16 @@ impl ShellApp {
             (f.content_size.width * self.zoom - self.environment().width).max(0.0)
         });
         self.scroll_x = self.scroll_x.clamp(0.0, max_x);
+        let viewport = self.web_viewport();
+        if self.script_ready && self.observer_viewport != Some(viewport) {
+            self.observer_viewport = Some(viewport);
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(Command::DomEvent {
+                    id: self.navigation_id,
+                    event: crate::script_worker::DomCommand::Viewport(viewport),
+                });
+            }
+        }
         let status = self.status_line();
         self.status_text.set_text(&mut self.font_system, &status);
         self.status_text
@@ -1420,6 +1740,9 @@ impl ShellApp {
             text.set_size(fs, (dw - 24).max(1) as f32, (dh - 16) as f32);
             text.draw(fs, cache, &mut canvas, x + 12, y + 10);
         }
+        if let Some(dialog) = &self.web_dialog {
+            dialog.draw(fs, cache, &mut canvas);
+        }
         window.pre_present_notify();
         if let Some(gpu) = &mut self.gpu {
             let window_clip = layout::Rect::new(0.0, 0.0, w as f32, h as f32);
@@ -1446,6 +1769,12 @@ impl ShellApp {
             }
             if let Some(rect) = dialog_rect {
                 if let Some(q) = chrome_quad(&self.pixels, w, h, rect) {
+                    quads.push((q, window_clip));
+                }
+            }
+            if self.web_dialog.is_some() {
+                if let Some(q) = chrome_quad(&self.pixels, w, h, crate::web_ui::WebDialog::rect(w))
+                {
                     quads.push((q, window_clip));
                 }
             }

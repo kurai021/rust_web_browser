@@ -1,0 +1,1 @@
+ var request=indexedDB.open('x',1);request.onupgradeneeded=e=>e.target.result.createObjectStore('s',{autoIncrement:true});request.onsuccess=()=>request.result.transaction('s','readwrite').objectStore('s').put({x:1});

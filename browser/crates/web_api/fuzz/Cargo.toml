@@ -1,0 +1,16 @@
+[package]
+name = "web-api-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+[package.metadata]
+cargo-fuzz = true
+[dependencies]
+libfuzzer-sys = "0.4"
+web_api = { path = "..", version = "0.1.0" }
+dom_bindings = { path = "../../dom_bindings", version = "0.1.0" }
+url = "2"
+[[bin]]
+name = "page_apis"
+path = "fuzz_targets/page_apis.rs"
+[workspace]

@@ -1,4 +1,4 @@
-# Minimal DOM/BOM bindings — Phase 5
+# Owned DOM bindings — Phase 5 core / Phase 7 extension boundary
 
 `DomRuntime` owns a persistent JS realm and one document on the JS worker thread.
 Bindings reuse `html::Document` and the CSS selector/cascade/parser APIs.
@@ -27,8 +27,12 @@ have a basic append/Backspace editor, and there is no full selection/caret,
 IME/composition, WebIDL/prototype or form-submission implementation. Geometry,
 dynamic stylesheet/script insertion and comprehensive lifecycle/resource/event
 semantics need further work. Window listener routing currently shares the
-document target. Full fetch/storage/history/worker/observer APIs are Phase 7;
-microtasks/Promises and the complete event loop are Phase 8.
+document target. Phase 7's `web_api::PageRuntime` extends this surface with the
+documented fetch/storage/history/worker/observer/canvas subsets. `DomHandle` and
+forkable host trampolines allow reentrant coercions without sharing an active
+borrow. Mutation journals and immutable canvas bitmaps are document-owned;
+policy also gates style/connect/image/worker resources. Complete Promises,
+microtasks and event-loop semantics are Phase 8.
 
 The classic loader resumes parser boundaries for blocking scripts and runs defer
 after parsing; the current async attribute takes the defer-compatible path.

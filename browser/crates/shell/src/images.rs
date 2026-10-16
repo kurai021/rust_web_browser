@@ -50,11 +50,29 @@ pub async fn load_images(
             break;
         }
         let cap = MAX_IMAGE_BYTES.min(MAX_PAGE_IMAGE_BYTES - requests.bytes);
+        let mut tainted = false;
         let bytes = if url.scheme() == "data" {
-            data_image(&url).filter(|b| b.len() <= cap)
+            if page
+                .policy
+                .resource_allowed("img-src", &page.url, &url, None)
+            {
+                data_image(&url).filter(|b| b.len() <= cap)
+            } else {
+                None
+            }
         } else if allowed_subresource(&page.url, &url) {
-            match client.fetch_limited(&url, cap, &mut |_| {}).await {
-                Ok(fetched) if allowed_subresource(&page.url, &fetched.url) => Some(fetched.bytes),
+            let allow = |target: &Url| {
+                allowed_subresource(&page.url, target)
+                    && page
+                        .policy
+                        .resource_allowed("img-src", &page.url, target, None)
+            };
+            match client.fetch_script_for(&page.url, &url, cap, &allow).await {
+                Ok(fetched) if allowed_subresource(&page.url, &fetched.url) => {
+                    tainted = !web_api::same_origin(&page.url, &url)
+                        || !web_api::same_origin(&page.url, &fetched.url);
+                    Some(fetched.bytes)
+                }
                 _ => None,
             }
         } else {
@@ -75,6 +93,10 @@ pub async fn load_images(
         // Cancellation must leave a cache miss retryable for the next DOM
         // revision; only completed attempts become negative cache entries.
         requests.attempted.insert(url.clone());
+        page.image_taint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(url.clone(), tainted);
         page.image_cache.insert(url.clone(), image);
         drop(requests);
         on_ready(url, success);

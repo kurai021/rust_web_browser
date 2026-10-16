@@ -5,6 +5,53 @@
 //! mutation; readers (layout, JS bindings, shell) borrow through accessors.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub struct CanvasBitmap {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
+}
+impl PartialEq for CanvasBitmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    ChildList,
+    Attributes,
+    CharacterData,
+}
+#[derive(Debug, Clone)]
+pub struct Mutation {
+    pub kind: MutationKind,
+    pub target: NodeId,
+    pub added: Vec<NodeId>,
+    pub removed: Vec<NodeId>,
+    pub previous: Option<NodeId>,
+    pub next: Option<NodeId>,
+    pub name: Option<String>,
+    pub old_value: Option<Arc<str>>,
+    pub ancestors: Vec<NodeId>,
+}
+impl Mutation {
+    pub fn retained_bytes(&self) -> usize {
+        128 + (self.added.len() + self.removed.len() + self.ancestors.len()) * 8
+            + self.name.as_ref().map_or(0, String::len)
+            + self.old_value.as_ref().map_or(0, |s| s.len())
+    }
+    pub fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        std::iter::once(self.target)
+            .chain(self.added.iter().copied())
+            .chain(self.removed.iter().copied())
+            .chain(self.previous)
+            .chain(self.next)
+            .chain(self.ancestors.iter().copied())
+    }
+}
 
 /// Arena index of a node. Stable for the document lifetime.
 pub type NodeId = usize;
@@ -96,6 +143,13 @@ pub struct Document {
     nodes: Vec<Node>,
     free_nodes: Vec<NodeId>,
     controls: HashMap<NodeId, ControlState>,
+    canvases: HashMap<NodeId, CanvasBitmap>,
+    canvas_epochs: HashMap<NodeId, u64>,
+    image_epochs: HashMap<NodeId, u64>,
+    mutation_enabled: bool,
+    mutations: Vec<Mutation>,
+    mutation_bytes: usize,
+    mutation_overflow: bool,
     /// First `id="…"` element per id (document order wins).
     id_index: HashMap<String, NodeId>,
     /// `<template>` element → its inert contents fragment.
@@ -174,6 +228,13 @@ impl Document {
             bytes = bytes.saturating_add(64).saturating_add(name.capacity());
         }
         bytes
+            .saturating_add(
+                self.canvases
+                    .values()
+                    .map(|c| c.pixels.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.mutation_bytes)
             .saturating_add(self.errors.capacity().saturating_mul(32))
             .saturating_add(self.free_nodes.capacity().saturating_mul(8))
             .saturating_add(self.template_contents.capacity().saturating_mul(32))
@@ -185,6 +246,13 @@ impl Document {
             nodes: Vec::new(),
             free_nodes: Vec::new(),
             controls: HashMap::new(),
+            canvases: HashMap::new(),
+            canvas_epochs: HashMap::new(),
+            image_epochs: HashMap::new(),
+            mutation_enabled: false,
+            mutations: Vec::new(),
+            mutation_bytes: 0,
+            mutation_overflow: false,
             id_index: HashMap::new(),
             template_contents: HashMap::new(),
             quirks_mode: QuirksMode::default(),
@@ -269,13 +337,20 @@ impl Document {
     /// Attach `child` at the end of `parent` (reparenting first if needed).
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
+        let previous = self.nodes[parent].children.last().copied();
         self.nodes[child].parent = Some(parent);
         self.nodes[parent].children.push(child);
         self.index_node(child);
+        if self.mutation_enabled {
+            self.child_mutation(parent, vec![child], Vec::new(), previous, None);
+        }
     }
 
     /// Insert `child` before `before` (which must be a child of `parent`).
     pub fn insert_before(&mut self, parent: NodeId, child: NodeId, before: NodeId) {
+        if child == before {
+            return;
+        }
         self.detach(child);
         self.nodes[child].parent = Some(parent);
         let siblings = &mut self.nodes[parent].children;
@@ -284,13 +359,38 @@ impl Document {
             None => siblings.push(child),
         }
         self.index_node(child);
+        let position = self.nodes[parent]
+            .children
+            .iter()
+            .position(|&id| id == child)
+            .unwrap_or(0);
+        let previous = position
+            .checked_sub(1)
+            .and_then(|i| self.nodes[parent].children.get(i))
+            .copied();
+        if self.mutation_enabled {
+            self.child_mutation(parent, vec![child], Vec::new(), previous, Some(before));
+        }
     }
 
     /// Remove `node` from its parent (children keep pointing at it until
     /// re-attached; the tree builder always re-attaches immediately).
     pub fn detach(&mut self, node: NodeId) {
         if let Some(parent) = self.nodes[node].parent.take() {
+            let position = self.nodes[parent]
+                .children
+                .iter()
+                .position(|&id| id == node)
+                .unwrap_or(0);
+            let previous = position
+                .checked_sub(1)
+                .and_then(|i| self.nodes[parent].children.get(i))
+                .copied();
+            let next = self.nodes[parent].children.get(position + 1).copied();
             self.nodes[parent].children.retain(|&id| id != node);
+            if self.mutation_enabled {
+                self.child_mutation(parent, Vec::new(), vec![node], previous, next);
+            }
         }
     }
 
@@ -329,14 +429,32 @@ impl Document {
             .filter(|&last| matches!(self.nodes[last].data, NodeData::Text(_)));
         match merge_into {
             Some(id) => {
+                let old = if self.mutation_enabled {
+                    match &self.nodes[id].data {
+                        NodeData::Text(s) => Some(Arc::from(s.as_str())),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 if let NodeData::Text(existing) = &mut self.nodes[id].data {
                     existing.push_str(text);
                 }
+                self.record_mutation(Mutation {
+                    kind: MutationKind::CharacterData,
+                    target: id,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    previous: None,
+                    next: None,
+                    name: None,
+                    old_value: old,
+                    ancestors: Vec::new(),
+                });
             }
             None => {
                 let id = self.create_node(NodeData::Text(text.to_owned()));
-                self.nodes[id].parent = Some(parent);
-                self.nodes[parent].children.push(id);
+                self.append_child(parent, id);
             }
         }
     }
@@ -475,6 +593,7 @@ impl Document {
         false
     }
     pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) -> Result<(), DomError> {
+        let observing = self.mutation_enabled;
         if value.len() > crate::DEFAULT_MAX_ATTR_LEN {
             return Err(DomError("attribute value limit"));
         }
@@ -490,17 +609,48 @@ impl Document {
         } else {
             name.to_owned()
         };
+        let old = if observing {
+            el.attributes
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| Arc::from(a.value.as_str()))
+        } else {
+            None
+        };
         if let Some(attr) = el.attributes.iter_mut().find(|a| a.name == name) {
             attr.value = value.into();
         } else {
             el.attributes.push(Attribute {
-                name,
+                name: name.clone(),
                 value: value.into(),
             });
+        }
+        let resizes_canvas =
+            self.is_element_named(id, "canvas") && matches!(name.as_str(), "width" | "height");
+        let image_source = self.is_element_named(id, "img") && name == "src";
+        self.record_mutation(Mutation {
+            kind: MutationKind::Attributes,
+            target: id,
+            added: Vec::new(),
+            removed: Vec::new(),
+            previous: None,
+            next: None,
+            name: Some(name),
+            old_value: old,
+            ancestors: Vec::new(),
+        });
+        if resizes_canvas {
+            let epoch = self.canvas_epochs.entry(id).or_default();
+            *epoch = epoch.wrapping_add(1);
+        }
+        if image_source {
+            let epoch = self.image_epochs.entry(id).or_default();
+            *epoch = epoch.wrapping_add(1);
         }
         Ok(())
     }
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> Result<(), DomError> {
+        let observing = self.mutation_enabled;
         let Some(Node {
             data: NodeData::Element(el),
             ..
@@ -508,7 +658,43 @@ impl Document {
         else {
             return Err(DomError("attribute target is not element"));
         };
+        let name = if el.namespace == Namespace::Html {
+            name.to_ascii_lowercase()
+        } else {
+            name.to_owned()
+        };
+        let old = el.attributes.iter().find(|a| a.name == name).map(|a| {
+            if observing {
+                Arc::from(a.value.as_str())
+            } else {
+                Arc::from("")
+            }
+        });
         el.attributes.retain(|a| a.name != name);
+        let resets_canvas =
+            old.is_some() && el.tag_name == "canvas" && matches!(name.as_str(), "width" | "height");
+        let resets_image = old.is_some() && el.tag_name == "img" && name == "src";
+        if old.is_some() {
+            self.record_mutation(Mutation {
+                kind: MutationKind::Attributes,
+                target: id,
+                added: Vec::new(),
+                removed: Vec::new(),
+                previous: None,
+                next: None,
+                name: Some(name),
+                old_value: old,
+                ancestors: Vec::new(),
+            });
+        }
+        if resets_canvas {
+            let epoch = self.canvas_epochs.entry(id).or_default();
+            *epoch = epoch.wrapping_add(1);
+        }
+        if resets_image {
+            let epoch = self.image_epochs.entry(id).or_default();
+            *epoch = epoch.wrapping_add(1);
+        }
         Ok(())
     }
     pub fn append_checked(
@@ -568,20 +754,45 @@ impl Document {
             return Err(DomError("unknown node"));
         };
         if matches!(node.data, NodeData::Text(_) | NodeData::Comment(_)) {
+            let old = if self.mutation_enabled {
+                match &node.data {
+                    NodeData::Text(s) | NodeData::Comment(s) => Some(Arc::from(s.as_str())),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             node.data = if matches!(node.data, NodeData::Text(_)) {
                 NodeData::Text(value.into())
             } else {
                 NodeData::Comment(value.into())
             };
+            self.record_mutation(Mutation {
+                kind: MutationKind::CharacterData,
+                target: id,
+                added: Vec::new(),
+                removed: Vec::new(),
+                previous: None,
+                next: None,
+                name: None,
+                old_value: old,
+                ancestors: Vec::new(),
+            });
             return Ok(());
         }
         let children = std::mem::take(&mut node.children);
-        for child in children {
-            self.nodes[child].parent = None;
+        for child in &children {
+            self.nodes[*child].parent = None;
         }
+        let mut added = Vec::new();
         if !value.is_empty() {
             let child = self.create_node(NodeData::Text(value.into()));
-            self.append_child(id, child);
+            self.nodes[child].parent = Some(id);
+            self.nodes[id].children.push(child);
+            added.push(child);
+        }
+        if !children.is_empty() || !added.is_empty() {
+            self.child_mutation(id, added, children, None, None);
         }
         Ok(())
     }
@@ -674,6 +885,9 @@ impl Document {
                     children: Vec::new(),
                 };
                 self.controls.remove(&id);
+                self.canvases.remove(&id);
+                self.canvas_epochs.remove(&id);
+                self.image_epochs.remove(&id);
                 self.template_contents.remove(&id);
                 self.free_nodes.push(id);
             }
@@ -693,6 +907,111 @@ impl Document {
     }
 
     // ---------- internals ----------
+    pub fn canvas_bitmap(&self, node: NodeId) -> Option<&CanvasBitmap> {
+        self.canvases.get(&node)
+    }
+    pub fn canvas_epoch(&self, node: NodeId) -> u64 {
+        self.canvas_epochs.get(&node).copied().unwrap_or(0)
+    }
+    pub fn set_canvas_bitmap(
+        &mut self,
+        node: NodeId,
+        width: u32,
+        height: u32,
+        pixels: Arc<[u8]>,
+    ) -> Result<(), DomError> {
+        if !self.is_element_named(node, "canvas")
+            || width > 4096
+            || height > 4096
+            || pixels.len() != width as usize * height as usize * 4
+        {
+            return Err(DomError("canvas dimensions"));
+        }
+        let retained = self
+            .canvases
+            .iter()
+            .filter(|(id, _)| **id != node)
+            .map(|(_, c)| c.pixels.len())
+            .sum::<usize>();
+        if retained.saturating_add(pixels.len()) > 32 * 1024 * 1024 {
+            return Err(DomError("page canvas quota"));
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.canvases.insert(
+            node,
+            CanvasBitmap {
+                id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                width,
+                height,
+                pixels,
+            },
+        );
+        Ok(())
+    }
+    pub fn image_epoch(&self, node: NodeId) -> u64 {
+        self.image_epochs.get(&node).copied().unwrap_or(0)
+    }
+    pub fn observe_mutations(&mut self, enabled: bool) {
+        self.mutation_enabled = enabled;
+        if !enabled {
+            self.mutations.clear();
+            self.mutation_bytes = 0;
+            self.mutation_overflow = false;
+        }
+    }
+    pub fn mutation_roots(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.mutations.iter().flat_map(Mutation::nodes)
+    }
+    pub fn take_mutations(&mut self) -> Result<Vec<Mutation>, DomError> {
+        if self.mutation_overflow {
+            return Err(DomError("mutation queue quota"));
+        }
+        self.mutation_bytes = 0;
+        Ok(std::mem::take(&mut self.mutations))
+    }
+    fn child_mutation(
+        &mut self,
+        target: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    ) {
+        self.record_mutation(Mutation {
+            kind: MutationKind::ChildList,
+            target,
+            added,
+            removed,
+            previous,
+            next,
+            name: None,
+            old_value: None,
+            ancestors: Vec::new(),
+        });
+    }
+    fn record_mutation(&mut self, mut mutation: Mutation) {
+        if !self.mutation_enabled || self.mutation_overflow {
+            return;
+        }
+        let mut parent = self.nodes.get(mutation.target).and_then(|n| n.parent);
+        while let Some(id) = parent {
+            if mutation.ancestors.len() >= crate::DEFAULT_MAX_DEPTH {
+                self.mutation_overflow = true;
+                return;
+            }
+            mutation.ancestors.push(id);
+            parent = self.nodes.get(id).and_then(|n| n.parent);
+        }
+        let bytes = mutation.retained_bytes();
+        if self.mutations.len() >= 1024
+            || self.mutation_bytes.saturating_add(bytes) > 16 * 1024 * 1024
+        {
+            self.mutation_overflow = true;
+            return;
+        }
+        self.mutation_bytes += bytes;
+        self.mutations.push(mutation);
+    }
 
     fn index_node(&mut self, id: NodeId) {
         if let NodeData::Element(el) = &self.nodes[id].data {

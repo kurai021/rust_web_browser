@@ -17,6 +17,7 @@ pub mod script_worker;
 pub mod scripts;
 pub mod text;
 pub mod viewport;
+pub mod web_ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;

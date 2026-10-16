@@ -21,6 +21,8 @@ pub struct Page {
     pub document: Arc<Document>,
     pub stylesheets: Vec<Stylesheet>,
     pub warnings: Vec<String>,
+    pub policy: dom_bindings::policy::Policy,
+    pub(crate) image_taint: Arc<std::sync::Mutex<std::collections::HashMap<Url, bool>>>,
     pub(crate) font_cache: Arc<crate::fonts::FontCache>,
     pub image_cache: Arc<paint::images::ImageCache>,
     pub(crate) image_requests: Arc<tokio::sync::Mutex<crate::images::ImageRequests>>,
@@ -64,23 +66,38 @@ impl Page {
             }
             sheets.push(sheet);
         }
+        let policy = dom_bindings::policy::Policy::parse(&head.script_policies, &document);
         Self {
             url: head.url.clone(),
             status: head.status,
             document: Arc::new(document),
             stylesheets: sheets,
             warnings: Vec::new(),
+            policy,
+            image_taint: Arc::default(),
             font_cache: Arc::default(),
             image_cache: Arc::default(),
             image_requests: Arc::default(),
         }
     }
     pub fn computed_styles(&self, env: Environment) -> ComputedStyles {
+        self.computed_styles_focused(env, None)
+    }
+    pub fn computed_styles_focused(
+        &self,
+        env: Environment,
+        focused: Option<html::NodeId>,
+    ) -> ComputedStyles {
+        let styled = self.policy.style_document(&self.document);
         Cascade {
             environment: env,
+            context: css::selectors::MatchContext {
+                focused,
+                ..Default::default()
+            },
             ..Cascade::default()
         }
-        .compute(&self.document, &self.stylesheets)
+        .compute(styled.as_ref().unwrap_or(&self.document), &self.stylesheets)
     }
 }
 
@@ -99,6 +116,7 @@ pub async fn load_page_from_document(
     document: Document,
 ) -> Page {
     let document = Arc::new(document);
+    let policy = dom_bindings::policy::Policy::parse(&fetched.script_policies, &document);
     let base = document
         .get_elements_by_tag_name("base")
         .into_iter()
@@ -111,6 +129,7 @@ pub async fn load_page_from_document(
     let mut loader = Loader {
         client,
         document_url: &fetched.url,
+        policy: policy.clone(),
         cache: BTreeMap::new(),
         requests: 0,
         total_bytes: 0,
@@ -131,7 +150,14 @@ pub async fn load_page_from_document(
         let media = document.get_attribute(id, "media").unwrap_or("");
         let mut sheet = if el.tag_name == "style" && css_type {
             let raw = document.text_content(id);
-            if loader.total_bytes.saturating_add(raw.len()) > MAX_CSS_TOTAL_BYTES {
+            if !policy.inline_resource_allowed(
+                "style-src",
+                &raw,
+                document.get_attribute(id, "nonce"),
+            ) {
+                loader.warnings.push("CSP blocks inline stylesheet".into());
+                None
+            } else if loader.total_bytes.saturating_add(raw.len()) > MAX_CSS_TOTAL_BYTES {
                 loader.warnings.push("embedded CSS budget exceeded".into());
                 None
             } else {
@@ -190,6 +216,8 @@ pub async fn load_page_from_document(
         document,
         stylesheets: sheets,
         warnings: loader.warnings,
+        policy,
+        image_taint: Arc::default(),
         font_cache: Arc::default(),
         image_cache: Arc::default(),
         image_requests: Arc::default(),
@@ -199,6 +227,7 @@ pub async fn load_page_from_document(
 struct Loader<'a> {
     client: &'a Client,
     document_url: &'a Url,
+    policy: dom_bindings::policy::Policy,
     cache: BTreeMap<Url, Stylesheet>,
     requests: usize,
     total_bytes: usize,
@@ -218,7 +247,17 @@ impl Loader<'_> {
         }
         self.requests += 1;
         let cap = css::syntax::MAX_STYLESHEET_BYTES.min(MAX_CSS_TOTAL_BYTES - self.total_bytes);
-        let fetched = match self.client.fetch_limited(url, cap, &mut |_| {}).await {
+        let allow = |target: &Url| {
+            allowed_subresource(self.document_url, target)
+                && self
+                    .policy
+                    .resource_allowed("style-src", self.document_url, target, None)
+        };
+        let fetched = match self
+            .client
+            .fetch_script_for(self.document_url, url, cap, &allow)
+            .await
+        {
             Ok(f) => f,
             Err(err) => {
                 self.warnings.push(format!("CSS load failed: {url}: {err}"));

@@ -15,3 +15,6 @@ crates/js/fuzz/target/
 crates/layout/fuzz/corpus/
 crates/layout/fuzz/artifacts/
 crates/layout/fuzz/target/
+crates/web_api/fuzz/corpus/
+crates/web_api/fuzz/artifacts/
+crates/web_api/fuzz/target/

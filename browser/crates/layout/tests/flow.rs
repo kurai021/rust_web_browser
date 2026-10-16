@@ -107,6 +107,25 @@ fn border_box_and_min_max_constraints() {
     near(bbox(&doc, &result, "b").border_box.width, 84.0);
     near(bbox(&doc, &result, "b").content_box.height, 50.0);
 }
+#[test]
+fn percentage_width_controls_keep_their_intrinsic_height_and_mask_passwords() {
+    let markup = "<input id=wide type=password value=never-print-this>";
+    let css = "input{display:block;width:100%;height:auto;font-size:16px;line-height:20px}";
+    let (a, tree, small) = page(markup, css, 240.0, &Images::default());
+    let (b, _, large) = page(markup, css, 800.0, &Images::default());
+    near(bbox(&a, &small, "wide").content_box.height, 28.0);
+    near(bbox(&b, &large, "wide").content_box.height, 28.0);
+    let labels = tree
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            RenderKind::Replaced(Replaced::Input { label }) => Some(label.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(!labels.contains("never-print-this"));
+    assert!(labels.contains('•'));
+}
 
 #[test]
 fn parent_child_and_sibling_margins_collapse() {

@@ -10,8 +10,8 @@ pub mod tokenizer;
 pub mod tree;
 
 pub use dom::{
-    Attribute, ControlState, Document, DomError, ElementData, Namespace, Node, NodeData, NodeId,
-    ParseError, QuirksMode, Truncated,
+    Attribute, CanvasBitmap, ControlState, Document, DomError, ElementData, Mutation, MutationKind,
+    Namespace, Node, NodeData, NodeId, ParseError, QuirksMode, Truncated,
 };
 pub use parser::{DomSink, NullSink, Parser};
 pub use tokenizer::{Token, Tokenizer};

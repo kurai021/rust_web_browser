@@ -5,6 +5,14 @@ use cosmic_text::FontSystem;
 use css::ComputedStyles;
 use layout::{LayoutOpts, LayoutResult, Rect, Size};
 use paint::{build_display_list, Rasterizer, Scene};
+pub fn observer_viewport(width: f64, height: f64) -> web_api::runtime::GeometryRect {
+    web_api::runtime::GeometryRect {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+    }
+}
 
 pub fn layout_page(
     page: &Page,
@@ -95,4 +103,120 @@ pub fn headless_frame(
         layout_ms,
         paint_ms,
     }
+}
+/// Linear geometry conversion on the JS/layout side, sharing paint scroll clips.
+pub fn web_geometry(
+    flow: &LayoutResult,
+    offsets: &layout::ScrollOffsets,
+) -> Vec<(html::NodeId, web_api::runtime::GeometryBox)> {
+    use web_api::runtime::{GeometryBox, GeometryRect};
+    #[derive(Clone, Copy, Default)]
+    struct Context {
+        x: f64,
+        y: f64,
+        clip: Option<GeometryRect>,
+        fixed: bool,
+    }
+    fn rect(r: Rect, c: Context) -> GeometryRect {
+        GeometryRect {
+            x: r.x as f64 + c.x,
+            y: r.y as f64 + c.y,
+            width: r.width as f64,
+            height: r.height as f64,
+        }
+    }
+    fn intersection(a: GeometryRect, b: GeometryRect) -> GeometryRect {
+        let x = a.x.max(b.x);
+        let y = a.y.max(b.y);
+        GeometryRect {
+            x,
+            y,
+            width: ((a.x + a.width).min(b.x + b.width) - x).max(0.0),
+            height: ((a.y + a.height).min(b.y + b.height) - y).max(0.0),
+        }
+    }
+    fn union(a: GeometryRect, b: GeometryRect) -> GeometryRect {
+        let x = a.x.min(b.x);
+        let y = a.y.min(b.y);
+        GeometryRect {
+            x,
+            y,
+            width: (a.x + a.width).max(b.x + b.width) - x,
+            height: (a.y + a.height).max(b.y + b.height) - y,
+        }
+    }
+    let mut contexts = Vec::<Context>::with_capacity(flow.boxes.len());
+    let mut geometry = std::collections::HashMap::<html::NodeId, GeometryBox>::new();
+    for b in &flow.boxes {
+        let mut context = b
+            .parent
+            .and_then(|p| contexts.get(p))
+            .copied()
+            .unwrap_or_default();
+        if b.fixed && !context.fixed {
+            context = Context {
+                fixed: true,
+                ..Default::default()
+            };
+        }
+        if !b.anonymous && b.element.pseudo.is_none() {
+            geometry.insert(
+                b.element.node,
+                GeometryBox {
+                    border: rect(b.border_box, context),
+                    content: rect(b.content_box, context),
+                    fixed: b.fixed,
+                    clip: context.clip,
+                },
+            );
+        }
+        if b.overflow != layout::Overflow::Visible {
+            let clip = rect(b.padding_box, context);
+            context.clip = Some(context.clip.map_or(clip, |old| intersection(old, clip)));
+        }
+        if matches!(
+            b.overflow,
+            layout::Overflow::Auto | layout::Overflow::Scroll
+        ) {
+            let (x, y) = offsets.get(&b.element).copied().unwrap_or_default();
+            context.x -= x as f64;
+            context.y -= y as f64;
+        }
+        contexts.push(context);
+    }
+    let boxed = geometry
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for target in &flow.targets {
+        if target.element.pseudo.is_some() || boxed.contains(&target.element.node) {
+            continue;
+        }
+        let mut context = target
+            .ancestors
+            .last()
+            .and_then(|&i| contexts.get(i))
+            .copied()
+            .unwrap_or_default();
+        if target.fixed && !context.fixed {
+            context = Context {
+                fixed: true,
+                ..Default::default()
+            };
+        }
+        let bounds = rect(target.rect, context);
+        geometry
+            .entry(target.element.node)
+            .and_modify(|g| {
+                g.border = union(g.border, bounds);
+                g.content = g.border;
+            })
+            .or_insert(GeometryBox {
+                border: bounds,
+                content: bounds,
+                fixed: target.fixed,
+                clip: context.clip,
+            });
+    }
+    geometry.into_iter().collect()
 }

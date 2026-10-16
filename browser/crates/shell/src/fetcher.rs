@@ -23,6 +23,24 @@ use url::Url;
 /// Commands from the UI thread to the worker.
 #[derive(Debug)]
 pub enum Command {
+    WebDecision {
+        id: u64,
+        request: u64,
+        name: String,
+        decision: String,
+        action: crate::web_ui::Action,
+    },
+    RevokePermissions {
+        id: u64,
+        all: bool,
+    },
+    OpenPopup {
+        url: Url,
+    },
+    WebCompletion {
+        id: u64,
+        completion: web_api::WebCompletion,
+    },
     DomEvent {
         id: u64,
         event: crate::script_worker::DomCommand,
@@ -43,7 +61,9 @@ pub enum Command {
         environment: Environment,
     },
     /// Abort the in-flight fetch, if any.
-    Stop { id: u64 },
+    Stop {
+        id: u64,
+    },
     /// Persist HSTS under `dir` and exit the worker.
     Shutdown,
 }
@@ -51,7 +71,29 @@ pub enum Command {
 /// Events from the worker to the UI thread.
 #[derive(Debug)]
 pub enum FetchEvent {
+    WebRequest {
+        id: u64,
+        origin: String,
+        command: web_api::WebCommand,
+    },
+    Dialog {
+        id: u64,
+        request: web_api::runtime::Dialog,
+        reply: Sender<Option<String>>,
+    },
+    SameDocument {
+        id: u64,
+        url: Url,
+        back: bool,
+        forward: bool,
+    },
+    WebNavigate {
+        id: u64,
+        url: Url,
+        replace: bool,
+    },
     ScriptPage {
+        _lease: Arc<crate::script_worker::PageLease>,
         id: u64,
         page: Arc<Page>,
         styles: css::ComputedStyles,
@@ -199,11 +241,30 @@ fn worker_main(
         .build()
         .expect("tokio runtime builds");
     let client = Arc::new(Client::new(options).expect("TLS stack initializes"));
-    let scripts = match crate::script_worker::ScriptWorker::spawn(
+    let profile = match web_api::storage::Profile::open(profile_dir.clone()) {
+        Ok(profile) => Arc::new(profile),
+        Err(error) => {
+            eprintln!("browser: web profile failed: {error}");
+            return;
+        }
+    };
+    if let Some(dir) = &profile_dir {
+        if let Err(error) = client.cookies.load(&dir.join("cookies.json")) {
+            eprintln!("browser: cookies could not load: {error}");
+        }
+    }
+    let config = web_api::RuntimeConfig {
+        profile,
+        cookies: client.cookies.clone(),
+        session: format!("window-{}", std::process::id()),
+        ..Default::default()
+    };
+    let scripts = match crate::script_worker::ScriptWorker::spawn_configured(
         client.clone(),
         events.clone(),
         wake.clone(),
         active_script,
+        config,
     ) {
         Ok(worker) => Arc::new(std::sync::Mutex::new(worker)),
         Err(error) => {
@@ -226,6 +287,35 @@ fn worker_main(
 
     while let Ok(command) = commands.recv() {
         match command {
+            Command::WebDecision {
+                id,
+                request,
+                name,
+                decision,
+                action,
+            } => scripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .decision(id, request, name, decision, action),
+            Command::RevokePermissions { id, all } => scripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .revoke(id, all),
+            Command::OpenPopup { url } => {
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Err(error) = std::process::Command::new(exe)
+                        .arg(url.as_str())
+                        .stdin(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        eprintln!("browser: popup window failed: {error}");
+                    }
+                }
+            }
+            Command::WebCompletion { id, completion } => scripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .complete(id, completion),
             Command::DomEvent { id, event } => scripts
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -375,8 +465,8 @@ fn worker_main(
             Command::Shutdown => {
                 abort_in_flight(&mut in_flight);
                 abort_in_flight(&mut restyling);
-                persist_hsts(&client, &profile_dir);
                 scripts.lock().unwrap_or_else(|e| e.into_inner()).shutdown();
+                persist_hsts(&client, &profile_dir);
                 break;
             }
         }
@@ -388,6 +478,11 @@ fn worker_main(
 fn persist_hsts(client: &Client, profile_dir: &Option<PathBuf>) {
     if let Some(path) = hsts_path(profile_dir) {
         let _ = client.hsts().save_to(&path);
+    }
+    if let Some(dir) = profile_dir {
+        if let Err(error) = client.cookies.save(&dir.join("cookies.json")) {
+            eprintln!("browser: cookies could not save: {error}");
+        }
     }
 }
 

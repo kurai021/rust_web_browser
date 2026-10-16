@@ -5,6 +5,9 @@
 //! HTTP semantics, cache policy, cookies and HSTS are built here.
 
 pub mod client;
+pub mod cookies;
+pub mod exchange;
+pub use exchange::{HttpRequest, HttpResponse};
 pub mod error;
 pub mod hsts;
 pub mod url;

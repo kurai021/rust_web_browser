@@ -102,6 +102,28 @@ layout fuzz harness reuses libfuzzer-sys/cosmic-text/url only for verification.
 Two WPT flex reftest inputs are BSD-3-Clause; contributor/Intel/Shiyou Tan notices,
 provenance and license are retained under `browser/crates/paint/tests/wpt/`.
 
+## Phase 7 service auxiliaries and WPT data (2026-10-16)
+
+| Dependency / data | License | Use |
+|---|---|---|
+| cookie 0.18.2 | MIT OR Apache-2.0 | Cookie parsing; storage/site/HttpOnly policy remains owned Rust |
+| psl 2.1.241 | MIT OR Apache-2.0 | Offline generated public-suffix lookup; no runtime updater |
+| tokio-tungstenite 0.26.2 | MIT | Async socket protocol adapter, not a web/JS engine |
+| tungstenite 0.26.2 | MIT OR Apache-2.0 | Bounded WebSocket framing and handshake auxiliary |
+| sha1 0.10.7 (transitive) | MIT OR Apache-2.0 | RFC WebSocket handshake inside the auxiliary; no own cryptography |
+| rand 0.9.5 and related protocol dependencies (transitive) | MIT OR Apache-2.0 | Auxiliary socket masking/handshake randomness |
+| WPT fetch/XHR adapted inputs | BSD-3-Clause | Pinned provenance, exclusions and license under web_api/tests/wpt |
+
+serde/serde_json, url, Tokio/futures, base64, encoding_rs, cosmic-text and the
+existing transport/TLS stack are reused. Reqwest's implicit cookie store feature
+was removed in favor of the shared owned policy. The 507-dependency resolved
+workspace passes cargo-deny and cargo-audit with only the six previously recorded
+maintenance notices. No copyleft or vulnerability exception was added.
+
+The initial audit found new RustSec advisories RUSTSEC-2026-0346 through -0349
+affecting the prior rustls 0.23.45. The workspace lock now selects rustls 0.23.46;
+transport/CORS/socket tests and the audit pass with that patched auxiliary.
+
 ## Copyleft exception registry
 
 | Crate | Version | License | Anti-overengineering justification |

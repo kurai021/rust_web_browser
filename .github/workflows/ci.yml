@@ -23,6 +23,13 @@ jobs:
           workspaces: browser
       - run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
       - run: cargo test --workspace --all-targets
+        env:
+          BROWSER_WPT_REPORT_DIR: target/wpt-reports
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase7-wpt-subsets
+          path: browser/target/wpt-reports
       - run: cargo test --workspace --no-default-features
       - uses: actions/setup-node@v4
         with:
@@ -144,3 +151,19 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then seconds=3600; else seconds=300; fi
           mkdir -p fuzz/corpus/layout
           cargo +nightly fuzz run layout fuzz/corpus/layout fuzz/seeds -- -max_total_time="$seconds" -max_len=8192 -timeout=5 -rss_limit_mb=1536
+
+  web-api-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+      - run: cargo install cargo-fuzz --locked
+      - name: Isolated page API, graph, observer and canvas fuzz smoke
+        working-directory: browser/crates/web_api
+        env:
+          ASAN_OPTIONS: quarantine_size_mb=16
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then seconds=3600; else seconds=300; fi
+          mkdir -p fuzz/corpus/page_apis
+          cargo +nightly fuzz run page_apis fuzz/corpus/page_apis fuzz/seeds -- -max_total_time="$seconds" -max_len=8192 -timeout=10 -rss_limit_mb=1536

@@ -8,6 +8,100 @@ pub struct Policy {
     pub policies: Vec<Vec<(String, Vec<String>)>>,
 }
 impl Policy {
+    pub fn from_sources(headers: &[String]) -> Self {
+        Self::parse(headers, &html::Document::new())
+    }
+    pub fn resource_allowed(
+        &self,
+        kind: &str,
+        document: &Url,
+        resource: &Url,
+        nonce: Option<&str>,
+    ) -> bool {
+        if kind == "script-src" {
+            return self.external_allowed(document, resource, nonce);
+        }
+        if kind == "img-src" && resource.scheme() == "data" {
+            return self.policies.iter().all(|p| {
+                p.iter()
+                    .find(|(k, _)| k == kind)
+                    .or_else(|| p.iter().find(|(k, _)| k == "default-src"))
+                    .is_none_or(|(_, sources)| sources.iter().any(|s| s == "data:"))
+            });
+        }
+        let mut target = resource.clone();
+        let _ = match target.scheme() {
+            "ws" => target.set_scheme("http"),
+            "wss" => target.set_scheme("https"),
+            _ => Ok(()),
+        };
+        let policies = self
+            .policies
+            .iter()
+            .map(|p| {
+                let directive = p
+                    .iter()
+                    .find(|(k, _)| k == kind)
+                    .or_else(|| {
+                        (kind == "worker-src")
+                            .then(|| p.iter().find(|(k, _)| k == "script-src"))
+                            .flatten()
+                    })
+                    .or_else(|| p.iter().find(|(k, _)| k == "default-src"));
+                directive.map_or_else(Vec::new, |(_, s)| {
+                    vec![(
+                        "script-src".into(),
+                        s.iter()
+                            .map(|s| s.replacen("wss:", "https:", 1).replacen("ws:", "http:", 1))
+                            .collect(),
+                    )]
+                })
+            })
+            .collect();
+        Self { policies }.external_allowed(document, &target, nonce)
+    }
+    pub fn inline_resource_allowed(&self, kind: &str, source: &str, nonce: Option<&str>) -> bool {
+        let policies = self
+            .policies
+            .iter()
+            .map(|p| {
+                p.iter()
+                    .find(|(k, _)| k == kind)
+                    .or_else(|| p.iter().find(|(k, _)| k == "default-src"))
+                    .map_or_else(Vec::new, |(_, sources)| {
+                        vec![("script-src".into(), sources.clone())]
+                    })
+            })
+            .collect();
+        Self { policies }.inline_allowed(source, nonce)
+    }
+    /// Style filtering changes only the cascade input, never the observable DOM.
+    pub fn style_document(&self, document: &html::Document) -> Option<html::Document> {
+        if !self.policies.iter().any(|p| {
+            p.iter()
+                .any(|(k, _)| matches!(k.as_str(), "style-src" | "default-src"))
+        }) {
+            return None;
+        }
+        let blocked = document
+            .elements_from(0)
+            .into_iter()
+            .filter(|&id| {
+                document
+                    .get_attribute(id, "style")
+                    .is_some_and(|s| !self.inline_resource_allowed("style-src", s, None))
+            })
+            .collect::<Vec<_>>();
+        if blocked.is_empty() {
+            return None;
+        }
+        let mut copy = document.clone();
+        copy.observe_mutations(false);
+        for id in blocked {
+            let _ = copy.remove_attribute(id, "style");
+        }
+        Some(copy)
+    }
     pub fn parse(headers: &[String], document: &html::Document) -> Self {
         let mut sources = headers.to_vec();
         for id in document.get_elements_by_tag_name("meta") {

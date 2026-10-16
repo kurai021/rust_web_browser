@@ -26,6 +26,10 @@ impl HostResult {
     }
 }
 pub trait HostHooks {
+    /// Independent trampolines may share a context, but never an active borrow.
+    fn fork(&self) -> Option<Box<dyn HostHooks>> {
+        None
+    }
     fn before_callback(
         &mut self,
         _vm: &mut Vm,
@@ -146,6 +150,7 @@ pub struct Vm {
     pub(crate) regexp_proto: ObjectId,
     pub(crate) error_proto: ObjectId,
     host: Option<Box<dyn HostHooks>>,
+    host_template: Option<Box<dyn HostHooks>>,
     dynamic_code_allowed: bool,
     pub limits: Limits,
     steps: u64,
@@ -162,6 +167,7 @@ pub struct Vm {
 }
 impl Vm {
     pub fn new(host: impl HostHooks + 'static) -> Self {
+        let host_template = host.fork();
         let mut heap = Heap::new();
         let object_proto = heap.alloc(Object::new(ObjectKind::Ordinary, None));
         let function_proto = heap.alloc(Object::new(ObjectKind::Ordinary, Some(object_proto)));
@@ -186,6 +192,7 @@ impl Vm {
             regexp_proto: object_proto,
             error_proto: object_proto,
             host: Some(Box::new(host)),
+            host_template,
             dynamic_code_allowed: true,
             limits: Limits::default(),
             steps: 0,
@@ -205,6 +212,27 @@ impl Vm {
     }
     pub fn global_value(&self) -> JsValue {
         JsValue::Object(self.global)
+    }
+    pub fn parse_json(&mut self, source: &str) -> Result<JsValue, JsError> {
+        crate::builtins::call(
+            self,
+            "JSON.parse",
+            JsValue::Undefined,
+            vec![JsValue::string(source)],
+            false,
+            None,
+        )
+    }
+    pub fn stringify_json(&mut self, value: JsValue) -> Result<String, JsError> {
+        let value = crate::builtins::call(
+            self,
+            "JSON.stringify",
+            JsValue::Undefined,
+            vec![value],
+            false,
+            None,
+        )?;
+        self.to_string(value)
     }
     pub fn set_global_host(&mut self, id: u64, class: &str) -> Result<(), JsError> {
         self.heap.get_mut(self.global)?.kind = ObjectKind::Host {
@@ -238,6 +266,7 @@ impl Vm {
     }
     pub fn replace_host(&mut self, host: impl HostHooks + 'static) {
         self.dynamic_code_allowed = host.allow_dynamic_code();
+        self.host_template = host.fork();
         self.host = Some(Box::new(host));
     }
     pub(crate) fn emit_console(&mut self, line: &str) -> Result<(), JsError> {
@@ -253,12 +282,16 @@ impl Vm {
         if let Some(host) = &self.host {
             self.dynamic_code_allowed = host.allow_dynamic_code();
         }
+        let primary = self.host.is_some();
         let mut host = self
             .host
             .take()
+            .or_else(|| self.host_template.as_ref().and_then(|h| h.fork()))
             .ok_or_else(|| JsError::new(ErrorKind::Error, "reentrant host operation"))?;
         let result = f(&mut *host, self);
-        self.host = Some(host);
+        if primary {
+            self.host = Some(host);
+        }
         result
     }
     pub fn host_object(&mut self, id: u64, class: &str) -> Result<JsValue, JsError> {
@@ -284,6 +317,34 @@ impl Vm {
             .map(|o| &o.kind)
         {
             Some(ObjectKind::Host { id, .. }) => Some(*id),
+            _ => None,
+        }
+    }
+    pub fn set_host_prototype(
+        &mut self,
+        value: &JsValue,
+        prototype: JsValue,
+    ) -> Result<(), JsError> {
+        if let (Some(id), Some(prototype)) = (value.object(), prototype.object()) {
+            if matches!(self.heap.get(id)?.kind, ObjectKind::Host { .. }) {
+                self.heap.get_mut(id)?.prototype = Some(prototype);
+            }
+        }
+        Ok(())
+    }
+    pub fn is_array(&self, value: &JsValue) -> bool {
+        value
+            .object()
+            .and_then(|id| self.heap.get(id).ok())
+            .is_some_and(|o| matches!(o.kind, ObjectKind::Array))
+    }
+    pub fn date_value(&self, value: &JsValue) -> Option<f64> {
+        match value
+            .object()
+            .and_then(|id| self.heap.get(id).ok())
+            .map(|o| &o.kind)
+        {
+            Some(ObjectKind::Date(value)) => Some(*value),
             _ => None,
         }
     }
@@ -1146,10 +1207,17 @@ impl Vm {
         }
         Ok(())
     }
-    fn begin_task(&mut self) {
+    /// Start a bounded native task before decoding service results or messages.
+    pub fn begin_task(&mut self) {
         self.steps = 0;
         self.started = Instant::now();
         self.depth = 0;
+    }
+    /// Native modal waiting is not script execution; instruction/call caps remain.
+    pub fn exclude_host_wait(&mut self, wait: Duration) {
+        if let Some(started) = self.started.checked_add(wait) {
+            self.started = started;
+        }
     }
     pub fn eval(&mut self, program: &Program) -> Result<JsValue, JsError> {
         self.begin_task();
@@ -2159,7 +2227,10 @@ impl Vm {
         }
         if let ObjectKind::Native(name) = kind {
             if name.starts_with("host:") {
-                return self.call_inner(function, JsValue::Undefined, args, true, None);
+                let prototype = self.get(function.clone(), "prototype")?;
+                let value = self.call_inner(function, JsValue::Undefined, args, true, None)?;
+                self.set_host_prototype(&value, prototype)?;
+                return Ok(value);
             }
             return crate::builtins::call(self, &name, JsValue::Undefined, args, true, None);
         }
@@ -2205,6 +2276,8 @@ impl Vm {
                         .with_host(|host, vm| host.call(vm, &name[5..], this, args.as_slice()))?;
                     self.checkpoint()?;
                     if large
+                        || name.starts_with("host:web:")
+                        || name == "host:postMessage"
                         || matches!(
                             name.as_str(),
                             "host:cloneNode"

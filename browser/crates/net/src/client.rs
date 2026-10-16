@@ -88,9 +88,10 @@ pub struct ResponseHead {
 
 /// HTTPS client with HSTS state.
 pub struct Client {
-    inner: reqwest::Client,
+    pub(crate) inner: reqwest::Client,
+    pub cookies: std::sync::Arc<crate::cookies::CookieJar>,
     hsts: Mutex<HstsStore>,
-    options: FetchOptions,
+    pub(crate) options: FetchOptions,
 }
 
 impl Client {
@@ -100,7 +101,6 @@ impl Client {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(options.connect_timeout)
             .timeout(options.total_timeout)
-            .cookie_store(true)
             // System + bundled (Mozilla) roots come from the
             // `rustls-tls-native-roots` + `rustls-tls-webpki-roots` features
             // (both default to enabled, plan/04 §4.3.3).
@@ -108,6 +108,7 @@ impl Client {
             .map_err(|e| Error::Transport(format!("TLS init failed: {e}")))?;
         Ok(Self {
             inner,
+            cookies: std::sync::Arc::new(crate::cookies::CookieJar::default()),
             hsts: Mutex::new(HstsStore::new()),
             options,
         })
@@ -154,7 +155,8 @@ impl Client {
         max_bytes: usize,
         on_chunk: &mut (dyn FnMut(&ResponseHead, &[u8], Progress) + Send),
     ) -> Result<Fetched, Error> {
-        self.fetch_checked(url, max_bytes, on_chunk, None).await
+        self.fetch_checked(url, max_bytes, on_chunk, None, None)
+            .await
     }
     /// Check every active-resource redirect before connecting to its target.
     pub async fn fetch_script(
@@ -163,8 +165,22 @@ impl Client {
         max_bytes: usize,
         allow: &(dyn Fn(&Url) -> bool + Send + Sync),
     ) -> Result<Fetched, Error> {
-        self.fetch_checked(url, max_bytes, &mut |_, _, _| {}, Some(allow))
+        self.fetch_checked(url, max_bytes, &mut |_, _, _| {}, Some(allow), None)
             .await
+    }
+    /// Active subresource fetch with an explicit top-level cookie context.
+    pub async fn fetch_script_for(
+        &self,
+        top: &Url,
+        url: &Url,
+        max_bytes: usize,
+        allow: &(dyn Fn(&Url) -> bool + Send + Sync),
+    ) -> Result<Fetched, Error> {
+        self.fetch_checked(url, max_bytes, &mut |_, _, _| {}, Some(allow), Some(top))
+            .await
+    }
+    pub fn resource_url(&self, url: &Url) -> Result<Url, Error> {
+        self.effective_url(url)
     }
     async fn fetch_checked(
         &self,
@@ -172,6 +188,7 @@ impl Client {
         max_bytes: usize,
         on_chunk: &mut (dyn FnMut(&ResponseHead, &[u8], Progress) + Send),
         allow: Option<&(dyn Fn(&Url) -> bool + Send + Sync)>,
+        top: Option<&Url>,
     ) -> Result<Fetched, Error> {
         let max_bytes = max_bytes.min(self.options.max_body_bytes);
         let mut url = self.effective_url(url)?;
@@ -185,11 +202,15 @@ impl Client {
             if remaining.is_zero() {
                 return Err(Error::Timeout("total request deadline exceeded".into()));
             }
-            let request = self
+            let mut request = self
                 .inner
                 .get(url.clone())
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .timeout(remaining);
+            let cookies = self.cookies.header(&url, top.unwrap_or(&url), false);
+            if !cookies.is_empty() {
+                request = request.header(reqwest::header::COOKIE, cookies);
+            }
             let response = tokio::time::timeout(
                 self.options.first_byte_timeout.min(remaining),
                 request.send(),
@@ -198,6 +219,11 @@ impl Client {
             .map_err(|_| Error::Timeout("time to first byte exceeded".into()))?
             .map_err(|e| map_reqwest(&e))?;
             self.note_hsts(&url, &response);
+            for value in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                if let Ok(value) = value.to_str() {
+                    self.cookies.set(&url, top.unwrap_or(&url), value, false);
+                }
+            }
             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 if redirects >= self.options.max_redirects {
                     return Err(Error::TooManyRedirects);
@@ -308,7 +334,7 @@ impl Client {
     }
 
     /// Apply scheme gating + HSTS upgrade. Pure and unit-tested.
-    fn effective_url(&self, url: &Url) -> Result<Url, Error> {
+    pub(crate) fn effective_url(&self, url: &Url) -> Result<Url, Error> {
         match url.scheme() {
             "https" => Ok(url.clone()),
             "http" => {
@@ -333,7 +359,7 @@ impl Client {
         })
     }
 
-    fn note_hsts(&self, final_url: &Url, response: &reqwest::Response) {
+    pub(crate) fn note_hsts(&self, final_url: &Url, response: &reqwest::Response) {
         if final_url.scheme() != "https" {
             return;
         }

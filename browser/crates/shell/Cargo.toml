@@ -17,6 +17,7 @@ layout = { path = "../layout", version = "0.1.0" }
 paint = { path = "../paint", version = "0.1.0" }
 js = { path = "../js", version = "0.1.0" }
 dom_bindings = { path = "../dom_bindings", version = "0.1.0" }
+web_api = { path = "../web_api", version = "0.1.0" }
 pollster = "0.4"
 encoding_rs = "0.8"
 flate2 = "1"

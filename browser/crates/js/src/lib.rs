@@ -7,6 +7,8 @@ mod lexer;
 mod parser;
 pub mod value;
 mod vm;
+mod wire;
+pub use wire::{CloneData, CloneNode, CloneValue};
 
 pub use ast::Program;
 pub use parser::{parse, ParseOpts};
