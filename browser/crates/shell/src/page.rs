@@ -26,6 +26,7 @@ pub struct Page {
     pub(crate) font_cache: Arc<crate::fonts::FontCache>,
     pub image_cache: Arc<paint::images::ImageCache>,
     pub(crate) image_requests: Arc<tokio::sync::Mutex<crate::images::ImageRequests>>,
+    pub(crate) icons: Arc<tokio::sync::Mutex<crate::images::Icons>>,
 }
 impl Page {
     /// Embedded CSS is available on a partial DOM; linked sheets and images
@@ -78,6 +79,7 @@ impl Page {
             font_cache: Arc::default(),
             image_cache: Arc::default(),
             image_requests: Arc::default(),
+            icons: Arc::default(),
         }
     }
     pub fn computed_styles(&self, env: Environment) -> ComputedStyles {
@@ -221,6 +223,7 @@ pub async fn load_page_from_document(
         font_cache: Arc::default(),
         image_cache: Arc::default(),
         image_requests: Arc::default(),
+        icons: Arc::default(),
     }
 }
 

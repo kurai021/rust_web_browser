@@ -69,6 +69,10 @@ pub enum Overflow {
 
 #[derive(Debug, Clone)]
 pub struct Glyph {
+    /// UTF-8 cluster offsets in the TextRun, retained for find/selection geometry.
+    pub start: usize,
+    pub end: usize,
+    pub advance: f32,
     pub key: CacheKey,
     pub x: i32,
     pub y: i32,

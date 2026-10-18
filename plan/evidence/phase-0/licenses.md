@@ -124,6 +124,36 @@ The initial audit found new RustSec advisories RUSTSEC-2026-0346 through -0349
 affecting the prior rustls 0.23.45. The workspace lock now selects rustls 0.23.46;
 transport/CORS/socket tests and the audit pass with that patched auxiliary.
 
+## Phase 9 browser/profile auxiliaries (2026-10-18)
+
+| Dependency | License selected | Use |
+|---|---|---|
+| toml 0.8.23 | MIT OR Apache-2.0 | Local profile configuration parsing/writing |
+| pdf-writer 0.12.1 | MIT OR Apache-2.0 | Basic raster A4 export from the owned display list |
+| x509-parser 0.18.1 | MIT OR Apache-2.0 | Display verified peer-certificate metadata; TLS verification remains in rustls |
+| hickory-resolver / hickory-net / hickory-proto 0.26.3 | MIT OR Apache-2.0 | Explicit opt-in DoH adapter; DNS grammar/transport are reused auxiliaries |
+| uuid 1.28.0 | MIT OR Apache-2.0 | OS-random opaque object-URL tokens; no own cryptography |
+| xattr 1.6.1 | MIT OR Apache-2.0 | Best-effort Linux download quarantine/origin metadata |
+| rustix 1.1.5 (existing transitive, promoted) | MIT | Safe no-follow/no-replace filesystem calls and test CPU clock |
+| unicode-normalization 0.1.26 (existing transitive, promoted) | MIT OR Apache-2.0 | Canonically equivalent Unicode find queries |
+
+The image auxiliary's ICO feature is enabled under the same existing image
+license and tighter favicon decoding caps. ASN.1, Moka and TOML support crates are
+auxiliary transitive dependencies; cargo-deny validates the complete resolved
+tree. Existing sha2, serde, url, Tokio/futures and codecs are reused. No web engine,
+toolkit/webview, copyleft-only dependency or new vulnerability exemption entered.
+
+Carry-forward Phase 8 test-data accounting: Level 2 Test262 inputs retain their
+BSD-3-Clause notices and pinned provenance under `js/tests/test262/level2/`.
+The optional upstream vanilla TodoMVC checkout is MIT-licensed test input and is
+not embedded into the product. The Phase 9 workshop and HTTP fixtures are owned
+project code/assets.
+
+The initial Phase 9 audit rejected hickory-proto 0.25.2 for
+RUSTSEC-2026-0118/-0119. The resolved DoH stack was upgraded to 0.26.3;
+no advisory suppression was added. The adapter remains lazy and disabled by
+default, and propagates construction failures rather than panicking.
+
 ## Copyleft exception registry
 
 | Crate | Version | License | Anti-overengineering justification |

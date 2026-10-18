@@ -118,5 +118,14 @@ fn canvas_text_uses_system_shaping_and_draws_nonempty_glyphs() {
     let bitmap = d
         .canvas_bitmap(d.get_element_by_id("chart").unwrap())
         .unwrap();
-    assert!(bitmap.pixels.chunks_exact(4).filter(|p| p[3] > 0).count() > 50);
+    assert!(
+        bitmap
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] > 0)
+            .count()
+            > 50
+    );
 }

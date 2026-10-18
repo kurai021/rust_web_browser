@@ -43,6 +43,12 @@ defect.
 
 ## Typical defensive techniques in use
 
+Carry-forward clarification: the earlier resource explanation was not a proof
+that all code was free of resource defects. Phase 9 GUI measurements found and
+fixed idle-GC bugs in both page and dedicated workers. See
+[`../phase-9/testing-scope.md`](../phase-9/testing-scope.md) and the measured
+[`../phase-9/performance.md`](../phase-9/performance.md).
+
 * Sanitized (ASan) libFuzzer targets for the JS parser/evaluator and the page API
   surface, seeded with modern-JS constructs (async generators, `for await`,
   Proxy, WeakMap, BigInt, structured clone, modules).

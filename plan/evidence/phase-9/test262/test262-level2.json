@@ -1,0 +1,431 @@
+{
+  "suite": "test262-level2-adapted",
+  "upstream": "tc39/test262@d53ebc8b1931d9f1541e43d59650776e4b766248",
+  "source_cases": 30,
+  "pass": 57,
+  "fail": 0,
+  "skip_sources": 3,
+  "assertions": 206,
+  "cases": [
+    {
+      "path": "built-ins/Promise/resolve/resolve-thenable.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 0,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/resolve/resolve-thenable.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 0,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/resolve/arg-poisoned-then.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/resolve/arg-poisoned-then.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/all/resolve-ignores-late-rejection.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/all/resolve-ignores-late-rejection.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/all/iter-arg-is-string-resolve.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/all/iter-arg-is-string-resolve.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/any/iter-arg-is-empty-iterable-reject.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/any/iter-arg-is-empty-iterable-reject.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/prototype/finally/rejection-reason-override-with-throw.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 5,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Promise/prototype/finally/rejection-reason-override-with-throw.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 5,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/evaluation-body-that-returns-after-await.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/evaluation-body-that-returns-after-await.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/evaluation-body-that-throws-after-await.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/evaluation-body-that-throws-after-await.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/evaluation-default-that-throws.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 0,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/evaluation-default-that-throws.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 0,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/try-return-finally-throw.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/async-function/try-return-finally-throw.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/generators/no-yield.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "language/statements/generators/no-yield.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "language/statements/generators/invoke-as-constructor.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "language/statements/generators/invoke-as-constructor.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Map/bigint-number-same-value.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 11,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Map/bigint-number-same-value.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 11,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Map/prototype/forEach/iterates-values-added-after-foreach-begins.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 8,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Map/prototype/forEach/iterates-values-added-after-foreach-begins.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 8,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Map/prototype/set/replaces-a-value-normalizes-zero-key.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Map/prototype/set/replaces-a-value-normalizes-zero-key.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Set/bigint-number-same-value.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 9,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Set/bigint-number-same-value.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 9,
+      "detail": null
+    },
+    {
+      "path": "built-ins/WeakMap/iterable-with-object-keys.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "path": "built-ins/WeakMap/iterable-with-object-keys.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "path": "built-ins/WeakMap/iterable-with-symbol-keys.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "path": "built-ins/WeakMap/iterable-with-symbol-keys.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Symbol/uniqueness.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 4,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Symbol/uniqueness.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 4,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Symbol/keyFor/arg-symbol-registry-hit.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Symbol/keyFor/arg-symbol-registry-hit.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-coercion.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-coercion.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-empty-string.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-empty-string.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-from-hex-string.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 8,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-from-hex-string.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 8,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-from-string-syntax-errors.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 14,
+      "detail": null
+    },
+    {
+      "path": "built-ins/BigInt/constructor-from-string-syntax-errors.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 14,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Proxy/get/not-same-value-configurable-false-writable-false-throws.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Proxy/get/not-same-value-configurable-false-writable-false-throws.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Reflect/get/return-value-from-receiver.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Reflect/get/return-value-from-receiver.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Reflect/set/receiver-is-not-object.js",
+      "mode": "sloppy",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "path": "built-ins/Reflect/set/receiver-is-not-object.js",
+      "mode": "strict",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "path": "language/expressions/import.meta/same-object-returned.js",
+      "mode": "module",
+      "status": "pass",
+      "assertions": 2,
+      "detail": null
+    },
+    {
+      "path": "language/expressions/import.meta/distinct-for-each-module.js",
+      "mode": "module",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "path": "language/module-code/top-level-await/module-import-resolution.js",
+      "mode": "module",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "path": "built-ins/WeakRef/constructor.js",
+      "mode": "not-run",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "WeakRef is optional in Level 2 and is not installed"
+    },
+    {
+      "path": "built-ins/Symbol/keyFor/cross-realm.js",
+      "mode": "not-run",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "the test harness does not expose $262.createRealm"
+    },
+    {
+      "path": "built-ins/Map/proto-from-ctor-realm.js",
+      "mode": "not-run",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "cross-realm newTarget needs the multi-realm $262 harness"
+    }
+  ]
+}

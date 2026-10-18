@@ -57,7 +57,7 @@ impl Engine<'_> {
             let wc = self.ctx(&node.style, containing.width);
             let hc = self.ctx(&node.style, containing.height);
             let [top, right, bottom, left] = std::array::from_fn::<_, 4, _>(|i| {
-                spec.inset[i].resolve(if i % 2 == 0 { hc } else { wc })
+                spec.inset[i].resolve(if i.is_multiple_of(2) { hc } else { wc })
             });
             let (m, p, b) = self.edges(node, containing.width);
             let inset = p.add_edges(b);

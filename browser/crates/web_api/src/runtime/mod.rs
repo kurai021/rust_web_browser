@@ -41,6 +41,12 @@ const STORAGE_MANAGER: u64 = WEB_BASE + 9;
 const INDEXED_DB: u64 = WEB_BASE + 10;
 #[derive(Debug, Clone)]
 pub enum Command {
+    Download {
+        url: Url,
+        filename: String,
+        bytes: Option<Arc<Vec<u8>>>,
+        gesture: bool,
+    },
     ModuleLoad {
         known: Vec<String>,
         id: u64,
@@ -64,6 +70,7 @@ pub enum Command {
     SameDocument {
         url: Url,
         replace: bool,
+        traversal: Option<i32>,
     },
     Permission {
         id: u64,
@@ -364,6 +371,7 @@ pub(super) enum Job {
     },
 }
 pub(super) struct State {
+    blob_urls: HashMap<String, Arc<Vec<u8>>>,
     dom: DomHandle,
     config: Config,
     next: u64,
@@ -508,6 +516,12 @@ impl Command {
                 ..
             } => url.as_str().len() + known.iter().map(|s| s.len() + 32).sum::<usize>() + policy(p),
             Self::SocketSend { data, .. } => data.len(),
+            Self::Download {
+                url,
+                filename,
+                bytes,
+                ..
+            } => url.as_str().len() + filename.len() + bytes.as_ref().map_or(0, |b| b.len()),
             Self::Clipboard { text, .. } => text.as_ref().map_or(0, String::len),
             Self::Notice(s) => s.len(),
             Self::Notify { title, body } => title.len() + body.len(),
@@ -548,6 +562,7 @@ impl PageRuntime {
     ) -> std::result::Result<Self, JsError> {
         let dom = DomRuntime::new(document, url.clone(), sheets, environment, policy)?;
         let state = Rc::new(RefCell::new(State {
+            blob_urls: Default::default(),
             dom: dom.handle(),
             config,
             next: 100,
@@ -616,13 +631,17 @@ impl PageRuntime {
         self.finish_web_task(result)
     }
     pub fn poll_timers(&mut self) -> std::result::Result<(), JsError> {
+        let mut ran = false;
         for _ in 0..100 {
             let result = self.dom.poll_one_timer();
             if !self.finish_web_task(result)? {
                 break;
             }
+            ran = true;
         }
-        self.dom.gc_collect();
+        if ran {
+            self.dom.gc_collect();
+        }
         Ok(())
     }
     pub fn begin_gesture(&mut self) {

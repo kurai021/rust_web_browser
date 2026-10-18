@@ -1,15 +1,18 @@
-# Example profile config (Phase 0).
-# Real use from Phase 9 on: copy to <profile-dir>/config.toml.
+# Local Phase 9 profile configuration. Copy to <profile-dir>/config.toml.
+# Defaults: $XDG_CONFIG_HOME/navegador-rust or ~/.config/navegador-rust.
 
 [general]
 homepage = "about:blank"
 search_engine = "https://duckduckgo.com/?q={query}"
+restore_session = true
 
 [privacy]
 adblock_enabled = true
 third_party_cookies = "block"
 doh_enabled = false
+# DoH is an explicit opt-in to Quad9 HTTPS; a change applies after restart.
 javascript_enabled = true
+# Optional origin-scoped overrides, e.g. site_javascript = { "https://example.com" = false }
 
 [downloads]
 path = "~/Downloads"
@@ -17,3 +20,6 @@ ask_every_time = true
 
 [render]
 software_fallback = false
+
+[appearance]
+theme = "system" # system, light, dark

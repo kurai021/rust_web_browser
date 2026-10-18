@@ -10,6 +10,45 @@ impl WebHost {
     ) -> std::result::Result<Option<JsValue>, JsError> {
         let snapshot = || self.state.borrow().objects.get(&id).map(|o| o.kind.clone());
         let value = match name {
+            "url:createObjectURL" => {
+                let blob = arg(args, 0);
+                let id = vm
+                    .host_id(&blob)
+                    .ok_or_else(|| error(vm, ApiError::new("TypeError", "Expected Blob")))?;
+                let bytes = match self.state.borrow().objects.get(&id).map(|o| &o.kind) {
+                    Some(Kind::Blob { bytes, .. }) => bytes.clone(),
+                    _ => return Err(error(vm, ApiError::new("TypeError", "Expected Blob"))),
+                };
+                vm.check_host_bytes(bytes.len())?;
+                let mut state = self.state.borrow_mut();
+                if state.blob_urls.len() >= 32
+                    || state
+                        .blob_urls
+                        .values()
+                        .map(|b| b.len())
+                        .sum::<usize>()
+                        .saturating_add(bytes.len())
+                        > 32 * 1024 * 1024
+                {
+                    drop(state);
+                    return Err(error(
+                        vm,
+                        ApiError::new("QuotaExceededError", "Object URL quota"),
+                    ));
+                }
+                let url = format!(
+                    "blob:{}/{}",
+                    state.dom.url().origin().ascii_serialization(),
+                    uuid::Uuid::new_v4()
+                );
+                state.blob_urls.insert(url.clone(), Arc::new(bytes));
+                JsValue::string(&url)
+            }
+            "url:revokeObjectURL" => {
+                let url = text(vm, args, 0)?;
+                self.state.borrow_mut().blob_urls.remove(&url);
+                JsValue::Undefined
+            }
             "fullscreen:request" => {
                 let (node, gesture, secure, platform) = {
                     let s = self.state.borrow();

@@ -4,12 +4,12 @@ Sanitized libFuzzer target for the **owned** JavaScript parser, bytecode compile
 and interpreter. It fuzzes this repository's engine only — no external process,
 library or network target.
 
-See [../../../plan/evidence/phase-8/testing-scope.md](../../../plan/evidence/phase-8/testing-scope.md)
+See [testing scope](../../../../plan/evidence/phase-9/testing-scope.md)
 for the full scope, boundaries and resource discipline.
 
 ```sh
-# single target, time- and memory-bounded; do not run alongside heavy builds
-CARGO_BUILD_JOBS=2 cargo +nightly fuzz run parse_eval corpus/parse_eval seeds -- \
+# From browser/crates/js; single target, serialized with heavy builds
+CARGO_BUILD_JOBS=2 cargo +nightly fuzz run parse_eval fuzz/corpus/parse_eval fuzz/seeds -- \
   -max_total_time=600 -max_len=8192 -timeout=3 -rss_limit_mb=1536
 ```
 

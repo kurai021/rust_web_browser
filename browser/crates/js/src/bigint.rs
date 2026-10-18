@@ -328,7 +328,7 @@ impl BigInt {
             let lost = self.words.iter().enumerate().any(|(i, &w)| {
                 if i < count / 32 {
                     w != 0
-                } else if i == count / 32 && count % 32 != 0 {
+                } else if i == count / 32 && !count.is_multiple_of(32) {
                     w & ((1u32 << (count % 32)) - 1) != 0
                 } else {
                     false
@@ -459,7 +459,7 @@ impl BigInt {
         }
         let mut words = self.twos(bits.div_ceil(32));
         words.truncate(bits.div_ceil(32));
-        if bits % 32 != 0 {
+        if !bits.is_multiple_of(32) {
             if let Some(word) = words.last_mut() {
                 *word &= (1u32 << (bits % 32)) - 1;
             }

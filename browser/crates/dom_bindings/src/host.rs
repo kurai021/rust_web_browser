@@ -661,7 +661,7 @@ impl HostHooks for DomHost {
                     .and_then(|raw| state.url.join(raw).ok())
                     .map_or_else(String::new, |u| u.to_string()),
             ),
-            "alt" | "name" | "placeholder" => {
+            "alt" | "name" | "placeholder" | "download" | "target" | "rel" => {
                 JsValue::string(document.get_attribute(node, key).unwrap_or(""))
             }
             "documentElement" => wrap(
@@ -819,6 +819,9 @@ impl HostHooks for DomHost {
                 | "type"
                 | "name"
                 | "href"
+                | "download"
+                | "target"
+                | "rel"
                 | "src"
                 | "alt"
                 | "placeholder"
@@ -1227,7 +1230,7 @@ impl HostHooks for DomHost {
             "append" | "prepend" => {
                 for (i, value) in args.iter().enumerate() {
                     vm.checkpoint()?;
-                    if i % 128 == 0 {
+                    if i.is_multiple_of(128) {
                         vm.check_host_bytes(self.retained_bytes())?;
                     }
                     let child = if let Some(id) = vm.host_id(value).and_then(node_id) {
@@ -1533,7 +1536,28 @@ impl HostHooks for DomHost {
                 }
                 JsValue::Undefined
             }
-            "click" | "focus" | "blur" => {
+            "click" => {
+                let mut state = self.state.borrow_mut();
+                if state.document.get_attribute(node, "disabled").is_some()
+                    || !state.activation.insert(node)
+                {
+                    return Ok(HostResult::value(JsValue::Undefined));
+                }
+                let event = state.make_event(
+                    "click".into(),
+                    node,
+                    true,
+                    true,
+                    JsValue::Undefined,
+                    String::new(),
+                );
+                if let Some(event) = state.events.get_mut(&event) {
+                    event.synthetic_activation = true;
+                }
+                drop(state);
+                return self.dispatch_plan(vm, node, event);
+            }
+            "focus" | "blur" => {
                 let mut state = self.state.borrow_mut();
                 if name == "focus" {
                     state.focused = Some(node);
@@ -1716,6 +1740,10 @@ impl HostHooks for DomHost {
         let node = event.target;
         let name = event.name.clone();
         let old_checked = event.old_checked;
+        let synthetic = event.synthetic_activation;
+        if synthetic {
+            state.activation.remove(&node);
+        }
         if name == "click" {
             if let Some(old) = old_checked {
                 if prevented {
@@ -1740,7 +1768,53 @@ impl HostHooks for DomHost {
                 }
             }
         }
-        Ok(JsValue::Bool(!prevented))
+        let link = if name == "click" && !prevented {
+            let mut current = Some(node);
+            let mut link = None;
+            while let Some(id) = current {
+                if state.document.is_element_named(id, "a") {
+                    if let Some(url) = state
+                        .document
+                        .get_attribute(id, "href")
+                        .and_then(|href| state.url.join(href).ok())
+                    {
+                        link = Some((
+                            url,
+                            state
+                                .document
+                                .get_attribute(id, "download")
+                                .map(str::to_owned),
+                            state
+                                .document
+                                .get_attribute(id, "target")
+                                .unwrap_or("")
+                                .to_owned(),
+                        ));
+                    }
+                    break;
+                }
+                current = state.document.try_get(id).and_then(|n| n.parent);
+            }
+            link
+        } else {
+            None
+        };
+        drop(state);
+        if let Some((url, download, target)) = link {
+            let handled = if let Some(extension) = &mut self.extension {
+                extension.activate_link(_vm, url.as_str(), download.as_deref(), &target)?
+            } else {
+                false
+            };
+            if !handled && matches!(url.scheme(), "http" | "https") {
+                self.state.borrow_mut().navigation = Some(url);
+            }
+        }
+        Ok(if synthetic {
+            JsValue::Undefined
+        } else {
+            JsValue::Bool(!prevented)
+        })
     }
     fn roots(&self, live: &HashSet<u64>) -> Vec<JsValue> {
         let state = self.state.borrow();

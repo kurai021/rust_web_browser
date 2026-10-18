@@ -1137,6 +1137,9 @@ impl Engine<'_> {
                     g.cache_key_flags,
                 );
                 Glyph {
+                    start: g.start,
+                    end: g.end,
+                    advance: g.w,
                     key,
                     x: gx,
                     y: gy,

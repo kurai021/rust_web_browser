@@ -13,7 +13,7 @@ simd = []
 layout = { path = "../layout", version = "0.1.0" }
 css = { path = "../css", version = "0.1.0" }
 cosmic-text = "0.12"
-image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 resvg = "0.45"
 roxmltree = "0.20"
 wgpu = "24"

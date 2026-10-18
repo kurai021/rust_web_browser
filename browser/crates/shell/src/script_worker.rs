@@ -10,9 +10,12 @@ use std::sync::{
     mpsc, Arc,
 };
 use std::time::Duration;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Clone)]
 pub enum DomCommand {
+    Snapshot,
     ExitFullscreen,
     Geometry {
         layout: Arc<layout::LayoutResult>,
@@ -35,6 +38,8 @@ pub enum DomCommand {
     Resize(Environment),
 }
 enum Command {
+    #[cfg(test)]
+    Fault,
     Image {
         navigation: u64,
         node: NodeId,
@@ -128,10 +133,14 @@ impl ScriptWorker {
         let (tx, rx) = mpsc::channel();
         let replies = tx.clone();
         let token = active.clone();
+        let crash_events = events.clone();
+        let crash_wake = wake.clone();
+        let crash_active = token.clone();
         let worker = std::thread::Builder::new()
             .name("js-worker".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .max_blocking_threads(2)
@@ -169,10 +178,12 @@ impl ScriptWorker {
                     let wait = current
                         .as_ref()
                         .map_or(Duration::from_millis(100), |(_, loaded)| {
-                            loaded.runtime.next_timer().min(Duration::from_millis(10))
+                            let timer=loaded.runtime.next_timer();if services.has_pending_work(){timer.min(Duration::from_millis(10))}else{timer}
                         });
                     let command = rx.recv_timeout(wait);
                     match command {
+                        #[cfg(test)]
+                        Ok(Command::Fault)=>panic!("test-only isolated tab fault"),
                         Ok(Command::Image{navigation,node,url,epoch,image})=>{if let Some((id,loaded))=&mut current{if *id==navigation&&token.load(Ordering::Relaxed)==navigation{let result=if let Some(image)=image{loaded.runtime.image_at(node,&url,epoch,image)}else{loaded.runtime.image_error(node,&url,epoch)};if let Err(error)=result{report(&events,&wake,navigation,&error);}}}}
                         Ok(Command::Revoke{navigation,all})=>{
                             if let Some((id,loaded))=&mut current{if *id==navigation{let result=if all{loaded.runtime.revoke_permissions()}else{loaded.runtime.revoke_origin_permissions()};if let Err(error)=result{loaded.runtime.handle().console(error.to_string());}}}
@@ -222,6 +233,7 @@ impl ScriptWorker {
                             ));
                             match loaded {
                                 Ok(mut loaded) => {
+                                    forward_services(&mut services,&mut loaded,navigation,&events,&wake);
                                     snapshots=Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                     let Some(page) = send_page(&events, &wake, navigation, &loaded, true,&snapshots)else{continue;};
                                     loaded.page = page.clone();
@@ -286,6 +298,10 @@ impl ScriptWorker {
                                 wake();
                             }
                             loaded.runtime.gc_collect();
+                            if matches!(event,DomCommand::Snapshot){
+                                if let Some(page)=send_page(&events,&wake,*id,loaded,false,&snapshots){loaded.page=page.clone();published=loaded.runtime.revision();if let Some(old)=resources.take(){old.abort();}resources=Some(load_resources(&runtime,client.clone(),*id,page,loaded.runtime_environment(),ResourceChannels{events:events.clone(),wake:wake.clone(),commands:replies.clone()}));}
+                                let(back,forward)=loaded.runtime.history_directions();let _=events.send(FetchEvent::SameDocument{id:*id,url:loaded.runtime.url(),back,forward,replace:true,traversal:None});wake();
+                            }
                         }
                         Ok(Command::Complete{navigation,completion})=>{
                             let Some((id,loaded))=&mut current else{continue;};
@@ -298,6 +314,7 @@ impl ScriptWorker {
                                     current = None;
                                     continue;
                                 }
+                                if !loaded.runtime.next_timer().is_zero(){continue;}
                                 if let Err(error) = loaded.runtime.poll_timers() {
                                     let _ = events.send(FetchEvent::ScriptError {
                                         id: *id,
@@ -310,10 +327,13 @@ impl ScriptWorker {
                                     let _ = events.send(FetchEvent::Navigate { id: *id, url });
                                     wake();
                                 }
-                                loaded.runtime.gc_collect();
                             }
                         }
                     }
+                }
+                }));
+                if result.is_err() {
+                    let _ = crash_events.send(FetchEvent::Crashed { id: crash_active.fetch_add(1, Ordering::Relaxed), message: "This tab's script worker stopped unexpectedly. Other tabs are still running; reload to recover.".into() }); crash_wake();
                 }
             })?;
         Ok(Self {
@@ -362,6 +382,13 @@ impl ScriptWorker {
         let _ = self.commands.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+impl Drop for ScriptWorker {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            self.shutdown();
         }
     }
 }
@@ -429,13 +456,19 @@ fn forward_services(
                 let _ = events.send(FetchEvent::WebNavigate { id, url, replace });
                 wake();
             }
-            WebCommand::SameDocument { url, .. } => {
+            WebCommand::SameDocument {
+                url,
+                replace,
+                traversal,
+            } => {
                 let (back, forward) = loaded.runtime.history_directions();
                 let _ = events.send(FetchEvent::SameDocument {
                     id,
                     url,
                     back,
                     forward,
+                    replace,
+                    traversal,
                 });
                 wake();
             }
@@ -656,11 +689,79 @@ fn load_resources(
             });
             wake();
         });
-        tokio::join!(fonts, images);
+        let favicon = async {
+            let Some(url) = page
+                .document
+                .get_elements_by_tag_name("link")
+                .into_iter()
+                .find_map(|node| {
+                    page.document.get_attribute(node, "rel").filter(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|name| name.eq_ignore_ascii_case("icon"))
+                    })?;
+                    page.document
+                        .get_attribute(node, "href")
+                        .and_then(|href| page.url.join(href).ok())
+                })
+            else {
+                return;
+            };
+            let mut icons = page.icons.lock().await;
+            if let Some(cached) = icons.cache.get(&url) {
+                if let Some(image) = cached {
+                    let _ = events.send(FetchEvent::Favicon {
+                        id,
+                        image: image.clone(),
+                    });
+                    wake();
+                }
+                return;
+            }
+            if icons.attempts >= 8 {
+                return;
+            }
+            icons.attempts += 1;
+            let allowed = |target: &url::Url| {
+                crate::page::allowed_subresource(&page.url, target)
+                    && page
+                        .policy
+                        .resource_allowed("img-src", &page.url, target, None)
+            };
+            let bytes = if url.scheme() == "data"
+                && page
+                    .policy
+                    .resource_allowed("img-src", &page.url, &url, None)
+            {
+                crate::images::data_image(&url).filter(|bytes| bytes.len() <= 256 * 1024)
+            } else if allowed(&url) {
+                client
+                    .fetch_script_for(&page.url, &url, 256 * 1024, &allowed)
+                    .await
+                    .ok()
+                    .map(|f| f.bytes)
+            } else {
+                None
+            };
+            let image = if let Some(bytes) = bytes {
+                tokio::task::spawn_blocking(move || paint::images::decode_icon(&bytes))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            } else {
+                None
+            };
+            icons.cache.insert(url, image.clone());
+            if let Some(image) = image {
+                let _ = events.send(FetchEvent::Favicon { id, image });
+                wake();
+            }
+        };
+        tokio::join!(fonts, images, favicon);
     })
 }
 fn handle_dom(loaded: &mut LoadedScripts, event: &DomCommand) -> Result<(), js::JsError> {
     match event {
+        DomCommand::Snapshot => Ok(()),
         DomCommand::ExitFullscreen => loaded.runtime.fullscreen_exit(),
         DomCommand::Geometry {
             layout,
@@ -753,23 +854,7 @@ fn handle_dom(loaded: &mut LoadedScripts, event: &DomCommand) -> Result<(), js::
                 return Ok(());
             }
             loaded.runtime.focus(focus)?;
-            let allowed = loaded.runtime.dispatch(*node, "click", "")?;
-            if allowed {
-                let document = loaded.runtime.document();
-                let mut current = Some(*node);
-                while let Some(node) = current {
-                    if document.is_element_named(node, "a") {
-                        if let Some(href) = document
-                            .get_attribute(node, "href")
-                            .and_then(|s| loaded.page.url.join(s).ok())
-                        {
-                            loaded.set_navigation(href);
-                        }
-                        break;
-                    }
-                    current = document.get(node).parent;
-                }
-            }
+            loaded.runtime.dispatch(*node, "click", "")?;
             Ok(())
         }
         DomCommand::Key {

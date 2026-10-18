@@ -137,6 +137,16 @@ pub fn clipboard(text: Option<String>) -> web_api::Result<String> {
         String::from_utf8_lossy(&output).into_owned()
     })
 }
+/// Only a user-selected directory URI is passed to the desktop helper.
+pub fn open_folder(url: &url::Url) -> web_api::Result<()> {
+    if url.scheme() != "file" || !url.as_str().ends_with('/') {
+        return Err(web_api::ApiError::new(
+            "TypeError",
+            "Expected a directory URI",
+        ));
+    }
+    run(Command::new("xdg-open").arg(url.as_str()), None).map(|_| ())
+}
 pub fn notify(title: &str, body: &str) -> web_api::Result<()> {
     run(
         Command::new("notify-send").args(["--app-name=browser", "--", title, body]),

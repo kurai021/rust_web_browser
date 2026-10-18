@@ -47,7 +47,13 @@ impl Services {
             workers: HashMap::new(),
         }
     }
-    /// UI-facing commands are returned to the shell, never executed on an I/O task.
+    /// Dormant pages can sleep; only outstanding I/O needs short completion polling.
+    pub fn has_pending_work(&self) -> bool {
+        !self.rx.is_empty()
+            || self.tasks.values().any(|task| !task.is_finished())
+            || !self.workers.is_empty()
+            || !self.sockets.is_empty()
+    }
     pub fn dispatch(&mut self, command: Command) -> Result<Option<Command>> {
         self.tasks.retain(|_, task| !task.is_finished());
         match command {

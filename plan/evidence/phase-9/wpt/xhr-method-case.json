@@ -1,0 +1,60 @@
+{
+  "suite": "xhr-method-case",
+  "upstream": "wpt@4aa56d3beafc5655fa55491169eb14845b44eab3 (adapted)",
+  "cases": [
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (XUNICORN)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (xUNIcorn)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (chiCKEN)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (PATCH)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (patCH)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (copy)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (COpy)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (inDEX)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    },
+    {
+      "name": "XMLHttpRequest: open() - case-sensitive methods test (movE)",
+      "status": "pass",
+      "assertions": 1,
+      "detail": null
+    }
+  ]
+}

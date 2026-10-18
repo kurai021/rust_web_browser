@@ -16,6 +16,11 @@ pub(crate) struct ImageRequests {
     attempted: HashSet<Url>,
     bytes: usize,
 }
+#[derive(Debug, Default)]
+pub(crate) struct Icons {
+    pub attempts: usize,
+    pub cache: std::collections::HashMap<Url, Option<std::sync::Arc<layout::RasterImage>>>,
+}
 
 pub async fn load_images(
     client: &Client,
@@ -103,7 +108,7 @@ pub async fn load_images(
     }
 }
 
-fn data_image(url: &Url) -> Option<Vec<u8>> {
+pub(crate) fn data_image(url: &Url) -> Option<Vec<u8>> {
     let raw = url.as_str().strip_prefix("data:")?;
     let (header, data) = raw.split_once(',')?;
     if !header.split(';').next()?.starts_with("image/") || data.len() > MAX_IMAGE_BYTES * 2 {

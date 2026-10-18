@@ -6,7 +6,10 @@
 
 pub mod app;
 pub mod article;
+pub mod downloads;
 pub mod fetcher;
+pub mod file_ops;
+pub mod find;
 pub mod fonts;
 pub mod history;
 pub mod images;
@@ -33,6 +36,8 @@ use fetcher::Fetcher;
 /// Startup configuration for the window.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Restore the saved session when no explicit startup target was supplied.
+    pub restore_session: bool,
     /// Initial navigation target (already classified).
     pub start_url: Option<Url>,
     /// Whether the https→http fallback applies to `start_url`.
@@ -52,6 +57,8 @@ pub struct Options {
 /// Window startup failure.
 #[derive(Debug, Error)]
 pub enum ShellError {
+    #[error("profile initialization failed: {0}")]
+    Profile(String),
     /// No display / event loop unavailable.
     #[error("event loop failed: {0}")]
     EventLoop(String),
@@ -62,6 +69,19 @@ pub enum ShellError {
 
 /// Open the window and run it until closed. Blocks the calling thread.
 pub fn run(options: Options) -> Result<(), ShellError> {
+    let profile = profile::Store::open(options.profile_dir.clone())
+        .map_err(|e| ShellError::Profile(e.to_string()))?;
+    let software = options.software_render || profile.preferences.render.software_fallback;
+    let shared = fetcher::Shared::configured(
+        options.fetch.clone(),
+        options.profile_dir.clone(),
+        profile.preferences.privacy.doh_enabled,
+    )
+    .map_err(ShellError::Profile)?;
+    shared
+        .client
+        .cookies
+        .set_block_third_party(profile.preferences.privacy.third_party_cookies == "block");
     let event_loop = EventLoop::<Wake>::with_user_event()
         .build()
         .map_err(|e| ShellError::EventLoop(e.to_string()))?;
@@ -69,18 +89,16 @@ pub fn run(options: Options) -> Result<(), ShellError> {
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = proxy.send_event(Wake::Fetch);
     });
-    let fetcher = Fetcher::spawn(
-        options.fetch.clone(),
-        options.profile_dir.clone(),
-        wake.clone(),
-    );
+    let fetcher = Fetcher::spawn_shared(shared, wake.clone())
+        .map_err(|e| ShellError::WindowInit(e.to_string()))?;
     let mut app = ShellApp::new(
         fetcher,
         options.start_url,
         options.start_allow_downgrade,
         options.start_search,
     );
-    app.configure_rendering(options.software_render, options.perf, wake);
+    app.configure_profile(profile, options.restore_session);
+    app.configure_rendering(software, options.perf, wake);
     let _ = event_loop.run_app(&mut app);
     if let Some(fatal) = app.take_fatal() {
         app.shutdown();

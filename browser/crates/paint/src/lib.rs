@@ -498,7 +498,7 @@ impl Rasterizer {
                                             }
                                         }
                                         SwashContent::SubpixelMask => {
-                                            for c in image.data.chunks_exact(4) {
+                                            for c in image.data.as_chunks::<4>().0 {
                                                 rgba.extend_from_slice(&[
                                                     255,
                                                     255,

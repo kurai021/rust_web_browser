@@ -1,0 +1,156 @@
+{
+  "suite": "fetch-request-headers",
+  "upstream": "wpt@4aa56d3beafc5655fa55491169eb14845b44eab3 (adapted)",
+  "cases": [
+    {
+      "name": "Fetch with GET",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with HEAD",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with PUT without body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with PUT with body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST without body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST with text body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST with FormData body",
+      "status": "pass",
+      "assertions": 6,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST with URLSearchParams body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST with Blob body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST with Blob body with mime type",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with Chicken",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with Chicken with body",
+      "status": "pass",
+      "assertions": 7,
+      "detail": null
+    },
+    {
+      "name": "Fetch with GET and mode \"cors\" does not need an Origin header",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST and mode \"same-origin\" needs an Origin header",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST and mode \"no-cors\" needs an Origin header",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "name": "Fetch with PUT and mode \"same-origin\" needs an Origin header",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "name": "Fetch with TacO and mode \"same-origin\" needs an Origin header",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "name": "Fetch with TacO and mode \"cors\" needs an Origin header",
+      "status": "pass",
+      "assertions": 3,
+      "detail": null
+    },
+    {
+      "name": "Fetch with POST with ArrayBuffer body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    },
+    {
+      "name": "Fetch with POST with Uint8Array body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    },
+    {
+      "name": "Fetch with POST with Int8Array body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    },
+    {
+      "name": "Fetch with POST with Float16Array body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    },
+    {
+      "name": "Fetch with POST with Float32Array body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    },
+    {
+      "name": "Fetch with POST with Float64Array body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    },
+    {
+      "name": "Fetch with POST with DataView body",
+      "status": "skip",
+      "assertions": 0,
+      "detail": "Typed binary arrays are not part of the current Level 1 language surface."
+    }
+  ]
+}

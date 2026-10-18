@@ -106,7 +106,7 @@ fn gpu_and_software_render_the_same_display_list() {
         scene.paint_software(&mut pixels, 160, 200, clip, (0.0, -4.0), scale, &offsets);
         let max_delta = pixels
             .iter()
-            .zip(rgba.chunks_exact(4))
+            .zip(rgba.as_chunks::<4>().0.iter())
             .flat_map(|(&cpu, p)| {
                 [(cpu >> 16) as u8, (cpu >> 8) as u8, cpu as u8]
                     .into_iter()

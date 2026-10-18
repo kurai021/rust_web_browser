@@ -8,8 +8,11 @@ pub mod client;
 pub mod cookies;
 pub mod exchange;
 pub use exchange::{HttpRequest, HttpResponse};
+pub mod diagnostics;
+mod dns;
 pub mod error;
 pub mod hsts;
+pub mod navigation;
 pub mod url;
 
 pub use client::{Client, FetchOptions, Fetched, Progress, ResponseHead};

@@ -88,7 +88,13 @@ pub struct ResponseHead {
 
 /// HTTPS client with HSTS state.
 pub struct Client {
+    pub(crate) requests:
+        std::sync::Arc<Mutex<std::collections::VecDeque<crate::diagnostics::RequestRecord>>>,
+    pub(crate) certificates: Mutex<std::collections::BTreeMap<String, String>>,
+    pub(crate) attempts: std::sync::atomic::AtomicU64,
+    pub(crate) gate: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) inner: reqwest::Client,
+    pub(crate) download_inner: reqwest::Client,
     pub cookies: std::sync::Arc<crate::cookies::CookieJar>,
     hsts: Mutex<HstsStore>,
     pub(crate) options: FetchOptions,
@@ -97,17 +103,56 @@ pub struct Client {
 impl Client {
     /// Build a client. Fails only when the TLS stack cannot initialize.
     pub fn new(options: FetchOptions) -> Result<Self, Error> {
-        let inner = reqwest::Client::builder()
+        Self::new_with_doh(options, false)
+    }
+    /// Explicit opt-in only. Construction does not create DNS or HTTP traffic.
+    pub fn new_with_doh(options: FetchOptions, doh: bool) -> Result<Self, Error> {
+        let resolver = doh.then(|| std::sync::Arc::new(crate::dns::Doh::quad9()));
+        let builder = |raw: bool| {
+            let mut builder = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(options.connect_timeout)
+                .pool_max_idle_per_host(6)
+                .tls_info(true);
+            if let Some(resolver) = &resolver {
+                builder = builder.dns_resolver(resolver.clone());
+            }
+            if raw {
+                builder = builder.gzip(false).brotli(false).deflate(false).zstd(false);
+            }
+            builder
+        };
+        let inner = builder(false)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(options.connect_timeout)
             .timeout(options.total_timeout)
+            .pool_max_idle_per_host(6)
+            .tls_info(true)
             // System + bundled (Mozilla) roots come from the
             // `rustls-tls-native-roots` + `rustls-tls-webpki-roots` features
             // (both default to enabled, plan/04 §4.3.3).
             .build()
             .map_err(|e| Error::Transport(format!("TLS init failed: {e}")))?;
+        // Downloads keep wire offsets stable for Range/If-Range. This shares all
+        // TLS, scheme, cookie, HSTS and concurrency policy with decoded requests.
+        let download_inner = builder(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(options.connect_timeout)
+            .pool_max_idle_per_host(6)
+            .tls_info(true)
+            .gzip(false)
+            .brotli(false)
+            .deflate(false)
+            .zstd(false)
+            .build()
+            .map_err(|e| Error::Transport(format!("TLS init failed: {e}")))?;
         Ok(Self {
+            requests: Default::default(),
+            certificates: Default::default(),
+            attempts: std::sync::atomic::AtomicU64::new(0),
+            gate: std::sync::Arc::new(tokio::sync::Semaphore::new(30)),
             inner,
+            download_inner,
             cookies: std::sync::Arc::new(crate::cookies::CookieJar::default()),
             hsts: Mutex::new(HstsStore::new()),
             options,
@@ -193,8 +238,15 @@ impl Client {
         let max_bytes = max_bytes.min(self.options.max_body_bytes);
         let mut url = self.effective_url(url)?;
         let started = std::time::Instant::now();
+        let _permit = tokio::time::timeout(
+            self.options.total_timeout,
+            self.gate.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Timeout("Connection queue deadline".into()))?
+        .map_err(|_| Error::Cancelled)?;
         let mut redirects = 0;
-        let response = loop {
+        let (response, mut trace) = loop {
             if allow.is_some_and(|allow| !allow(&url)) {
                 return Err(Error::Transport("active resource blocked by policy".into()));
             }
@@ -211,6 +263,7 @@ impl Client {
             if !cookies.is_empty() {
                 request = request.header(reqwest::header::COOKIE, cookies);
             }
+            let mut trace = self.begin_request("GET", &url);
             let response = tokio::time::timeout(
                 self.options.first_byte_timeout.min(remaining),
                 request.send(),
@@ -218,6 +271,7 @@ impl Client {
             .await
             .map_err(|_| Error::Timeout("time to first byte exceeded".into()))?
             .map_err(|e| map_reqwest(&e))?;
+            trace.headers(response.status().as_u16());
             self.note_hsts(&url, &response);
             for value in response.headers().get_all(reqwest::header::SET_COOKIE) {
                 if let Ok(value) = value.to_str() {
@@ -238,13 +292,15 @@ impl Client {
                         .map_err(|_| Error::InvalidUrl(location.into()))?,
                 )?;
                 redirects += 1;
+                trace.finish();
                 continue;
             }
-            break response;
+            break (response, trace);
         };
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
+            trace.fail(&format!("HTTP {status}"));
             return Err(Error::HttpStatus(status));
         }
         let final_url = response.url().clone();
@@ -274,12 +330,14 @@ impl Client {
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(|e| map_reqwest(&e))?;
             downloaded += chunk.len();
+            trace.bytes(chunk.len());
             if downloaded > max_bytes {
                 return Err(Error::BodyTooLarge { cap: max_bytes });
             }
             bytes.extend_from_slice(&chunk);
             on_chunk(&head, &chunk, Progress { downloaded, total });
         }
+        trace.finish();
         Ok(Fetched {
             url: final_url,
             status,
@@ -360,6 +418,7 @@ impl Client {
     }
 
     pub(crate) fn note_hsts(&self, final_url: &Url, response: &reqwest::Response) {
+        self.note_certificate(final_url, response);
         if final_url.scheme() != "https" {
             return;
         }

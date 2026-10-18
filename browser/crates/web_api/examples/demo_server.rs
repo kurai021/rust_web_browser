@@ -18,6 +18,9 @@ const MODERN_VIEW: &str = include_str!("../../shell/tests/fixtures/modern-demo/v
 const MODERN_DETAILS: &str = include_str!("../../shell/tests/fixtures/modern-demo/details.js");
 const MODERN_WORKER: &str = include_str!("../../shell/tests/fixtures/modern-demo/worker.js");
 const MODERN_STYLE: &str = include_str!("../../shell/tests/fixtures/modern-demo/style.css");
+const BROWSER_INDEX: &str = include_str!("../../shell/tests/fixtures/browser-demo/index.html");
+const BROWSER_STYLE: &str = include_str!("../../shell/tests/fixtures/browser-demo/style.css");
+const BROWSER_APP: &str = include_str!("../../shell/tests/fixtures/browser-demo/app.js");
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> io::Result<()> {
     let port = std::env::args()
@@ -29,6 +32,7 @@ async fn main() -> io::Result<()> {
     let origin = format!("http://{}", listener.local_addr()?);
     println!("PHASE7_DEMO {origin}/");
     println!("PHASE8_DEMO {origin}/modern/");
+    println!("PHASE9_DEMO {origin}/browser/");
     let board = Arc::new(std::sync::Mutex::new(vec![
         serde_json::json!({"id":1,"title":"Explore live module bindings","completed":false}),
         serde_json::json!({"id":2,"title":"Verify async fetch and microtasks","completed":false}),
@@ -112,7 +116,48 @@ async fn serve(
         return Ok(());
     }
     let mut extra = String::new();
+    if path == "/browser/download.bin" {
+        let total = 100u64 * 1024 * 1024;
+        let requested = header
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| key.eq_ignore_ascii_case("range"))
+                    .map(|(_, value)| value.trim())
+            })
+            .and_then(|s| s.strip_prefix("bytes="))
+            .and_then(|s| s.strip_suffix('-'))
+            .and_then(|s| s.parse::<u64>().ok());
+        let valid = header.lines().any(|line| {
+            line.split_once(':').is_some_and(|(key, value)| {
+                key.eq_ignore_ascii_case("if-range") && value.trim() == "\"browser-fixture-v1\""
+            })
+        });
+        let partial = requested.is_some() && valid;
+        let mut offset = if partial { requested.unwrap_or(0) } else { 0 };
+        if offset >= total {
+            stream.write_all(format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nETag: \"browser-fixture-v1\"\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            return Ok(());
+        }
+        let range = if partial {
+            format!("Content-Range: bytes {offset}-{}/{total}\r\n", total - 1)
+        } else {
+            String::new()
+        };
+        stream.write_all(format!("HTTP/1.1 {}\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"browser-fixture.bin\"\r\nETag: \"browser-fixture-v1\"\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n{range}Connection: close\r\n\r\n",if partial{"206 Partial Content"}else{"200 OK"},total-offset).as_bytes()).await?;
+        let chunk = vec![0x5a; 64 * 1024];
+        while offset < total {
+            let n = ((total - offset) as usize).min(chunk.len());
+            stream.write_all(&chunk[..n]).await?;
+            offset += n as u64;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        return Ok(());
+    }
     let (mime,body)=match path{
+        "/browser/style.css"=>("text/css",BROWSER_STYLE.into()),"/browser/app.js"=>("text/javascript",BROWSER_APP.into()),
+        "/browser/icon.svg"=>("image/svg+xml","<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' rx='3' fill='#0a8588'/><path d='M4 4h4q5 0 5 4t-5 4H4z' fill='white'/></svg>".into()),
+        path if path.starts_with("/browser/")=>("text/html",BROWSER_INDEX.into()),
         "/modern/app.js"=>("text/javascript",MODERN_APP.into()),"/modern/api.js"=>("text/javascript",MODERN_API.into()),"/modern/store.js"=>("text/javascript",MODERN_STORE.into()),"/modern/view.js"=>("text/javascript",MODERN_VIEW.into()),"/modern/details.js"=>("text/javascript",MODERN_DETAILS.into()),"/modern/worker.js"=>("text/javascript",MODERN_WORKER.into()),"/modern/style.css"=>("text/css",MODERN_STYLE.into()),
         path if path.starts_with("/modern")=>("text/html",MODERN_INDEX.into()),
         path if path=="/api/tasks"||path.starts_with("/api/tasks/")=>{

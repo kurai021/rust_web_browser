@@ -17,6 +17,7 @@ pub struct Request {
     pub db: cosmic_text::fontdb::Database,
 }
 pub struct Ready {
+    pub error: Option<String>,
     pub navigation: u64,
     pub revision: u64,
     pub viewport: Size,
@@ -47,7 +48,9 @@ impl LayoutWorker {
                     while let Ok(newer) = rx.try_recv() {
                         request = newer;
                     }
-                    if generation != Some(request.font_generation) {
+                    if generation != Some(request.font_generation)
+                        || navigation != Some(request.navigation)
+                    {
                         fonts = Some(FontSystem::new_with_locale_and_db(
                             request.locale,
                             request.db,
@@ -64,16 +67,35 @@ impl LayoutWorker {
                         continue;
                     };
                     let started = std::time::Instant::now();
-                    let (layout, scene) = crate::viewport::layout_page_cached(
-                        &request.page,
-                        &request.styles,
-                        request.viewport,
-                        fonts,
-                        &mut rasterizer,
-                        &mut cache,
-                    );
+                    let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::viewport::layout_page_cached(
+                            &request.page,
+                            &request.styles,
+                            request.viewport,
+                            fonts,
+                            &mut rasterizer,
+                            &mut cache,
+                        )
+                    }));
+                    let (layout, scene, error) = match computed {
+                        Ok((layout, scene)) => (layout, scene, None),
+                        Err(_) => {
+                            rasterizer.clear();
+                            cache.clear();
+                            generation = None;
+                            (
+                                LayoutResult::default(),
+                                Scene::default(),
+                                Some(
+                                    "This tab's layout stopped unexpectedly; reload to recover"
+                                        .into(),
+                                ),
+                            )
+                        }
+                    };
                     passes += 1;
                     let ready = Ready {
+                        error,
                         navigation: request.navigation,
                         revision: request.revision,
                         viewport: request.viewport,

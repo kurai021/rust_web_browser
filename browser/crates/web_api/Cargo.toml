@@ -22,6 +22,7 @@ futures = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 cosmic-text = "0.12"
 encoding_rs = "0.8"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -59,14 +59,40 @@ impl Client {
         ),
         Error,
     > {
+        self.exchange_stream_kind(request, false).await
+    }
+    pub(crate) async fn exchange_stream_kind(
+        &self,
+        request: HttpRequest,
+        download: bool,
+    ) -> Result<
+        (
+            HttpResponse,
+            futures::stream::BoxStream<'static, Result<Vec<u8>, Error>>,
+        ),
+        Error,
+    > {
         let url = self.effective_url(&request.url)?;
+        let timeout = if download {
+            request.timeout
+        } else {
+            request.timeout.min(self.options.total_timeout)
+        };
+        let permit = tokio::time::timeout(timeout, self.gate.clone().acquire_owned())
+            .await
+            .map_err(|_| Error::Timeout("Connection queue deadline".into()))?
+            .map_err(|_| Error::Cancelled)?;
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| Error::Transport("invalid method".into()))?;
-        let mut builder = self
-            .inner
+        let transport = if download {
+            &self.download_inner
+        } else {
+            &self.inner
+        };
+        let mut builder = transport
             .request(method, url.clone())
             .header(reqwest::header::USER_AGENT, crate::client::USER_AGENT_VALUE)
-            .timeout(request.timeout.min(self.options.total_timeout));
+            .timeout(timeout);
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
@@ -79,6 +105,7 @@ impl Client {
                 builder = builder.header(reqwest::header::COOKIE, cookie);
             }
         }
+        let trace = self.begin_request(&request.method, &url);
         let response = tokio::time::timeout(
             request.timeout.min(self.options.first_byte_timeout),
             builder.body(request.body).send(),
@@ -95,22 +122,42 @@ impl Client {
             }
         }
         let status = response.status();
+        trace.headers(status.as_u16());
         let headers = response
             .headers()
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().into(), v.into())))
             .collect();
         let cap = request.max_bytes.min(self.options.max_body_bytes);
-        let stream = response
-            .bytes_stream()
-            .map(move |chunk| {
-                let chunk = chunk.map_err(|e| crate::error::map_reqwest(&e))?;
-                if chunk.len() > cap {
-                    return Err(Error::BodyTooLarge { cap });
+        let stream = futures::stream::unfold(
+            (response.bytes_stream(), trace, permit),
+            move |(mut body, mut trace, permit)| async move {
+                match body.next().await {
+                    Some(chunk) => {
+                        let chunk =
+                            chunk
+                                .map_err(|e| crate::error::map_reqwest(&e))
+                                .and_then(|chunk| {
+                                    if chunk.len() > cap {
+                                        Err(Error::BodyTooLarge { cap })
+                                    } else {
+                                        trace.bytes(chunk.len());
+                                        Ok(chunk.to_vec())
+                                    }
+                                });
+                        if let Err(error) = &chunk {
+                            trace.fail(&error.to_string());
+                        }
+                        Some((chunk, (body, trace, permit)))
+                    }
+                    None => {
+                        trace.finish();
+                        None
+                    }
                 }
-                Ok(chunk.to_vec())
-            })
-            .boxed();
+            },
+        )
+        .boxed();
         Ok((
             HttpResponse {
                 url,

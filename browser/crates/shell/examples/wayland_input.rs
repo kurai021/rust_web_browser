@@ -38,7 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() < 4 {
         return Err(
-            "usage: wayland_input X Y OUTPUT_WIDTH OUTPUT_HEIGHT [click|scroll DELTA]".into(),
+            "usage: wayland_input X Y OUTPUT_WIDTH OUTPUT_HEIGHT [click|scroll DELTA|drag X2 Y2]"
+                .into(),
         );
     }
     let x: u32 = args[0].parse()?;
@@ -73,6 +74,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 delta,
                 (delta / 15.0) as i32,
             );
+            pointer.frame();
+        }
+        Some("drag") => {
+            let x2: u32 = args.get(5).ok_or("drag target X missing")?.parse()?;
+            let y2: u32 = args.get(6).ok_or("drag target Y missing")?.parse()?;
+            pointer.button(2, 272, wl_pointer::ButtonState::Pressed);
+            pointer.frame();
+            pointer.motion_absolute(3, x2, y2, width, height);
+            pointer.frame();
+            pointer.button(4, 272, wl_pointer::ButtonState::Released);
             pointer.frame();
         }
         None => {}

@@ -349,28 +349,31 @@ pub fn install_fonts(
     system: &mut cosmic_text::FontSystem,
     assets: &[FontAsset],
 ) -> Vec<cosmic_text::fontdb::ID> {
+    install_fonts_db(system.db_mut(), assets)
+}
+pub fn install_fonts_db(
+    db: &mut cosmic_text::fontdb::Database,
+    assets: &[FontAsset],
+) -> Vec<cosmic_text::fontdb::ID> {
     use cosmic_text::fontdb::{Source, Style, Weight};
     let mut added = Vec::new();
     for asset in assets {
         let alias = web_family(&asset.family);
-        if system.db().faces().any(|face| {
+        if db.faces().any(|face| {
             face.families.iter().any(|(family, _)| family == &alias)
                 && face.weight.0 == asset.weight
                 && (face.style == Style::Italic) == asset.italic
         }) {
             continue;
         }
-        let before = system
-            .db()
+        let before = db
             .faces()
             .map(|f| f.id)
             .collect::<std::collections::HashSet<_>>();
-        let ids = system
-            .db_mut()
-            .load_font_source(Source::Binary(asset.data.clone()));
+        let ids = db.load_font_source(Source::Binary(asset.data.clone()));
         for id in ids {
-            if let Some(mut face) = system.db().face(id).cloned() {
-                system.db_mut().remove_face(id);
+            if let Some(mut face) = db.face(id).cloned() {
+                db.remove_face(id);
                 for (name, _) in &mut face.families {
                     *name = alias.clone();
                 }
@@ -380,13 +383,11 @@ pub fn install_fonts(
                 } else {
                     Style::Normal
                 };
-                system.db_mut().push_face_info(face);
+                db.push_face_info(face);
             }
         }
         added.extend(
-            system
-                .db()
-                .faces()
+            db.faces()
                 .filter(|face| !before.contains(&face.id))
                 .map(|f| f.id),
         );

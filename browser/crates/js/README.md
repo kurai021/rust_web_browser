@@ -1,9 +1,17 @@
-# In-house JavaScript — Phase 5 / Level 1 MVP
+# In-house JavaScript — modern Level 2 subset
 
-The lexer, recursive-descent parser, AST evaluator, lexical environments,
+The lexer, parser, bytecode compiler/resumable VM, retained AST oracle, lexical environments,
 abstract operations, object/prototype model and tracing heap are owned Rust code.
 `regex`, `serde_json` and `time` supply bounded auxiliary functionality, not a JS
 engine. Node appears only in the explicit differential test.
+
+Phase 8 added native Promises/async/await, sync/async generators and iteration,
+source-text modules with static/dynamic imports, `import.meta` and top-level
+await, Map/Set/WeakMap, well-known Symbol hooks, BigInt, basic Proxy/Reflect and
+extended structured clone. The pinned adapted Level 2 report records 57 case-mode
+passes and 206 assertions; the Phase 9 evidence carries that report forward.
+See `plan/evidence/phase-8/` and `plan/evidence/phase-9/` at the repository root
+for measured boundaries and the modern differential tests.
 
 ## Implemented surface
 
@@ -32,6 +40,7 @@ engine. Node appears only in the explicit differential test.
 | Arenas | 500,000 JS objects and 500,000 environments |
 | Strings | 8 MiB per result; bounded join/split/match/replacement/JSON temporaries |
 | Page accounting | 512 MiB conservative JS + DOM retained-allocation budget |
+| Native stack | 1 MiB headroom by default; shell hosts use 4 MiB on 8 MiB JS threads |
 
 Accounting covers properties/keys, retained strings, environments/bindings,
 function ASTs and host-owned DOM/control/listener/timer data. Shared string/AST

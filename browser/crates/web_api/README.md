@@ -1,4 +1,4 @@
-# Origin-scoped Web APIs — Phase 7
+# Origin-scoped Web APIs
 
 `PageRuntime` extends the existing `DomRuntime`/owned JS interpreter. VM objects
 and DOM handles remain thread-local. Bounded `WebCommand`/`WebCompletion` messages
@@ -6,6 +6,13 @@ connect the realm to Tokio HTTP/socket tasks, isolated dedicated-worker VMs and
 trusted shell permission/dialog adapters. Navigation and shutdown cancel services.
 Workers exchange bounded data-only graphs, including cycles; they receive no DOM,
 profile, filesystem or other-context pointers.
+
+Phase 9 connects ordinary link activation and realm-local object URLs to the
+native download UI. `URL.createObjectURL` / `revokeObjectURL` use capped owned Blob
+buffers (32 URLs / 32 MiB); activation captures data before revocation. Native save
+paths are selected by the shell, never by page strings. Cancelled clicks and
+cross-origin `download` attributes retain navigation policy. Idle page/dedicated
+workers sleep and collect after actual work instead of polling GC continuously.
 
 ## Implemented subsets
 
@@ -19,16 +26,18 @@ profile, filesystem or other-context pointers.
 * Location and same-document history implement push/replace/go and
   popstate/hashchange. State uses data-only cloning rather than sharing heap IDs.
   Full document navigation requires a trusted gesture; blocked actions surface a
-  notice. Browser-wide history/session restoration is still the Phase 9 boundary.
+  notice. The shell supplies browser-wide history and URL-based session restore.
 * Profile-backed localStorage, IndexedDB and explicit saved permissions use fixed
   profile paths, capped JSON, atomic replacement and private Unix files. Session
   storage stays in memory, isolated by window/session plus origin, and is cleared
-  on close. `--profile-dir` enables persistence; the default profile is in-memory.
+  on close. Standalone runtimes default to memory; the GUI opens its configured
+  persistent profile (`--profile-dir` overrides the platform default).
   `navigator.storage.estimate()` reports real retained origin data and a fixed
   quota; `persist()` returns false when there is no persistent profile backend.
 * document.cookie shares the net jar used by fetch/XHR and subresources. Domain,
   path, public suffix, Secure, HttpOnly, expiry and cookie prefixes are checked.
-  Third-party cookies are blocked. Only persistent, unexpired cookies are saved;
+   Third-party cookies are blocked by default; the native preference can allow
+   eligible SameSite=None/Secure cookies. Only persistent, unexpired cookies are saved;
   HttpOnly values are never returned to document.cookie or response headers.
 * IndexedDB supports version upgrades, object stores, inline/out-of-line keys,
   auto-increment, get/put/add/delete/clear/getAll/count, basic unique/non-unique

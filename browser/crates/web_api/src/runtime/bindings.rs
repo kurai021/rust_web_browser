@@ -25,6 +25,8 @@ const GLOBALS: &[&str] = &[
     "DOMException",
 ];
 const METHODS: &[&str] = &[
+    "url:createObjectURL",
+    "url:revokeObjectURL",
     "fullscreen:request",
     "fullscreen:exit",
     "canvas:getContext",
@@ -212,6 +214,14 @@ pub fn install(runtime: &mut PageRuntime) -> std::result::Result<(), JsError> {
         }
     }
     let notification = runtime.state.borrow().function("Notification");
+    let url = runtime.state.borrow().function("URL");
+    for (key, name) in [
+        ("createObjectURL", "url:createObjectURL"),
+        ("revokeObjectURL", "url:revokeObjectURL"),
+    ] {
+        let method = runtime.state.borrow().function(name);
+        runtime.dom.vm.set(url.clone(), key, method)?;
+    }
     let method = runtime
         .state
         .borrow()
@@ -605,6 +615,50 @@ impl WebHost {
     }
 }
 impl HostHooks for WebHost {
+    fn activate_link(
+        &mut self,
+        vm: &mut Vm,
+        href: &str,
+        download: Option<&str>,
+        target: &str,
+    ) -> std::result::Result<bool, JsError> {
+        let url =
+            Url::parse(href).map_err(|e| error(vm, ApiError::new("TypeError", e.to_string())))?;
+        let (document, gesture, blob) = {
+            let state = self.state.borrow();
+            (
+                state.dom.url(),
+                state.gesture,
+                state.blob_urls.get(href).cloned(),
+            )
+        };
+        if url.scheme() == "blob" && blob.is_none() {
+            return Err(error(
+                vm,
+                ApiError::new(
+                    "NotFoundError",
+                    "Object URL was revoked or belongs to another realm",
+                ),
+            ));
+        }
+        if let Some(filename) = download.filter(|_| blob.is_some() || same_origin(&document, &url))
+        {
+            self.command(
+                vm,
+                Command::Download {
+                    url,
+                    filename: filename.chars().take(220).collect(),
+                    bytes: blob,
+                    gesture,
+                },
+            )?;
+        } else if target.eq_ignore_ascii_case("_blank") {
+            self.command(vm, Command::Popup { url, gesture })?;
+        } else {
+            self.navigate(vm, url, false)?;
+        }
+        Ok(true)
+    }
     fn import_module(
         &mut self,
         vm: &mut Vm,
@@ -652,6 +706,12 @@ impl HostHooks for WebHost {
     fn retained_bytes(&self) -> usize {
         let s = self.state.borrow();
         let mut bytes = s.objects.len() * 256;
+        bytes = bytes.saturating_add(
+            s.blob_urls
+                .iter()
+                .map(|(key, body)| key.len() + body.len() + 64)
+                .sum::<usize>(),
+        );
         bytes = bytes.saturating_add(s.jobs.len() * 256);
         for job in &s.jobs {
             let values = match job {
@@ -1577,8 +1637,12 @@ impl WebHost {
                 name: "hashchange".into(),
                 data,
             });
-            s.enqueue(Command::SameDocument { url, replace })
-                .map_err(|e| error(vm, e))?;
+            s.enqueue(Command::SameDocument {
+                url,
+                replace,
+                traversal: None,
+            })
+            .map_err(|e| error(vm, e))?;
         } else {
             let gesture = self.state.borrow().gesture;
             if gesture {
@@ -1905,8 +1969,12 @@ impl WebHost {
                     .push(url.clone(), state, replace)
                     .map_err(|e| error(vm, e))?;
                 s.dom.set_url(url.clone());
-                s.enqueue(Command::SameDocument { url, replace })
-                    .map_err(|e| error(vm, e))?;
+                s.enqueue(Command::SameDocument {
+                    url,
+                    replace,
+                    traversal: None,
+                })
+                .map_err(|e| error(vm, e))?;
                 return Ok(JsValue::Undefined);
             }
             "history:back" | "history:forward" | "history:go" => {
@@ -1945,6 +2013,7 @@ impl WebHost {
                     s.enqueue(Command::SameDocument {
                         url: entry.url,
                         replace: true,
+                        traversal: Some(delta),
                     })
                     .map_err(|e| error(vm, e))?;
                 }

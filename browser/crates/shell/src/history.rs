@@ -25,11 +25,20 @@ impl History {
     pub fn current(&self) -> Option<&Url> {
         self.current.as_ref()
     }
+    pub fn back_target(&self) -> Option<Url> {
+        self.back.last().cloned()
+    }
+    pub fn forward_target(&self) -> Option<Url> {
+        self.forward.last().cloned()
+    }
 
     /// Record a new navigation: push current to back, clear forward.
     pub fn navigate(&mut self, url: Url) {
         if let Some(current) = self.current.take() {
             self.back.push(current);
+            if self.back.len() > 200 {
+                self.back.remove(0);
+            }
         }
         self.forward.clear();
         self.current = Some(url);
@@ -65,6 +74,51 @@ impl History {
     #[must_use]
     pub fn can_go_forward(&self) -> bool {
         !self.forward.is_empty()
+    }
+    pub fn replace(&mut self, url: Url) {
+        self.current = Some(url);
+    }
+    pub fn save(&self) -> profile::SavedTab {
+        profile::SavedTab {
+            current: self
+                .current
+                .as_ref()
+                .map_or_else(|| "about:blank".into(), |u| u.to_string()),
+            back: self
+                .back
+                .iter()
+                .rev()
+                .take(200)
+                .rev()
+                .map(|u| u.to_string())
+                .collect(),
+            forward: self
+                .forward
+                .iter()
+                .rev()
+                .take(200)
+                .rev()
+                .map(|u| u.to_string())
+                .collect(),
+            ..Default::default()
+        }
+    }
+    pub fn restore(tab: &profile::SavedTab) -> Self {
+        Self {
+            back: tab
+                .back
+                .iter()
+                .filter_map(|u| profile::clean_url(u))
+                .take(200)
+                .collect(),
+            current: profile::clean_url(&tab.current),
+            forward: tab
+                .forward
+                .iter()
+                .filter_map(|u| profile::clean_url(u))
+                .take(200)
+                .collect(),
+        }
     }
 }
 

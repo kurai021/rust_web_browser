@@ -15,10 +15,19 @@ struct Stored {
     expires: Option<i64>,
     created: u64,
 }
-#[derive(Default)]
 pub struct CookieJar {
+    block_third_party: std::sync::atomic::AtomicBool,
     entries: Mutex<Vec<Stored>>,
     persistence: Mutex<()>,
+}
+impl Default for CookieJar {
+    fn default() -> Self {
+        Self {
+            block_third_party: std::sync::atomic::AtomicBool::new(true),
+            entries: Mutex::new(Vec::new()),
+            persistence: Mutex::new(()),
+        }
+    }
 }
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -42,9 +51,18 @@ fn path_matches(path: &str, prefix: &str) -> bool {
             && (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/'))
 }
 impl CookieJar {
+    pub fn set_block_third_party(&self, block: bool) {
+        self.block_third_party
+            .store(block, std::sync::atomic::Ordering::Relaxed);
+    }
     pub fn header(&self, url: &Url, top: &Url, document: bool) -> String {
+        let cross = site(url) != site(top);
         // Third-party cookies are blocked by default. No unpartitioned fallback.
-        if site(url) != site(top) {
+        if cross
+            && self
+                .block_third_party
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return String::new();
         }
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -61,6 +79,7 @@ impl CookieJar {
                 }) && path_matches(url.path(), &c.path)
                     && (!c.secure || url.scheme() == "https")
                     && (!document || !c.http_only)
+                    && (!cross || c.same_site == "None")
             })
             .collect::<Vec<_>>();
         values.sort_by_key(|c| (std::cmp::Reverse(c.path.len()), c.created));
@@ -74,6 +93,9 @@ impl CookieJar {
         if !matches!(url.scheme(), "http" | "https")
             || source.len() > 8192
             || site(url) != site(top)
+                && self
+                    .block_third_party
+                    .load(std::sync::atomic::Ordering::Relaxed)
         {
             return false;
         }

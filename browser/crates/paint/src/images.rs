@@ -44,6 +44,15 @@ pub fn save_snapshot(
 }
 
 pub fn decode_image(bytes: &[u8]) -> Result<Arc<RasterImage>, String> {
+    decode_capped(bytes, MAX_DIMENSION, MAX_DECODED_BYTES)
+}
+pub fn decode_icon(bytes: &[u8]) -> Result<Arc<RasterImage>, String> {
+    if bytes.len() > 256 * 1024 {
+        return Err("Favicon body limit exceeded".into());
+    }
+    decode_capped(bytes, 256, 256 * 256 * 4)
+}
+fn decode_capped(bytes: &[u8], dimension: u32, decoded: usize) -> Result<Arc<RasterImage>, String> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err("image body limit exceeded".into());
     }
@@ -51,22 +60,22 @@ pub fn decode_image(bytes: &[u8]) -> Result<Arc<RasterImage>, String> {
         .windows(4)
         .any(|w| w == b"<svg")
     {
-        return decode_svg(bytes);
+        return decode_svg(bytes, dimension, decoded);
     }
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DIMENSION);
-    limits.max_image_height = Some(MAX_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODED_BYTES as u64);
+    limits.max_image_width = Some(dimension);
+    limits.max_image_height = Some(dimension);
+    limits.max_alloc = Some(decoded as u64);
     reader.limits(limits);
     let image = reader.decode().map_err(|e| e.to_string())?.into_rgba8();
     RasterImage::new(image.width(), image.height(), image.into_raw())
         .ok_or_else(|| "invalid decoded image dimensions".into())
 }
 
-fn decode_svg(bytes: &[u8]) -> Result<Arc<RasterImage>, String> {
+fn decode_svg(bytes: &[u8], dimension: u32, decoded: usize) -> Result<Arc<RasterImage>, String> {
     if bytes.len() > 2 * 1024 * 1024 || bytes.iter().filter(|&&b| b == b'<').count() > 20_000 {
         return Err("SVG syntax budget exceeded".into());
     }
@@ -121,10 +130,7 @@ fn decode_svg(bytes: &[u8]) -> Result<Arc<RasterImage>, String> {
     let tree = resvg::usvg::Tree::from_xmltree(&xml, &options).map_err(|e| e.to_string())?;
     let size = tree.size().to_int_size();
     let (width, height) = (size.width(), size.height());
-    if width > MAX_DIMENSION
-        || height > MAX_DIMENSION
-        || width as usize * height as usize * 4 > MAX_DECODED_BYTES
-    {
+    if width > dimension || height > dimension || width as usize * height as usize * 4 > decoded {
         return Err("SVG raster budget exceeded".into());
     }
     let mut pixmap =
@@ -136,7 +142,7 @@ fn decode_svg(bytes: &[u8]) -> Result<Arc<RasterImage>, String> {
     );
     let mut rgba = pixmap.take();
     // tiny-skia stores premultiplied RGBA; our backends use straight alpha.
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         if p[3] != 0 {
             for c in 0..3 {
                 p[c] = (u32::from(p[c]) * 255 / u32::from(p[3])).min(255) as u8;

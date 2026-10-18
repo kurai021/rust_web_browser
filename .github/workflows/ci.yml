@@ -10,6 +10,10 @@ defaults:
   run:
     working-directory: browser
 
+env:
+  CARGO_BUILD_JOBS: 2
+  RUST_TEST_THREADS: 2
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,8 +28,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
       - run: cargo test --workspace --all-targets
         env:
-          BROWSER_WPT_REPORT_DIR: target/wpt-reports
-          BROWSER_TEST262_REPORT_DIR: target/test262-reports
+          BROWSER_WPT_REPORT_DIR: ${{ github.workspace }}/browser/target/wpt-reports
+          BROWSER_TEST262_REPORT_DIR: ${{ github.workspace }}/browser/target/test262-reports
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -41,6 +45,17 @@ jobs:
         run: cargo test -p js --test differential -- --ignored --exact representative_language_results_match_node
       - name: Modern JavaScript and bytecode differential oracle (tests only)
         run: cargo test -p js --test modern_differential -- --include-ignored
+      - name: Five-tab startup and idle CPU acceptance (loopback only)
+        run: |
+          cargo build -p web_api -p shell --example demo_server --example phase9_probe
+          target/debug/examples/demo_server 8099 > target/phase9-server.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 50); do
+            if curl --silent --fail http://127.0.0.1:8099/browser/ > /dev/null; then break; fi
+            sleep 0.1
+          done
+          target/debug/examples/phase9_probe http://127.0.0.1:8099/
       - run: sudo apt-get install -y mesa-vulkan-drivers libegl1
       - name: GPU and scalar display-list parity
         env:
@@ -58,6 +73,16 @@ jobs:
         with:
           workspaces: browser
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: browser
+      - run: cargo check --workspace --locked
 
   fmt:
     runs-on: ubuntu-latest

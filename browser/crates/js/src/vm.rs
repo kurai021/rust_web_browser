@@ -82,6 +82,16 @@ pub trait HostHooks {
     fn finish(&mut self, _vm: &mut Vm, _token: u64) -> Result<JsValue, JsError> {
         Ok(JsValue::Undefined)
     }
+    /// HTML activation stays native; Web APIs decide navigation/download policy.
+    fn activate_link(
+        &mut self,
+        _vm: &mut Vm,
+        _url: &str,
+        _download: Option<&str>,
+        _target: &str,
+    ) -> Result<bool, JsError> {
+        Ok(false)
+    }
     /// Connected DOM listeners are roots. Detached cycles are traced only from
     /// the host objects that the JS mark phase actually reaches.
     fn roots(&self, _live_hosts: &HashSet<u64>) -> Vec<JsValue> {
@@ -1512,7 +1522,7 @@ impl Vm {
                 "script instruction budget exceeded",
             ));
         }
-        if self.steps % 128 == 0 {
+        if self.steps.is_multiple_of(128) {
             if self
                 .limits
                 .navigation
@@ -1531,7 +1541,8 @@ impl Vm {
                 ));
             }
         }
-        if self.steps % 4096 == 0 && self.accounted_bytes() > self.limits.max_memory_bytes {
+        if self.steps.is_multiple_of(4096) && self.accounted_bytes() > self.limits.max_memory_bytes
+        {
             return Err(JsError::new(
                 ErrorKind::MemoryLimit,
                 "page memory budget exceeded",

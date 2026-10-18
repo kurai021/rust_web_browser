@@ -41,6 +41,7 @@ pub(crate) struct Listener {
 }
 #[derive(Clone)]
 pub(crate) struct EventData {
+    synthetic_activation: bool,
     name: String,
     target: NodeId,
     current: NodeId,
@@ -65,6 +66,7 @@ pub(crate) struct Timer {
     animation_frame: bool,
 }
 pub(crate) struct State {
+    activation: HashSet<NodeId>,
     pub owners: HashMap<NodeId, NodeId>,
     pub inert_documents: HashSet<NodeId>,
     pub document: Document,
@@ -139,6 +141,7 @@ impl State {
         self.events.insert(
             id,
             EventData {
+                synthetic_activation: false,
                 name,
                 target,
                 current: target,
@@ -221,8 +224,9 @@ impl DomHandle {
         node_host(node, 0)
     }
     pub fn node_id(&self, id: u64) -> Option<NodeId> {
-        node_id(id)
-            .filter(|&node| id % 8 == 0 && self.state.borrow().document.try_get(node).is_some())
+        node_id(id).filter(|&node| {
+            id.is_multiple_of(8) && self.state.borrow().document.try_get(node).is_some()
+        })
     }
 }
 impl DomRuntime {
@@ -255,6 +259,7 @@ impl DomRuntime {
             events: HashMap::new(),
             timers: HashMap::new(),
             running_timer: None,
+            activation: HashSet::new(),
             cancel_running_timer: false,
             next: 0,
             revision: 0,

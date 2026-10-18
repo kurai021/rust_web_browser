@@ -1,0 +1,1 @@
+var file=new Blob([input],{type:'text/plain'});var uri=URL.createObjectURL(file);var link=document.createElement('a');link.href=uri;link.download='fixture.txt';document.body.appendChild(link);link.click();URL.revokeObjectURL(uri);link.remove();

@@ -1,0 +1,20 @@
+{
+  "phase": 9,
+  "baseline": "4b30112",
+  "platform": "linux-aarch64-apple-m2-pro",
+  "rust_tested": "1.99",
+  "rust_minimum_checked": "1.89.0",
+  "workspace_default": { "pass": 302, "fail": 0, "ignored": 10 },
+  "workspace_scalar": { "pass": 302, "fail": 0, "ignored": 10 },
+  "fmt": "pass",
+  "clippy_deny_warnings": "pass",
+  "audit": { "dependencies": 540, "vulnerabilities": 0, "existing_maintenance_warnings": 6 },
+  "deny": { "advisories": "pass", "bans": "pass", "licenses": "pass", "sources": "pass" },
+  "fetch_xhr_wpt": { "pass": 40, "fail": 0, "skip": 17, "assertions": 178 },
+  "test262_level2": { "pass": 57, "fail": 0, "excluded_sources": 3, "assertions": 206 },
+  "gpu_software_parity": "pass",
+  "upstream_todomvc": "pass",
+  "release_probe": { "tabs": 5, "blank_startup_connections": 0, "startup_ms": 61.5, "idle_cpu_percent_of_one_core": 0.334, "rss_kib": 161408 },
+  "sanitized_page_run": { "runs": 68702, "seconds": 301, "peak_rss_mb": 233, "artifacts": 0 },
+  "final_sanitized_replay": { "runs": 8985, "seconds": 59, "peak_rss_mb": 206, "artifacts": 0 }
+}

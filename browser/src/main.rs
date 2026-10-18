@@ -1,11 +1,10 @@
-//! `browser` binary — Phase 7 (plan/09, plan/14 Phase 7).
+//! `browser` binary — Phase 9 graphical browser and local acceptance harness.
 //!
 //! `browser [url] [--profile-dir p] [--software-render] [--perf] [--headless-test url]`
 //! (`--headless-test` is a test harness only, never a product).
 //!
-//! GUI limitations tracked for later phases: single browsing context
-//! (tabs in Phase 9), no HiDPI scaling yet, IME composition unhandled
-//! (printable `KeyEvent.text` only).
+//! The page viewport uses the owned engines. Test automation is windowless only
+//! when explicitly selected; ordinary startup opens the graphical browser.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,12 +25,12 @@ struct Args {
 fn print_help() {
     print!(
         "browser {VERSION}\n\
-         Graphical web browser in Rust (Phase 7: dynamic-page Web API subsets)\n\
+         Graphical web browser in Rust (Phase 9: tabs, sessions and downloads)\n\
          \n\
          Usage: browser [url] [options]\n\
          \n\
          Options:\n  \
-           --profile-dir <dir>    HSTS, cookies, storage and site permissions\n  \
+           --profile-dir <dir>    Local settings, session, history and site data\n  \
            --software-render      Force the software display-list backend\n  \
            --perf                 Local performance counters\n  \
            --headless-test <url>  Load/layout/paint without a window (test harness)\n  \
@@ -53,10 +52,16 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--perf" => args.perf = true,
             "--profile-dir" => {
                 let dir = iter.next().ok_or("--profile-dir requires <dir>")?;
+                if dir.is_empty() || dir.starts_with("--") {
+                    return Err("--profile-dir requires <dir>".into());
+                }
                 args.profile_dir = Some(dir.clone());
             }
             "--headless-test" => {
                 let url = iter.next().ok_or("--headless-test requires <url>")?;
+                if url.is_empty() || url.starts_with("--") {
+                    return Err("--headless-test requires <url>".into());
+                }
                 args.headless_test = Some(url.clone());
             }
             flag if flag.starts_with("--") => return Err(format!("unknown flag: {flag}")),
@@ -68,11 +73,20 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             }
         }
     }
+    if args.url.is_some() && args.headless_test.is_some() {
+        return Err("Do not combine a positional URL with --headless-test".into());
+    }
     Ok(args)
 }
 
 fn profile_dir_of(args: &Args) -> Option<PathBuf> {
-    args.profile_dir.as_ref().map(PathBuf::from)
+    args.profile_dir.as_ref().map(PathBuf::from).or_else(|| {
+        if args.headless_test.is_none() {
+            profile::default_directory()
+        } else {
+            None
+        }
+    })
 }
 
 /// Classify startup/headless input into a URL or a search query.
@@ -87,10 +101,47 @@ fn classify_startup(text: &str) -> Result<(url::Url, bool), String> {
 }
 
 fn run_headless(url_text: &str, perf: bool, profile_dir: Option<PathBuf>) -> ExitCode {
+    if url_text.eq_ignore_ascii_case("about:blank") {
+        let result = (|| -> Result<(), String> {
+            let profile = profile::Store::open(profile_dir.clone()).map_err(|e| e.to_string())?;
+            let shared = shell::fetcher::Shared::configured(
+                FetchOptions::default(),
+                profile_dir,
+                profile.preferences.privacy.doh_enabled,
+            )?;
+            let wake = std::sync::Arc::new(|| {});
+            let fetcher = shell::fetcher::Fetcher::spawn_shared(shared.clone(), wake.clone())
+                .map_err(|e| e.to_string())?;
+            let mut app = shell::app::ShellApp::new(
+                fetcher,
+                Some(url::Url::parse("about:blank").map_err(|e| e.to_string())?),
+                false,
+                None,
+            );
+            app.configure_profile(profile, false);
+            app.configure_rendering(true, perf, wake);
+            app.initialize_navigation();
+            app.pump();
+            let attempts = shared.client.network_attempts();
+            app.shutdown();
+            if attempts != 0 {
+                return Err(format!("Unexpected startup traffic: {attempts}"));
+            }
+            println!("HEADLESS INTERNAL OK url=about:blank connections=0");
+            Ok(())
+        })();
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("HEADLESS ERROR: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let (url, allow_downgrade) = match classify_startup(url_text) {
         Ok(target) => target,
         Err(query) => {
-            eprintln!("search queries need a search engine (Phase 9): {query}");
+            eprintln!("headless test requires an HTTP(S) URL or about:blank: {query}");
             return ExitCode::from(2);
         }
     };
@@ -249,13 +300,16 @@ fn run(argv: &[String]) -> ExitCode {
 
     let (start_url, start_allow_downgrade, start_search) = match &args.url {
         None => (None, false, None),
-        Some(text) if text.trim().eq_ignore_ascii_case("about:blank") => (None, false, None),
+        Some(text) if text.trim().starts_with("about:") => {
+            (url::Url::parse(text.trim()).ok(), false, None)
+        }
         Some(text) => match classify_startup(text) {
             Ok((url, allow_downgrade)) => (Some(url), allow_downgrade, None),
             Err(query) => (None, false, Some(query)),
         },
     };
     let options = shell::Options {
+        restore_session: args.url.is_none(),
         start_url,
         start_allow_downgrade,
         start_search,
@@ -326,6 +380,17 @@ mod tests {
     #[test]
     fn double_url_is_error() {
         assert!(parse_args(&v(&["a", "b"])).is_err());
+    }
+    #[test]
+    fn flags_cannot_be_consumed_as_values_and_startup_modes_are_unambiguous() {
+        assert!(parse_args(&v(&["--profile-dir", "--perf"])).is_err());
+        assert!(parse_args(&v(&["--headless-test", "--perf"])).is_err());
+        assert!(parse_args(&v(&[
+            "https://example.test/",
+            "--headless-test",
+            "about:blank"
+        ]))
+        .is_err());
     }
 
     #[test]

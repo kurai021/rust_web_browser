@@ -24,6 +24,12 @@ use crate::fetcher::{resolve_input, Command, FetchEvent, Fetcher};
 use crate::history::History;
 use crate::omnibox::Omnibox;
 use crate::text::{rgb, Canvas, TextBuffer, TextRenderer};
+mod tabs;
+use tabs::{Presentation, TabState};
+mod browser_ui;
+#[cfg(test)]
+mod phase9_tests;
+use browser_ui::{Action as ChromeAction, BrowserUi, LocalPage};
 
 /// Wake signal from the network worker.
 #[derive(Debug)]
@@ -33,7 +39,11 @@ pub enum Wake {
 }
 
 /// Layout metrics (physical pixels).
-const TOOLBAR_H: i32 = 44;
+const TABS_H: i32 = 32;
+const NAV_H: i32 = 44;
+const BOOKMARKS_H: i32 = 28;
+const TOOLBAR_H: i32 = TABS_H + NAV_H + BOOKMARKS_H;
+const FIND_H: i32 = 40;
 const STATUS_H: i32 = 26;
 const BUTTON_W: i32 = 34;
 const BUTTON_GAP: i32 = 6;
@@ -55,9 +65,9 @@ fn welcome_article() -> Article {
     Article {
         title: Some("Welcome".to_owned()),
         blocks: vec![
-            Block::Heading { level: 1, text: "browser — Phase 7".to_owned(), links: Vec::new() },
+            Block::Heading { level: 1, text: "Your browser — Phase 9".to_owned(), links: Vec::new() },
             Block::Paragraph {
-                text: "Dynamic pages use the in-house JavaScript interpreter, origin-scoped Web APIs and GPU/software painting. Open about:permissions to revoke site grants.".to_owned(),
+                text: "Tabs, saved sessions, local history and bookmarks. Downloads stream to disk with pause and resume. Pages use the in-house HTML/CSS/JavaScript engines and GPU/software painting.".to_owned(),
                 links: Vec::new(),
             },
             Block::Heading { level: 2, text: "Try".to_owned(), links: Vec::new() },
@@ -66,7 +76,7 @@ fn welcome_article() -> Article {
             Block::ListItem { depth: 1, text: "about:blank (this page)".to_owned(), links: Vec::new() },
             Block::Heading { level: 2, text: "Shortcuts".to_owned(), links: Vec::new() },
             Block::Paragraph {
-                text: "Click a link to follow it. Ctrl+L focuses the address bar, Enter loads, Esc stops or unfocuses, Ctrl+R reloads, Alt+Left/Right moves through history, wheel and PgUp/PgDn scroll.".to_owned(),
+                text: "Ctrl+T/W opens/closes a tab. Ctrl+Tab switches tabs. Ctrl+L focuses the address bar; Enter navigates or searches. Ctrl+H/B/J opens history/bookmarks/downloads. Ctrl+F finds text, Ctrl++/- zooms, Ctrl+P prints to PDF. Alt+Left/Right navigates history. Settings: about:preferences.".to_owned(),
                 links: Vec::new(),
             },
         ],
@@ -102,6 +112,29 @@ struct Button {
 
 /// The running window and all of its UI state.
 pub struct ShellApp {
+    browser: BrowserUi,
+    local_page: Option<LocalPage>,
+    batch_visible: Option<usize>,
+    session_dirty: bool,
+    next_cache: net::navigation::CacheMode,
+    previous_navigation: Option<(u64, bool)>,
+    previous_presentation: Option<Presentation>,
+    committed: bool,
+    pending_traversal: i32,
+    page_font_db: cosmic_text::fontdb::Database,
+    navigation_url: Option<Url>,
+    crashed: bool,
+    favicon: Option<Arc<layout::RasterImage>>,
+    tabs: Vec<Option<TabState>>,
+    active_tab: usize,
+    next_navigation_id: u64,
+    shared: Arc<crate::fetcher::Shared>,
+    profile: profile::Store,
+    exit_requested: bool,
+    handling_background: bool,
+    restore_session: bool,
+    pending_restore: Option<profile::SavedTab>,
+    restore_scroll: Option<(f32, f32)>,
     fetcher: Option<Fetcher>,
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
@@ -115,6 +148,7 @@ pub struct ShellApp {
     pixels: Vec<u32>,
     size: PhysicalSize<u32>,
     fatal_init: Option<String>,
+    last_window_title: String,
 
     font_system: cosmic_text::FontSystem,
     text_renderer: TextRenderer,
@@ -191,7 +225,31 @@ impl ShellApp {
         let omnibox_prefix =
             TextBuffer::with_metrics(&mut font_system, 15.0, cosmic_text::Wrap::None);
         let status_text = TextBuffer::with_metrics(&mut font_system, 13.0, cosmic_text::Wrap::None);
+        let page_font_db = font_system.db().clone();
         let mut app = Self {
+            browser: BrowserUi::default(),
+            local_page: None,
+            batch_visible: None,
+            session_dirty: false,
+            next_cache: Default::default(),
+            previous_navigation: None,
+            previous_presentation: None,
+            committed: false,
+            pending_traversal: 0,
+            page_font_db,
+            navigation_url: None,
+            crashed: false,
+            favicon: None,
+            tabs: vec![None],
+            active_tab: 0,
+            next_navigation_id: 0,
+            shared: fetcher.shared(),
+            profile: profile::Store::open(None).expect("in-memory defaults"),
+            exit_requested: false,
+            handling_background: false,
+            restore_session: true,
+            pending_restore: None,
+            restore_scroll: None,
             fetcher: Some(fetcher),
             window: None,
             context: None,
@@ -205,6 +263,7 @@ impl ShellApp {
             pixels: Vec::new(),
             size: PhysicalSize::new(1100, 750),
             fatal_init: None,
+            last_window_title: String::new(),
             font_system,
             text_renderer,
             omnibox_text,
@@ -284,6 +343,19 @@ impl ShellApp {
             Err(err) => self.fatal_init = Some(format!("layout worker failed: {err}")),
         }
         self.gpu_wake = Some(wake);
+        let wake = self.gpu_wake.clone().unwrap_or_else(|| Arc::new(|| {}));
+        match crate::find::Worker::spawn(wake.clone()) {
+            Ok(worker) => self.browser.find_worker = Some(worker),
+            Err(error) => self.browser.notice = error.to_string(),
+        }
+        match crate::downloads::Manager::spawn(
+            self.shared.client.clone(),
+            self.profile.data.downloads.clone(),
+            wake,
+        ) {
+            Ok(manager) => self.browser.downloads = Some(manager),
+            Err(error) => self.browser.notice = error.to_string(),
+        }
     }
 
     fn start_gpu(&mut self, window: Arc<Window>) {
@@ -340,6 +412,16 @@ impl ShellApp {
 
     /// Join the worker thread (saves HSTS). Called after the loop exits.
     pub fn shutdown(&mut self) {
+        if let Some(manager) = &mut self.browser.downloads {
+            manager.shutdown();
+        }
+        self.drain_browser();
+        self.save_session();
+        for tab in self.tabs.iter_mut().flatten() {
+            if let Some(fetcher) = tab.fetcher.take() {
+                fetcher.shutdown();
+            }
+        }
         if let Some(worker) = &mut self.layout_worker {
             worker.shutdown();
         }
@@ -349,11 +431,69 @@ impl ShellApp {
         if let Some(worker) = self.gpu_worker.take() {
             let _ = worker.join();
         }
+        self.profile.shutdown();
+    }
+
+    pub fn configure_profile(&mut self, profile: profile::Store, restore: bool) {
+        self.restore_session = restore;
+        self.dark_theme = profile.preferences.appearance.theme == "dark";
+        self.profile = profile;
+    }
+    /// The window and headless acceptance harness share this startup path.
+    pub fn initialize_navigation(&mut self) {
+        self.restore_startup();
+    }
+    /// Service channels without a window; no transport/VM/layout runs on this caller.
+    pub fn pump(&mut self) {
+        self.drain_fetcher();
+        self.drain_layout();
+        self.drain_browser();
+        self.measure_content(self.size.width as f32);
+    }
+    pub fn navigate(&mut self, input: &str) {
+        self.omnibox_focused = false;
+        self.navigate_input(input);
+    }
+    pub fn snapshot(&self) -> Option<Arc<Page>> {
+        self.page.clone()
+    }
+    pub fn current_url(&self) -> Option<&Url> {
+        self.history.current()
+    }
+    pub fn is_loading(&self) -> bool {
+        matches!(self.load, LoadState::Loading { .. })
+    }
+    pub fn tab_crashed(&self) -> bool {
+        self.crashed
+    }
+    pub fn back(&mut self) {
+        self.go_back();
+    }
+    pub fn forward(&mut self) {
+        self.go_forward();
+    }
+    pub fn click_node(&self, node: html::NodeId) {
+        if let Some(fetcher) = &self.fetcher {
+            fetcher.send(Command::DomEvent {
+                id: self.navigation_id,
+                event: crate::script_worker::DomCommand::Click(node),
+            });
+        }
     }
 
     // ---------- navigation ----------
 
     fn submit_omnibox(&mut self) {
+        if let Some(index) = self.browser.suggestion.take() {
+            if let Some((url, _)) = self
+                .profile
+                .data
+                .suggestions(self.omnibox.text(), 6)
+                .get(index)
+            {
+                self.omnibox.set_text(url);
+            }
+        }
         let input = self.omnibox.text().to_owned();
         self.omnibox_focused = false;
         self.navigate_input(&input);
@@ -361,6 +501,18 @@ impl ShellApp {
 
     fn navigate_input(&mut self, input: &str) {
         let trimmed = input.trim();
+        let local = match trimmed.to_ascii_lowercase().as_str() {
+            "about:preferences" | "about:config" => Some(LocalPage::Preferences),
+            "about:history" => Some(LocalPage::History),
+            "about:bookmarks" => Some(LocalPage::Bookmarks),
+            "about:downloads" => Some(LocalPage::Downloads),
+            "about:devtools" => Some(LocalPage::Devtools),
+            _ => None,
+        };
+        if let Some(page) = local {
+            self.open_local(page);
+            return;
+        }
         if trimmed.eq_ignore_ascii_case("about:permissions") {
             let mut dialog=crate::web_ui::WebDialog::notice("Site permissions are origin-scoped. Revoke saved and current grants here. Camera and microphone have no backend and are denied.");
             dialog.origin = self.page.as_ref().map_or_else(
@@ -375,16 +527,75 @@ impl ShellApp {
             self.show_welcome();
             return;
         }
+        if trimmed.to_ascii_lowercase().starts_with("about:") {
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(Command::Stop {
+                    id: self.navigation_id,
+                });
+            }
+            self.previous_navigation = None;
+            self.previous_presentation = None;
+            self.navigation_id = self.next_navigation();
+            self.script_ready = false;
+            self.load = LoadState::Idle;
+            self.local_page = None;
+            let title = if trimmed.starts_with("about:cert-error") {
+                "Certificate error"
+            } else if trimmed.starts_with("about:net-error") {
+                "Network error"
+            } else {
+                "Local browser page"
+            };
+            self.set_article(Article{title:Some(title.into()),blocks:vec![Block::Heading{level:1,text:title.into(),links:Vec::new()},Block::Paragraph{text:"This page is generated locally. Use about:preferences, about:history, about:bookmarks or about:downloads. Network and certificate failures show their details here without remote assets.".into(),links:Vec::new()}],..Default::default()},View::Error);
+            self.omnibox.set_text(trimmed);
+            if let Ok(url) = Url::parse(trimmed) {
+                if self.history.current() != Some(&url) {
+                    self.history.navigate(url);
+                }
+            }
+            self.navigation_url = None;
+            self.save_session();
+            self.update_title();
+            self.request_redraw();
+            return;
+        }
         match resolve_input(trimmed) {
             Ok((url, allow_downgrade)) => self.start_fetch(url, allow_downgrade, true),
-            Err(query) => self.show_search_stub(&query),
+            Err(query) => match self.profile.preferences.search_url(&query) {
+                Ok(url) => self.start_fetch(url, false, true),
+                Err(error) => self.browser.notice = error,
+            },
         }
     }
 
     /// Begin a fetch. `record_history` is false for back/forward/reload
     /// (the entry already exists); the final URL is recorded on Done.
     fn start_fetch(&mut self, url: Url, allow_downgrade: bool, record_history: bool) {
-        self.navigation_id = self.navigation_id.wrapping_add(1);
+        if self.crashed {
+            if let Some(fetcher) = self.fetcher.take() {
+                fetcher.shutdown();
+            }
+            let wake = self.gpu_wake.clone().unwrap_or_else(|| Arc::new(|| {}));
+            match Fetcher::spawn_shared(self.shared.clone(), wake) {
+                Ok(fetcher) => {
+                    self.fetcher = Some(fetcher);
+                    self.crashed = false;
+                }
+                Err(error) => {
+                    self.browser.notice = format!("Cannot restart tab: {error}");
+                    return;
+                }
+            }
+        }
+        if !matches!(self.load, LoadState::Loading { .. }) {
+            self.previous_navigation = Some((self.navigation_id, self.script_ready));
+            self.previous_presentation = Some(Presentation::capture(self));
+        }
+        self.navigation_url = Some(url.clone());
+        self.committed = false;
+        self.pending_traversal = 0;
+        self.local_page = None;
+        self.navigation_id = self.next_navigation();
         self.style_revision = self.style_revision.wrapping_add(1);
         self.pending_history = record_history;
         self.navigation_started = Some(std::time::Instant::now());
@@ -407,6 +618,11 @@ impl ShellApp {
         self.update_title();
         self.request_redraw();
         if let Some(fetcher) = &self.fetcher {
+            fetcher.send(Command::NavigationPolicy {
+                javascript: self.profile.preferences.privacy.javascript_enabled,
+                sites: self.profile.preferences.privacy.site_javascript.clone(),
+                cache: std::mem::take(&mut self.next_cache),
+            });
             fetcher.send(Command::Navigate {
                 id: self.navigation_id,
                 url,
@@ -417,20 +633,24 @@ impl ShellApp {
     }
 
     fn reload(&mut self) {
+        self.reload_mode(net::navigation::CacheMode::Revalidate);
+    }
+
+    fn reload_mode(&mut self, mode: net::navigation::CacheMode) {
+        self.next_cache = mode;
         if let Some(url) = self
-            .page
-            .as_ref()
-            .map(|p| p.url.clone())
+            .navigation_url
+            .clone()
             .or_else(|| self.history.current().cloned())
         {
-            self.start_fetch(url, false, false);
+            self.navigate_saved(url.as_str());
         } else if matches!(self.view, View::Error) {
             self.show_welcome();
         }
     }
 
     fn go_back(&mut self) {
-        if self.spa_back {
+        if self.spa_back && self.script_ready {
             if let Some(fetcher) = &self.fetcher {
                 fetcher.send(Command::DomEvent {
                     id: self.navigation_id,
@@ -439,14 +659,20 @@ impl ShellApp {
             }
             return;
         }
-        if let Some(url) = self.history.go_back() {
+        if let Some(url) = self.history.back_target() {
             self.omnibox.set_text(url.as_str());
-            self.start_fetch(url, false, false);
+            if url.scheme() == "about" {
+                self.history.go_back();
+                self.navigate_saved(url.as_str());
+                return;
+            }
+            self.navigate_saved(url.as_str());
+            self.pending_traversal = -1;
         }
     }
 
     fn go_forward(&mut self) {
-        if self.spa_forward {
+        if self.spa_forward && self.script_ready {
             if let Some(fetcher) = &self.fetcher {
                 fetcher.send(Command::DomEvent {
                     id: self.navigation_id,
@@ -455,21 +681,48 @@ impl ShellApp {
             }
             return;
         }
-        if let Some(url) = self.history.go_forward() {
+        if let Some(url) = self.history.forward_target() {
             self.omnibox.set_text(url.as_str());
-            self.start_fetch(url, false, false);
+            if url.scheme() == "about" {
+                self.history.go_forward();
+                self.navigate_saved(url.as_str());
+                return;
+            }
+            self.navigate_saved(url.as_str());
+            self.pending_traversal = 1;
         }
     }
 
     fn stop_or_reload(&mut self) {
         if matches!(self.load, LoadState::Loading { .. }) {
             if let Some(fetcher) = &self.fetcher {
-                fetcher.send(Command::Stop {
-                    id: self.navigation_id,
+                fetcher.send(if self.committed {
+                    Command::Stop {
+                        id: self.navigation_id,
+                    }
+                } else {
+                    Command::StopNavigation {
+                        id: self.navigation_id,
+                    }
                 });
             }
         } else {
             self.reload();
+        }
+    }
+    pub fn stop(&mut self) {
+        if matches!(self.load, LoadState::Loading { .. }) {
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(if self.committed {
+                    Command::Stop {
+                        id: self.navigation_id,
+                    }
+                } else {
+                    Command::StopNavigation {
+                        id: self.navigation_id,
+                    }
+                });
+            }
         }
     }
 
@@ -481,6 +734,10 @@ impl ShellApp {
     /// Swap the article, reset scroll and schedule a rebuild.
     fn set_article(&mut self, article: Article, view: View) {
         if view != View::Document {
+            self.script_ready = false;
+            self.spa_back = false;
+            self.spa_forward = false;
+            self.dom_focused = None;
             self.clear_web_fonts();
             self.page = None;
             self.canvas_color = css::values::Color::WHITE;
@@ -508,7 +765,7 @@ impl ShellApp {
                     styles: self.styles.clone(),
                     font_generation: self.font_generation,
                     locale: self.font_system.locale().to_owned(),
-                    db: self.font_system.db().clone(),
+                    db: self.page_font_db.clone(),
                 });
             }
             return;
@@ -582,42 +839,36 @@ impl ShellApp {
     }
 
     fn show_welcome(&mut self) {
+        self.previous_presentation = None;
+        self.previous_navigation = None;
+        self.local_page = None;
         if let Some(fetcher) = &self.fetcher {
             fetcher.send(Command::Stop {
                 id: self.navigation_id,
             });
         }
-        self.navigation_id = self.navigation_id.wrapping_add(1);
+        self.navigation_id = self.next_navigation();
         self.load = LoadState::Idle;
         self.set_article(welcome_article(), View::Welcome);
         self.omnibox.set_text("");
-        self.update_title();
-        self.request_redraw();
-    }
-
-    fn show_search_stub(&mut self, query: &str) {
-        // Search engine wiring lands in Phase 9 (plan/01.3.6).
-        let article = Article {
-            title: Some("Search".to_owned()),
-            blocks: vec![
-                Block::Heading { level: 1, text: "Search".to_owned(), links: Vec::new() },
-                Block::Paragraph {
-                    text: format!(
-                        "Query: {query}\n\nWeb search needs a configured search engine (Phase 9).\nType a URL like example.com instead."
-                    ),
-                    links: Vec::new(),
-                },
-            ],
-            ..Article::default()
-        };
-        self.load = LoadState::Idle;
-        self.set_article(article, View::Error);
+        self.script_ready = false;
+        self.navigation_url = None;
+        if let Ok(blank) = Url::parse("about:blank") {
+            if self.history.current() != Some(&blank) {
+                self.history.navigate(blank);
+            }
+        }
+        self.save_session();
         self.update_title();
         self.request_redraw();
     }
 
     fn on_fetch_event(&mut self, event: FetchEvent) {
         let id = match &event {
+            FetchEvent::Committed { id, .. } => *id,
+            FetchEvent::Favicon { id, .. } => *id,
+            FetchEvent::Download { id, .. } => *id,
+            FetchEvent::Crashed { id, .. } => *id,
             FetchEvent::Started { id, .. }
             | FetchEvent::WebRequest { id, .. }
             | FetchEvent::Dialog { id, .. }
@@ -634,10 +885,64 @@ impl ShellApp {
             | FetchEvent::Styled { id, .. }
             | FetchEvent::Stopped { id } => *id,
         };
-        if id != self.navigation_id {
+        if id != self.navigation_id && !matches!(event, FetchEvent::Crashed { .. }) {
             return;
         }
         match event {
+            FetchEvent::Committed { url, .. } => {
+                self.commit_history(&url);
+                self.committed = true;
+                self.previous_navigation = None;
+                self.previous_presentation = None;
+                self.set_article(
+                    Article {
+                        title: Some("Loading…".into()),
+                        ..Default::default()
+                    },
+                    View::Welcome,
+                );
+                self.local_page = None;
+                self.navigation_url = Some(url.clone());
+                if !self.omnibox_focused {
+                    self.omnibox.set_text(url.as_str());
+                }
+                self.save_session();
+            }
+            FetchEvent::Favicon { image, .. } => self.favicon = Some(image),
+            FetchEvent::Download { source, .. } => {
+                self.restore_previous_navigation();
+                self.offer_download(source);
+            }
+            FetchEvent::Crashed { message, .. } => {
+                if let Some(fetcher) = &self.fetcher {
+                    fetcher.send(Command::Stop {
+                        id: self.navigation_id,
+                    });
+                }
+                self.previous_presentation = None;
+                self.previous_navigation = None;
+                self.crashed = true;
+                self.load = LoadState::Idle;
+                self.script_ready = false;
+                self.set_article(
+                    Article {
+                        title: Some("Tab crashed".into()),
+                        blocks: vec![
+                            Block::Heading {
+                                level: 1,
+                                text: "This tab stopped".into(),
+                                links: Vec::new(),
+                            },
+                            Block::Paragraph {
+                                text: message,
+                                links: Vec::new(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    View::Error,
+                );
+            }
             FetchEvent::Dialog { request, reply, .. } => {
                 self.queue_web_dialog(crate::web_ui::WebDialog::native(request, reply))
             }
@@ -645,11 +950,35 @@ impl ShellApp {
                 origin, command, ..
             } => self.web_request(origin, command),
             FetchEvent::SameDocument {
-                url, back, forward, ..
+                url,
+                back,
+                forward,
+                replace,
+                traversal,
+                ..
             } => {
                 self.spa_back = back;
                 self.spa_forward = forward;
                 self.omnibox.set_text(url.as_str());
+                if let Some(delta) = traversal {
+                    for _ in 0..delta.unsigned_abs().min(100) {
+                        if delta < 0 {
+                            self.history.go_back();
+                        } else {
+                            self.history.go_forward();
+                        }
+                    }
+                    self.history.replace(url.clone());
+                } else if replace {
+                    self.history.replace(url.clone());
+                } else {
+                    self.history.navigate(url.clone());
+                }
+                self.navigation_url = Some(url.clone());
+                self.profile
+                    .data
+                    .visit(&url, self.article.title.as_deref().unwrap_or(""));
+                self.save_session();
                 self.update_title();
             }
             FetchEvent::WebNavigate { url, replace, .. } => {
@@ -704,6 +1033,8 @@ impl ShellApp {
                 }
             }
             FetchEvent::Done { url, result, .. } => {
+                self.previous_navigation = None;
+                self.previous_presentation = None;
                 self.script_ready = result.is_ok();
                 self.load = LoadState::Idle;
                 match result {
@@ -724,6 +1055,12 @@ impl ShellApp {
                 self.refresh_styled_article();
             }
             FetchEvent::Stopped { .. } => {
+                if !self.crashed && !self.committed {
+                    self.restore_previous_navigation();
+                }
+                if self.committed {
+                    self.script_ready = false;
+                }
                 self.load = LoadState::Idle;
                 self.update_title();
             }
@@ -749,7 +1086,7 @@ impl ShellApp {
                     .as_ref()
                     .is_some_and(|current| Arc::ptr_eq(current, &page))
                 {
-                    let added = crate::fonts::install_fonts(&mut self.font_system, &assets);
+                    let added = crate::fonts::install_fonts_db(&mut self.page_font_db, &assets);
                     if !added.is_empty() {
                         self.web_font_ids.extend(added);
                         self.font_generation = self.font_generation.wrapping_add(1);
@@ -770,6 +1107,49 @@ impl ShellApp {
         self.request_redraw();
     }
 
+    fn restore_previous_navigation(&mut self) {
+        if let Some(presentation) = self.previous_presentation.take() {
+            presentation.restore(self);
+        }
+        if let Some((id, ready)) = self.previous_navigation.take() {
+            self.navigation_id = id;
+            self.script_ready = ready;
+        }
+        self.load = LoadState::Idle;
+        self.pending_traversal = 0;
+        self.navigation_url = self.history.current().cloned();
+        if let Some(url) = self.history.current() {
+            self.omnibox.set_text(if url.as_str() == "about:blank" {
+                ""
+            } else {
+                url.as_str()
+            });
+        }
+        self.update_title();
+        if self.script_ready {
+            if let Some(fetcher) = &self.fetcher {
+                fetcher.send(Command::DomEvent {
+                    id: self.navigation_id,
+                    event: crate::script_worker::DomCommand::Snapshot,
+                });
+            }
+        }
+    }
+    fn commit_history(&mut self, url: &Url) {
+        if self.pending_traversal < 0 {
+            self.history.go_back();
+        } else if self.pending_traversal > 0 {
+            self.history.go_forward();
+        }
+        if self.pending_history {
+            self.history.navigate(url.clone());
+        } else {
+            self.history.replace(url.clone());
+        }
+        self.pending_history = false;
+        self.pending_traversal = 0;
+    }
+
     fn queue_web_dialog(&mut self, dialog: crate::web_ui::WebDialog) {
         if self.web_dialog.is_none() {
             self.web_dialog = Some(dialog);
@@ -783,6 +1163,29 @@ impl ShellApp {
     fn web_request(&mut self, origin: String, command: web_api::WebCommand) {
         use crate::web_ui::{Action, Kind, WebDialog};
         match command {
+            web_api::WebCommand::Download {
+                url,
+                filename,
+                bytes,
+                gesture,
+            } => {
+                let top = self
+                    .page
+                    .as_ref()
+                    .map_or_else(|| url.clone(), |p| p.url.clone());
+                let filename = if filename.is_empty() {
+                    crate::downloads::suggested_filename(&url, None)
+                } else {
+                    filename
+                };
+                self.offer_download(crate::downloads::Source {
+                    force_prompt: !gesture || (top.scheme() == "https" && url.scheme() == "http"),
+                    url,
+                    top,
+                    filename,
+                    bytes,
+                });
+            }
             web_api::WebCommand::Permission { id, name, .. } => {
                 let mut dialog=WebDialog::notice(format!("This page requests {name}. Choose once, always, or never. Saved grants can be revoked at about:permissions."));
                 dialog.origin = origin;
@@ -817,7 +1220,7 @@ impl ShellApp {
             }
             web_api::WebCommand::Popup { url, gesture } => {
                 let mut dialog = WebDialog::notice(if gesture {
-                    format!("Open a separate browsing window for {url}?")
+                    format!("Open a separate, isolated tab for {url}?")
                 } else {
                     "Popup blocked: no user gesture.".into()
                 });
@@ -831,6 +1234,9 @@ impl ShellApp {
                 self.queue_web_dialog(WebDialog::notice(message))
             }
             web_api::WebCommand::Fullscreen { enter } => {
+                if self.handling_background {
+                    return;
+                }
                 if let Some(window) = &self.window {
                     window.set_fullscreen(if enter {
                         Some(winit::window::Fullscreen::Borderless(None))
@@ -895,8 +1301,8 @@ impl ShellApp {
             }
             Kind::Popup(url) => {
                 if choice == 1 {
-                    if let Some(fetcher) = &self.fetcher {
-                        fetcher.send(Command::OpenPopup { url });
+                    if let Err(error) = self.new_tab(Some(url.as_str())) {
+                        self.browser.notice = error;
                     }
                 }
             }
@@ -957,8 +1363,9 @@ impl ShellApp {
         }
     }
     fn show_document(&mut self, requested: &Url, page: Arc<Page>, styles: ComputedStyles) {
-        if self.pending_history {
-            self.history.navigate(page.url.clone());
+        self.favicon = None;
+        if !self.committed {
+            self.commit_history(&page.url);
         }
         self.pending_history = false;
         self.clear_web_fonts();
@@ -969,11 +1376,23 @@ impl ShellApp {
         }
         self.redirected_from = (requested != &page.url).then(|| requested.clone());
         self.omnibox.set_text(page.url.as_str());
+        self.navigation_url = Some(page.url.clone());
+        self.zoom = self
+            .profile
+            .data
+            .zoom
+            .get(&page.url.origin().ascii_serialization())
+            .copied()
+            .unwrap_or(1.0);
+        self.profile
+            .data
+            .visit(&page.url, page.document.title().as_deref().unwrap_or(""));
         self.page = Some(page);
         self.styles = styles;
         self.refresh_styled_article();
         self.queue_restyle();
         self.update_title();
+        self.save_session();
     }
 
     fn environment(&self) -> Environment {
@@ -1007,7 +1426,10 @@ impl ShellApp {
             .and_then(|&id| self.styles.get(id))
             .cloned();
         let article = Article {
-            title: page.document.title(),
+            title: page
+                .document
+                .title()
+                .map(|title| profile::short_title(&title)),
             page_style: body_style,
             ..Article::default()
         };
@@ -1035,22 +1457,19 @@ impl ShellApp {
         if self.web_font_ids.is_empty() {
             return;
         }
-        for id in self.web_font_ids.drain(..) {
-            self.font_system.db_mut().remove_face(id);
-        }
-        let db = self.font_system.db().clone();
-        let locale = self.font_system.locale().to_owned();
-        self.font_system = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
-        self.text_renderer = TextRenderer::new();
+        self.web_font_ids.clear();
+        self.page_font_db = self.font_system.db().clone();
         self.font_generation = self.font_generation.wrapping_add(1);
     }
 
     fn show_error(&mut self, url: &Url, err: &NetError) {
+        self.commit_history(url);
+        self.omnibox.set_text(url.as_str());
         self.pending_history = false;
         let (title, advice) = match err {
             NetError::Tls(tls) => (
                 format!("[TLS ERROR — {tls}]"),
-                "The connection is not private: the certificate cannot be trusted.\nGo Back (Alt+Left). A per-site bypass lives behind about:config (Phase 9).",
+                "The connection is not private: the certificate cannot be trusted.\nGo Back (Alt+Left) or correct the certificate before reloading. Certificate verification was not bypassed.",
             ),
             NetError::HttpStatus(status) => (
                 format!("[HTTP {status}]"),
@@ -1078,9 +1497,13 @@ impl ShellApp {
         };
         self.set_article(article, View::Error);
         self.update_title();
+        self.save_session();
     }
 
-    fn update_title(&self) {
+    fn update_title(&mut self) {
+        if self.handling_background {
+            return;
+        }
         let Some(window) = &self.window else { return };
         let title = match &self.load {
             LoadState::Loading { url, .. } => {
@@ -1100,7 +1523,10 @@ impl ShellApp {
                 }
             }
         };
-        window.set_title(&title);
+        if self.last_window_title != title {
+            self.last_window_title = title.clone();
+            window.set_title(&title);
+        }
     }
 
     fn request_redraw(&self) {
@@ -1111,13 +1537,39 @@ impl ShellApp {
 
     fn drain_fetcher(&mut self) {
         // Collect first to end the fetcher borrow before mutating self.
+        let original = self.active_tab;
+        self.batch_visible = Some(original);
+        let mut batches = Vec::new();
         let mut events = Vec::new();
         if let Some(fetcher) = &self.fetcher {
             fetcher.drain_events(|event| events.push(event));
         }
-        for event in events {
-            self.on_fetch_event(event);
+        batches.push((original, events));
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if let Some(fetcher) = tab.as_ref().and_then(|t| t.fetcher.as_ref()) {
+                let mut events = Vec::new();
+                fetcher.drain_events(|event| events.push(event));
+                batches.push((index, events));
+            }
         }
+        for (index, events) in batches {
+            if events.is_empty() {
+                continue;
+            }
+            self.handling_background = index != original;
+            self.swap_context(index);
+            for event in events {
+                self.on_fetch_event(event);
+            }
+        }
+        self.swap_context(original);
+        self.handling_background = false;
+        self.batch_visible = None;
+        if self.session_dirty {
+            self.session_dirty = false;
+            self.save_session();
+        }
+        self.update_title();
     }
 
     fn drain_layout(&mut self) {
@@ -1133,8 +1585,20 @@ impl ShellApp {
             {
                 continue;
             }
+            if let Some(message) = result.error {
+                self.on_fetch_event(FetchEvent::Crashed {
+                    id: self.navigation_id,
+                    message,
+                });
+                continue;
+            }
             self.content_h = result.layout.content_size.height * self.zoom;
+            if let Some((x, y)) = self.restore_scroll.take() {
+                self.scroll_x = x;
+                self.scroll_y = y;
+            }
             self.flow = Some(Arc::new(result.layout));
+            self.browser.find_key = None;
             self.scene = result.scene;
             self.flow_navigation = Some(result.navigation);
             self.layout_ms = result.elapsed_ms;
@@ -1150,9 +1614,17 @@ impl ShellApp {
 
     fn on_key(&mut self, event: &KeyEvent) {
         if event.state == ElementState::Released {
-            if !self.omnibox_focused && self.script_ready {
+            if !self.omnibox_focused
+                && !self.browser.find_focused
+                && self.browser.editor.is_none()
+                && self.browser.focused.is_none()
+                && self.script_ready
+            {
                 self.send_dom_key(event, false);
             }
+            return;
+        }
+        if self.handle_browser_key(event) {
             return;
         }
         let ctrl = self.modifiers.control_key();
@@ -1223,6 +1695,9 @@ impl ShellApp {
 
     /// Focus the address bar with its content selected.
     fn focus_omnibox(&mut self) {
+        self.browser.find_focused = false;
+        self.browser.focused = None;
+        self.browser.suggestion = None;
         self.omnibox_focused = true;
         self.omnibox.select_all();
         self.request_redraw();
@@ -1251,6 +1726,24 @@ impl ShellApp {
                 self.omnibox.move_caret(-1);
                 self.request_redraw();
             }
+            Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp) => {
+                let count = self.profile.data.suggestions(self.omnibox.text(), 6).len();
+                if count > 0 {
+                    let current = self.browser.suggestion.unwrap_or(count - 1);
+                    self.browser.suggestion =
+                        Some(if event.logical_key == Key::Named(NamedKey::ArrowUp) {
+                            (current + count - 1) % count
+                        } else {
+                            (current + 1) % count
+                        });
+                }
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.omnibox_focused = false;
+                self.browser.focused = Some(0);
+                self.request_redraw();
+            }
             Key::Named(NamedKey::ArrowRight) => {
                 self.omnibox.move_caret(1);
                 self.request_redraw();
@@ -1266,7 +1759,12 @@ impl ShellApp {
             _ => {
                 if let Some(text) = event.text.as_ref() {
                     if !text.chars().any(|c| c.is_control()) {
-                        self.omnibox.insert(text.as_str());
+                        if self.omnibox.is_selected()
+                            || self.omnibox.text().len() + text.len() <= 8192
+                        {
+                            self.omnibox.insert(text.as_str());
+                            self.browser.suggestion = None;
+                        }
                         self.request_redraw();
                     }
                 }
@@ -1324,7 +1822,7 @@ impl ShellApp {
                 self.request_redraw();
             }
             Key::Named(NamedKey::Escape) => {
-                self.stop_or_reload();
+                self.stop();
             }
             _ => {}
         }
@@ -1389,12 +1887,20 @@ impl ShellApp {
 
     fn zoom_by(&mut self, factor: f32) {
         let old = self.zoom;
-        self.zoom = (self.zoom * factor).clamp(0.25, 4.0);
+        self.zoom = (self.zoom * factor).clamp(0.8, 2.0);
         if let Some(flow) = &self.flow {
             self.content_h = flow.content_size.height * self.zoom;
         }
         self.scroll_y *= self.zoom / old;
         self.scroll_x *= self.zoom / old;
+        if let Some(page) = &self.page {
+            self.profile
+                .data
+                .zoom
+                .insert(page.url.origin().ascii_serialization(), self.zoom);
+            self.profile.changed();
+        }
+        self.send_geometry();
         self.request_redraw();
     }
 
@@ -1405,7 +1911,11 @@ impl ShellApp {
     }
 
     fn viewport_h(&self) -> f32 {
-        (self.size.height as i32 - TOOLBAR_H - STATUS_H).max(50) as f32
+        (self.size.height as i32
+            - TOOLBAR_H
+            - STATUS_H
+            - if self.browser.find_open { FIND_H } else { 0 })
+        .max(50) as f32
     }
     fn web_viewport(&self) -> web_api::runtime::GeometryRect {
         web_api::runtime::GeometryRect {
@@ -1448,6 +1958,39 @@ impl ShellApp {
             self.request_redraw();
             return;
         }
+        if let Some(action) = self
+            .browser
+            .widgets
+            .iter()
+            .rev()
+            .find(|widget| {
+                let (x, y, w, h) = widget.rect;
+                widget.action.is_some()
+                    && self.mouse_x >= x as f64
+                    && self.mouse_x < (x + w) as f64
+                    && self.mouse_y >= y as f64
+                    && self.mouse_y < (y + h) as f64
+            })
+            .and_then(|w| w.action.clone())
+        {
+            if let ChromeAction::Select(index) = action {
+                self.browser.dragged_tab = Some(index);
+                self.chrome_action(ChromeAction::Select(index));
+            } else {
+                self.chrome_action(action);
+            }
+            return;
+        }
+        if self.browser.editor.is_some() {
+            return;
+        }
+        if self.browser.menu {
+            self.browser.menu = false;
+            self.request_redraw();
+            return;
+        }
+        self.browser.focused = None;
+        self.browser.find_focused = false;
         let (mx, my) = (self.mouse_x as i32, self.mouse_y as i32);
         // Toolbar buttons.
         let layout = self.toolbar_layout();
@@ -1460,7 +2003,12 @@ impl ShellApp {
                 match index {
                     0 => self.go_back(),
                     1 => self.go_forward(),
-                    _ => self.stop_or_reload(),
+                    2 => self.stop_or_reload(),
+                    3 => self.chrome_action(ChromeAction::Home),
+                    4 => self.chrome_action(ChromeAction::Security),
+                    5 => self.chrome_action(ChromeAction::Bookmark),
+                    6 => self.chrome_action(ChromeAction::Local(LocalPage::Downloads)),
+                    _ => self.chrome_action(ChromeAction::Menu),
                 }
                 return;
             }
@@ -1564,15 +2112,31 @@ impl ShellApp {
             ("<", self.history.can_go_back() || self.spa_back),
             (">", self.history.can_go_forward() || self.spa_forward),
             (if loading { "[]" } else { "R" }, true),
+            ("H", true),
+            (
+                if self
+                    .history
+                    .current()
+                    .is_some_and(|u| u.scheme() == "https")
+                {
+                    "L"
+                } else {
+                    "!"
+                },
+                true,
+            ),
+            ("*", true),
+            ("D", true),
+            ("=", true),
         ] {
             buttons.push(Button {
                 label,
-                rect: (x, 6, BUTTON_W, TOOLBAR_H - 12),
+                rect: (x, TABS_H + 6, BUTTON_W, NAV_H - 12),
                 enabled,
             });
             x += BUTTON_W + BUTTON_GAP;
         }
-        let omnibox_rect = (x, 6, (w - x - PAD).max(80), TOOLBAR_H - 12);
+        let omnibox_rect = (x, TABS_H + 6, (w - x - PAD).max(80), NAV_H - 12);
         ToolbarLayout {
             buttons,
             omnibox_rect,
@@ -1582,7 +2146,12 @@ impl ShellApp {
     fn viewport_rect(&self) -> (i32, i32, i32, i32) {
         let w = self.size.width as i32;
         let h = self.size.height as i32;
-        (0, TOOLBAR_H, w, (h - TOOLBAR_H - STATUS_H).max(50))
+        (
+            0,
+            TOOLBAR_H,
+            w,
+            (h - TOOLBAR_H - STATUS_H - if self.browser.find_open { FIND_H } else { 0 }).max(50),
+        )
     }
 
     // ---------- rendering ----------
@@ -1643,6 +2212,9 @@ impl ShellApp {
         self.status_text
             .set_size(&mut self.font_system, w as f32, STATUS_H as f32);
         let layout = self.toolbar_layout();
+        self.request_find();
+        self.browser.widgets = self.chrome_widgets();
+        let find_quads = self.find_quads();
         let omni_w = (layout.omnibox_rect.2 - 16).max(10) as f32;
         self.omnibox_text
             .set_text(&mut self.font_system, self.omnibox.text());
@@ -1702,6 +2274,19 @@ impl ShellApp {
                 );
             }
         }
+        if self.gpu.is_none() && !find_quads.is_empty() {
+            let highlights =
+                paint::Scene::from_quads(find_quads.iter().map(|(q, _)| q.clone()).collect());
+            highlights.paint_software(
+                canvas.pixels,
+                w,
+                h,
+                page_clip,
+                (0.0, 0.0),
+                1.0,
+                &Default::default(),
+            );
+        }
         paint_scrollbar(&mut canvas, vx, vy, vw, vh, self.content_h, self.scroll_y);
         canvas.fill_rect(0, 0, w as i32, TOOLBAR_H, CHROME_BG);
         canvas.fill_rect(0, TOOLBAR_H - 1, w as i32, 1, BORDER);
@@ -1728,6 +2313,50 @@ impl ShellApp {
         );
         self.status_text
             .draw(fs, cache, &mut canvas, PAD, h as i32 - STATUS_H + 5);
+        if self.local_page.is_some() {
+            canvas.fill_rect(
+                vx,
+                vy,
+                vw,
+                vh,
+                if self.dark_theme { 0x142234 } else { VIEW_BG },
+            );
+        }
+        if self.browser.find_open {
+            canvas.fill_rect(0, h as i32 - STATUS_H - FIND_H, w as i32, FIND_H, CHROME_BG);
+        }
+        for widget in &self.browser.widgets {
+            widget.draw(fs, cache, &mut canvas, self.dark_theme);
+        }
+        for widget in &self.browser.widgets {
+            if let Some(ChromeAction::Select(index)) = &widget.action {
+                let icon = if *index == self.active_tab {
+                    self.favicon.as_ref()
+                } else {
+                    self.tabs
+                        .get(*index)
+                        .and_then(|t| t.as_ref())
+                        .and_then(|t| t.favicon.as_ref())
+                };
+                if let Some(icon) = icon {
+                    let (x, y, _, _) = widget.rect;
+                    for yy in 0..16 {
+                        for xx in 0..16 {
+                            let i = ((yy * icon.height / 16 * icon.width + xx * icon.width / 16)
+                                * 4) as usize;
+                            let p = &icon.rgba[i..i + 4];
+                            canvas.blend_rect(
+                                x + 4 + xx as i32,
+                                y + 8 + yy as i32,
+                                1,
+                                1,
+                                (p[0], p[1], p[2], p[3]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let dialog_rect = self
             .script_dialog
             .as_ref()
@@ -1754,6 +2383,7 @@ impl ShellApp {
                     self.zoom,
                     &self.scroll_offsets,
                 ));
+                quads.extend(find_quads);
             } else if let Some(q) = chrome_quad(&self.pixels, w, h, (vx, vy, vw - SCROLLBAR_W, vh))
             {
                 quads.push((q, page_clip));
@@ -1764,6 +2394,21 @@ impl ShellApp {
                 (vx + vw - SCROLLBAR_W, vy, SCROLLBAR_W, vh),
             ] {
                 if let Some(q) = chrome_quad(&self.pixels, w, h, rect) {
+                    quads.push((q, window_clip));
+                }
+            }
+            if self.browser.find_open {
+                if let Some(q) = chrome_quad(
+                    &self.pixels,
+                    w,
+                    h,
+                    (0, h as i32 - STATUS_H - FIND_H, w as i32, FIND_H),
+                ) {
+                    quads.push((q, window_clip));
+                }
+            }
+            for widget in self.browser.widgets.iter().filter(|widget| widget.overlay) {
+                if let Some(q) = chrome_quad(&self.pixels, w, h, widget.rect) {
                     quads.push((q, window_clip));
                 }
             }
@@ -1830,6 +2475,10 @@ impl ShellApp {
 
     /// Rebuild laid-out blocks only when content or width changed.
     fn measure_content(&mut self, vw: f32) {
+        if self.local_page == Some(LocalPage::Preferences) {
+            self.content_h = 600.0;
+            return;
+        }
         let key = (self.content_version, vw as u32);
         if self.content_measured_for == Some(key) {
             return;
@@ -1839,6 +2488,12 @@ impl ShellApp {
     }
 
     fn status_line(&self) -> String {
+        if !self.browser.notice.is_empty() {
+            return self.browser.notice.clone();
+        }
+        if let Some(page) = self.local_page {
+            return format!("{} · local profile · no remote assets", page.path());
+        }
         match &self.load {
             LoadState::Loading {
                 url,
@@ -1939,10 +2594,10 @@ fn paint_button(
     canvas.fill_rect(x, y + h - 1, w, 1, BORDER);
     canvas.fill_rect(x, y, 1, h, BORDER);
     canvas.fill_rect(x + w - 1, y, 1, h, BORDER);
-    if !button.enabled {
-        return;
-    }
     let mut label = TextBuffer::with_metrics(font_system, 15.0, cosmic_text::Wrap::None);
+    if !button.enabled {
+        label.set_color(cosmic_text::Color::rgb(145, 145, 145));
+    }
     label.set_text(font_system, button.label);
     label.set_size(font_system, w as f32, h as f32);
     label.draw(font_system, cache, canvas, x + 11, y + 5);
@@ -2034,20 +2689,17 @@ impl ApplicationHandler<Wake> for ShellApp {
         let attrs = WindowAttributes::default()
             .with_title("browser")
             .with_inner_size(PhysicalSize::new(1100, 750));
+        #[cfg(target_os = "linux")]
+        let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            attrs, "browser", "browser",
+        );
         match event_loop.create_window(attrs) {
             Ok(window) => {
                 let window = Arc::new(window);
                 self.start_gpu(window.clone());
                 self.window = Some(window);
                 self.request_redraw();
-                // Kick off the startup navigation/search now that the UI exists.
-                if let Some(url) = self.start_url.take() {
-                    let allow_downgrade = self.start_allow_downgrade;
-                    self.omnibox.set_text(url.as_str());
-                    self.start_fetch(url, allow_downgrade, true);
-                } else if let Some(query) = self.start_search.take() {
-                    self.show_search_stub(&query);
-                }
+                self.initialize_navigation();
             }
             Err(err) => {
                 self.fatal_init = Some(format!("window creation failed: {err}"));
@@ -2079,8 +2731,10 @@ impl ApplicationHandler<Wake> for ShellApp {
                 self.request_redraw();
             }
             WindowEvent::ThemeChanged(theme) => {
-                self.dark_theme = theme == winit::window::Theme::Dark;
-                self.queue_restyle();
+                if self.profile.preferences.appearance.theme == "system" {
+                    self.dark_theme = theme == winit::window::Theme::Dark;
+                    self.queue_restyle();
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.render();
@@ -2100,6 +2754,25 @@ impl ApplicationHandler<Wake> for ShellApp {
                 if self.dragging_scroll {
                     self.drag_scroll_to(position.y as i32);
                 }
+                if let Some(from) = self.browser.dragged_tab {
+                    let to = self.browser.widgets.iter().find_map(|widget| {
+                        let (x, y, w, h) = widget.rect;
+                        if position.x >= x as f64
+                            && position.x < (x + w) as f64
+                            && position.y >= y as f64
+                            && position.y < (y + h) as f64
+                        {
+                            if let Some(ChromeAction::Select(i)) = &widget.action {
+                                return Some(*i);
+                            }
+                        }
+                        None
+                    });
+                    if let Some(to) = to.filter(|to| *to != from) {
+                        self.reorder_tab(from, to);
+                        self.browser.dragged_tab = Some(to);
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.on_wheel(&delta);
@@ -2114,6 +2787,45 @@ impl ApplicationHandler<Wake> for ShellApp {
                     self.on_click();
                 } else {
                     self.dragging_scroll = false;
+                    self.browser.dragged_tab = None;
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                if self.mouse_y < TABS_H as f64 {
+                    let tab = self.browser.widgets.iter().find_map(|widget| {
+                        let (x, y, w, h) = widget.rect;
+                        if self.mouse_x >= x as f64
+                            && self.mouse_x < (x + w) as f64
+                            && self.mouse_y >= y as f64
+                            && self.mouse_y < (y + h) as f64
+                        {
+                            if let Some(ChromeAction::Select(i) | ChromeAction::Close(i)) =
+                                &widget.action
+                            {
+                                return Some(*i);
+                            }
+                        }
+                        None
+                    });
+                    if let Some(tab) = tab {
+                        self.close_tab(tab);
+                    }
+                } else {
+                    let (vx, vy, _, _) = self.viewport_rect();
+                    if self.mouse_y >= vy as f64 {
+                        if let Some(url) = self.hit_link(
+                            self.mouse_x as f32 - vx as f32 - self.page_origin.0 + self.scroll_x,
+                            self.mouse_y as f32 - vy as f32 + self.scroll_y - self.page_origin.1,
+                        ) {
+                            if let Err(error) = self.new_tab(Some(url.as_str())) {
+                                self.browser.notice = error;
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -2121,15 +2833,21 @@ impl ApplicationHandler<Wake> for ShellApp {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
+        self.drain_browser();
         self.drain_fetcher();
         self.drain_layout();
         self.poll_gpu();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
         // Drain in case events arrived without a wake (e.g. startup fetch).
         self.drain_fetcher();
+        self.drain_browser();
         self.drain_layout();
         self.poll_gpu();
     }

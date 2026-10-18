@@ -1,9 +1,13 @@
-# browser — Graphical web browser in Rust (Phase 7)
+# browser — Graphical web browser in Rust (Phase 9)
 
 Sealed theoretical framework in `../plan/` (see `../plan/SEALED.md`, v1.2).
 Sequential phased implementation per `../plan/14-roadmap-phases.md`.
 
-## Current status: Phase 7 — Dynamic-page Web API subsets
+Rust 1.89+ is required by the resolved audited dependency set. The workspace
+minimum now reflects that requirement; current verification also uses stable
+Rust 1.99.
+
+## Current status: Phase 9 — Tabs, sessions and downloads
 
 Cargo workspace with 12 component crates. `net`, `html`, `css`, `layout`,
 `paint` and `shell` now render nested block/inline flow, shaped text, generated
@@ -13,8 +17,10 @@ glyph preparation and image decoding run on workers; scroll and pinch/Ctrl+wheel
 zoom change layer offsets/scale without re-layout. Resize re-evaluates CSS and
 queues a new flow layout, discarding obsolete revisions.
 
-`js` now supplies a bounded lexer/parser, lexical AST interpreter, Level 1
-builtins and tracing arena GC. `dom_bindings` connects selectors, mutation,
+`js` supplies the owned bytecode VM, bounded modern-language parser, Promises,
+async/await and generators, modules, collections, Symbol, BigInt, Proxy/Reflect,
+structured clone and tracing GC. The retained AST path is a test oracle.
+`dom_bindings` connects selectors, mutation,
 inline CSSOM, events, basic form controls and timers to the existing HTML/CSS
 engines. A dedicated JS worker preserves a realm across interactions and cancels
 it when navigation changes. Classic blocking/defer scripts run with basic CSP,
@@ -47,8 +53,60 @@ executes classic scripts and bounded asynchronous service work, lays out and
 paints HTML/CSS/images/canvas, reporting a deterministic pixel hash. The measured
 language/DOM surface and current compatibility boundaries are documented in
 `crates/js/README.md`, `crates/dom_bindings/README.md` and the Phase 5 evidence.
-This remains experimental; complete modern JS/event-loop semantics are Phase 8,
-and the full browser/session interface is Phase 9.
+This remains experimental. Measured modern-JS compatibility is recorded in the
+Phase 8 evidence; the Phase 9 report covers the browser/session interface. The
+blocker/privacy integration and final compatibility hardening follow in Phases
+10 and 11.
+
+The graphical shell supports independently running tabs, reorder/duplicate/close,
+URL-based session restore, local history/bookmarks and omnibox suggestions,
+per-site zoom, rendered-text find, native preferences and basic A4 PDF export.
+Downloads stream to disk through a five-transfer queue with validated Range /
+If-Range resumption, pause/cancel, native save paths and persistent metadata.
+Read-only Elements/Console and a bounded in-memory Network log are available via
+F12. All chrome is drawn by the application; no webview or external page engine
+is embedded.
+
+GUI profiles default to `$XDG_CONFIG_HOME/navegador-rust` or
+`~/.config/navegador-rust`; `--profile-dir` selects another directory.
+[`crates/profile/README.md`](crates/profile/README.md) describes formats and caps.
+Session restore loads the selected page first and leaves background tabs dormant
+until selected. A clean `about:blank` startup makes no connections. Explicit
+`--headless-test about:blank` exercises that same startup path.
+
+### Browser shortcuts
+
+| Action | Shortcut |
+| --- | --- |
+| New / close / cycle tab | Ctrl+T / Ctrl+W / Ctrl+Tab (Shift reverses) |
+| Select tab / last tab | Ctrl+1…8 / Ctrl+9 |
+| Reorder selected tab | Ctrl+Shift+PageUp / PageDown, or drag the tab |
+| Omnibox / reload / force reload | Ctrl+L / Ctrl+R / Ctrl+Shift+R |
+| Back / forward | Alt+Left / Alt+Right |
+| History / bookmarks / bookmark page | Ctrl+H / Ctrl+B / Ctrl+D |
+| Downloads / save / print PDF | Ctrl+J / Ctrl+S / Ctrl+P |
+| Find / next / previous | Ctrl+F / Enter or F3 / Shift+Enter or Shift+F3 |
+| Per-site zoom / reset | Ctrl++ / Ctrl+- / Ctrl+0 (80–200%) |
+| Preferences / menu / developer tools | Ctrl+, / F10 / F12 |
+
+Native managers also accept Tab/Shift+Tab and Enter/Space. Preferences, history,
+bookmarks and downloads use local `about:` pages. Downloaded files never open
+automatically; the explicit folder button opens their directory.
+
+### Phase 9 acceptance
+
+```sh
+CARGO_BUILD_JOBS=2 cargo run -p web_api --example demo_server -- 8099
+cargo run -- --profile-dir /tmp/browser-workshop http://127.0.0.1:8099/browser/
+cargo run -p shell --example phase9_probe -- http://127.0.0.1:8099/
+cargo test -p shell --test browser_session --test browser_tools --test downloads -- --test-threads=2
+```
+
+The loopback workshop covers five tabs, independent page state, a 100 MiB
+streamed download, fetch→Blob→native save, bookmarks/history, find and PDF export.
+Use a temporary download directory when recording it. Robustness tests exercise
+owned code with bounded inputs/runs; compile with `CARGO_BUILD_JOBS=2`, limit test
+threads and serialize heavy checks. See `../plan/evidence/phase-9/` for results.
 
 ## Layout
 
@@ -63,6 +121,7 @@ browser/
 ## Commands
 
 ```sh
+export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2  # bounded local builds/tests
 cargo test --workspace                  # tests with simd feature (default)
 cargo test --workspace --no-default-features  # scalar-fallback tests
 cargo clippy --workspace --all-targets -- -D warnings

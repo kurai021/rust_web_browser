@@ -18,6 +18,11 @@ paint = { path = "../paint", version = "0.1.0" }
 js = { path = "../js", version = "0.1.0" }
 dom_bindings = { path = "../dom_bindings", version = "0.1.0" }
 web_api = { path = "../web_api", version = "0.1.0" }
+profile = { path = "../profile", version = "0.1.0" }
+futures = "0.3"
+serde_json = "1"
+unicode-normalization = "0.1"
+pdf-writer = "0.12"
 pollster = "0.4"
 encoding_rs = "0.8"
 flate2 = "1"
@@ -31,6 +36,10 @@ softbuffer = "0.4"
 cosmic-text = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 thiserror = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+xattr = "1"
+rustix = { version = "1", features = ["fs", "time"] }
 
 [lints]
 workspace = true

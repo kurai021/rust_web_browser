@@ -1,0 +1,16 @@
+* { box-sizing: border-box; }
+body { margin: 0; background: #edf3f9; color: #23374d; font: 16px sans-serif; }
+.wrap { max-width: 1040px; padding: 24px; margin: 0 auto; }
+header { background: #153b57; color: white; }
+h1 { font-size: 36px; margin: 8px 0; }
+h2 { font-size: 23px; margin: 0 0 12px; }
+.eyebrow { color: #9bdece; font-size: 12px; letter-spacing: 2px; }
+nav { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+nav a { color: white; background: #295875; padding: 8px 14px; border-radius: 5px; text-decoration: none; white-space: nowrap; }
+main.wrap { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 20px; }
+.card { background: white; border: 1px solid #ccdce8; border-radius: 10px; padding: 24px; }
+.wide { grid-column: 1 / -1; }
+button, .button { display: inline-block; padding: 10px 14px; margin: 6px 6px 0 0; background: #087e80; color: white; border: 0; border-radius: 5px; text-decoration: none; }
+.small, footer { font-size: 13px; color: #607b91; }
+@media (max-width:700px) { main.wrap { grid-template-columns: minmax(0,1fr); } h1 { font-size: 28px; } .wrap { padding: 18px; } }
+@media (prefers-color-scheme:dark) { body { background: #162535; color: #dce9f3; } .card { background: #22374a; border-color: #3d566c; } .small, footer { color: #9cbbd3; } }
