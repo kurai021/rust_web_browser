@@ -2,8 +2,8 @@ use super::*;
 impl State {
     pub(super) fn promise(&mut self) -> Result<u64> {
         self.allocate(Kind::Promise(Promise {
+            native: JsValue::Undefined,
             result: None,
-            reactions: Vec::new(),
         }))
     }
     pub(super) fn settle(&mut self, id: u64, ok: bool, value: JsValue) {
@@ -18,82 +18,83 @@ impl State {
             return;
         }
         p.result = Some((ok, value.clone()));
-        for reaction in p.reactions.drain(..) {
-            self.jobs.push_back(Job::Reaction {
-                ok,
-                value: value.clone(),
-                reaction,
-            });
-        }
-    }
-    pub(super) fn react(&mut self, id: u64, reaction: Reaction) {
-        if let Some(Object {
-            kind: Kind::Promise(p),
-            ..
-        }) = self.objects.get_mut(&id)
-        {
-            if let Some((ok, value)) = &p.result {
-                self.jobs.push_back(Job::Reaction {
-                    ok: *ok,
-                    value: value.clone(),
-                    reaction,
-                });
-            } else {
-                p.reactions.push(reaction);
-            }
-        }
+        self.jobs.push_back(Job::Settle {
+            id,
+            ok,
+            value: value.clone(),
+        });
     }
 }
 impl PageRuntime {
-    fn resolve(&mut self, target: u64, value: JsValue) -> std::result::Result<(), JsError> {
-        let host = self.dom.vm.host_id(&value);
-        let promise = host.is_some_and(|id| {
-            matches!(
-                self.state.borrow().objects.get(&id).map(|o| &o.kind),
-                Some(Kind::Promise(_))
-            )
-        });
-        if promise {
-            let source = host.unwrap_or(0);
-            if source == target {
-                let e = error(
-                    &mut self.dom.vm,
-                    ApiError::new("TypeError", "promise cycle"),
-                );
-                let value = self.dom.vm.error_value(e)?;
-                self.state.borrow_mut().settle(target, false, value);
-            } else {
-                self.state.borrow_mut().react(
-                    source,
-                    Reaction {
-                        continuation: None,
-                        child: target,
-                        success: JsValue::Undefined,
-                        failure: JsValue::Undefined,
-                        finally: false,
-                    },
-                );
-            }
-        } else {
-            self.state.borrow_mut().settle(target, true, value);
-        }
-        Ok(())
-    }
     pub(super) fn drain_jobs(&mut self) -> std::result::Result<(), JsError> {
         if self.dom.is_stopped() {
             self.state.borrow_mut().jobs.clear();
             return Ok(());
         }
         for _ in 0..2048 {
+            self.dom.vm.drain_microtasks()?;
+            for error in self.dom.vm.take_async_errors() {
+                self.state.borrow().dom.console(error.to_string());
+            }
+            let notifications = self.dom.vm.take_promise_notifications();
+            if !notifications.is_empty() {
+                for notification in notifications {
+                    let data = self.dom.vm.object()?;
+                    self.dom
+                        .vm
+                        .set(data.clone(), "promise", notification.promise)?;
+                    self.dom
+                        .vm
+                        .set(data.clone(), "reason", notification.reason.clone())?;
+                    let allowed = self.dom.dispatch_detail_in_task(
+                        0,
+                        if notification.handled {
+                            "rejectionhandled"
+                        } else {
+                            "unhandledrejection"
+                        },
+                        data,
+                    )?;
+                    if allowed && !notification.handled {
+                        let reason = self
+                            .dom
+                            .vm
+                            .to_string(notification.reason)
+                            .unwrap_or_else(|_| "<unprintable rejection>".into());
+                        self.state
+                            .borrow()
+                            .dom
+                            .console(format!("Unhandled promise rejection: {reason}"));
+                    }
+                }
+                continue;
+            }
             let job = self.state.borrow_mut().jobs.pop_front();
             let Some(job) = job else {
                 if self.observer_checkpoint()? {
                     continue;
                 }
+                if self.dom.vm.has_microtasks() {
+                    continue;
+                }
                 self.flush_canvases()?;
                 return Ok(());
             };
+            if !matches!(job, Job::Settle { .. }) {
+                self.dom.vm.begin_task();
+            }
             match job {
+                Job::Settle { id, ok, value } => {
+                    let native = WebHost {
+                        state: self.state.clone(),
+                    }
+                    .promise_value(id);
+                    if ok {
+                        self.dom.vm.resolve_promise(native, value)?;
+                    } else {
+                        self.dom.vm.reject_promise(native, value)?;
+                    }
+                }
                 Job::Observer { id } => self.observer_callback(id)?,
                 Job::Database(task) => self.database_task(task)?,
                 Job::Permission { id, name, decision } => {
@@ -111,97 +112,12 @@ impl PageRuntime {
                     self.deliver_event(id, "load", JsValue::Undefined)?;
                     self.deliver_event(id, "loadend", JsValue::Undefined)?;
                 }
-                Job::Reaction {
-                    ok,
-                    value,
-                    reaction,
-                } => {
-                    if let Some((saved_ok, saved_value)) = reaction.continuation {
-                        self.state.borrow_mut().settle(
-                            reaction.child,
-                            if ok { saved_ok } else { false },
-                            if ok { saved_value } else { value },
-                        );
-                        continue;
-                    }
-                    let callback = if ok {
-                        reaction.success
-                    } else {
-                        reaction.failure
-                    };
-                    if self.dom.vm.callable(&callback) {
-                        let result = self.dom.call(
-                            callback,
-                            JsValue::Undefined,
-                            if reaction.finally {
-                                Vec::new()
-                            } else {
-                                vec![value.clone()]
-                            },
-                        );
-                        match result {
-                            Ok(result) => {
-                                if reaction.finally {
-                                    let promise = self.dom.vm.host_id(&result).filter(|id| {
-                                        matches!(
-                                            self.state.borrow().objects.get(id).map(|o| &o.kind),
-                                            Some(Kind::Promise(_))
-                                        )
-                                    });
-                                    if let Some(source) = promise {
-                                        if source == reaction.child {
-                                            let value = error(
-                                                &mut self.dom.vm,
-                                                ApiError::new("TypeError", "promise cycle"),
-                                            )
-                                            .thrown
-                                            .unwrap_or(JsValue::Undefined);
-                                            self.state.borrow_mut().settle(
-                                                reaction.child,
-                                                false,
-                                                value,
-                                            );
-                                        } else {
-                                            self.state.borrow_mut().react(
-                                                source,
-                                                Reaction {
-                                                    child: reaction.child,
-                                                    success: JsValue::Undefined,
-                                                    failure: JsValue::Undefined,
-                                                    finally: false,
-                                                    continuation: Some((ok, value)),
-                                                },
-                                            );
-                                        }
-                                    } else {
-                                        self.state.borrow_mut().settle(reaction.child, ok, value);
-                                    }
-                                } else {
-                                    self.resolve(reaction.child, result)?;
-                                }
-                            }
-                            Err(e) => {
-                                if e.is_resource_limit() {
-                                    return Err(e);
-                                }
-                                let value = if let Some(v) = e.thrown {
-                                    v
-                                } else {
-                                    self.dom.vm.error_value(e)?
-                                };
-                                self.state.borrow_mut().settle(reaction.child, false, value);
-                            }
-                        }
-                    } else {
-                        self.state.borrow_mut().settle(reaction.child, ok, value);
-                    }
-                }
                 Job::Callback {
                     function,
                     this,
                     args,
                 } => {
-                    if let Err(e) = self.dom.call(function, this, args) {
+                    if let Err(e) = self.dom.call_in_task(function, this, args) {
                         if e.is_resource_limit() {
                             return Err(e);
                         }
@@ -210,7 +126,7 @@ impl PageRuntime {
                 }
                 Job::Event { target, name, data } => self.deliver_event(target, &name, data)?,
                 Job::DomEvent { name, data } => {
-                    self.dom.dispatch_detail(0, &name, data)?;
+                    self.dom.dispatch_detail_in_task(0, &name, data)?;
                 }
                 Job::XhrEvent {
                     id,
@@ -335,7 +251,10 @@ impl PageRuntime {
         }
         let mut succeeded = true;
         for callback in callbacks {
-            if let Err(e) = self.dom.call(callback, target.clone(), vec![event.clone()]) {
+            if let Err(e) = self
+                .dom
+                .call_in_task(callback, target.clone(), vec![event.clone()])
+            {
                 if e.is_resource_limit() {
                     return Err(e);
                 }
@@ -362,6 +281,27 @@ impl PageRuntime {
             return Ok(());
         }
         match completion {
+            Completion::Module { id, result } => {
+                if !self.state.borrow_mut().pending.remove(&id) {
+                    return Ok(());
+                }
+                let result = result
+                    .map_err(|e| error(&mut self.dom.vm, e))
+                    .and_then(|graph| self.install_module_graph(&graph));
+                let (ok, value) = match result {
+                    Ok(value) => (true, value),
+                    Err(error) if error.is_resource_limit() => return Err(error),
+                    Err(error) => (
+                        false,
+                        if let Some(value) = error.thrown {
+                            value
+                        } else {
+                            self.dom.vm.error_value(error)?
+                        },
+                    ),
+                };
+                self.state.borrow_mut().settle(id, ok, value);
+            }
             Completion::WorkerClosed { id } => {
                 self.state.borrow_mut().pending.remove(&id);
                 if let Some(Object {
@@ -746,5 +686,18 @@ impl PageRuntime {
     }
     fn current_xhr(&self, id: u64, operation: u64) -> bool {
         matches!(self.state.borrow().objects.get(&id).map(|o|&o.kind),Some(Kind::Xhr(x))if x.operation==Some(operation)&&!x.aborted)
+    }
+    pub fn install_module_graph(
+        &mut self,
+        graph: &crate::modules::ModuleGraph,
+    ) -> std::result::Result<JsValue, JsError> {
+        for source in &graph.sources {
+            self.dom.vm.define_module(&source.url, &source.source)?;
+            self.dom.vm.set_module_base(&source.url, &source.base);
+        }
+        for (alias, canonical) in &graph.aliases {
+            self.dom.vm.alias_module(alias, canonical)?;
+        }
+        self.dom.vm.evaluate_module_in_task(&graph.entry)
     }
 }

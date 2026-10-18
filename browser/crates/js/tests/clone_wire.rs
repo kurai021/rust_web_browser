@@ -28,3 +28,17 @@ fn malformed_and_oversized_message_graphs_fail_before_use() {
         })
         .is_err());
 }
+#[test]
+fn modern_builtins_clone_across_realms_without_sharing_identity() {
+    let mut source = Vm::new(NullHost);
+    let value=source.eval_source("var key={id:1};var map=new Map();var set=new Set([key]);map.set(key,{big:2n**100n,set:set});map.set(map,map);var result={key:key,map:map,regex:/a/gi,boxed:Object(9n),error:new TypeError('failure')};result.regex.lastIndex=7;result.error.cause=key;result;").unwrap();
+    let data = source.serialize_clone(value).unwrap();
+    let encoded = serde_json::to_string(&data).unwrap();
+    let data: CloneData = serde_json::from_str(&encoded).unwrap();
+    let mut target = Vm::new(NullHost);
+    let copy = target.deserialize_clone(&data).unwrap();
+    target.set_global("copy", copy).unwrap();
+    target.gc_collect();
+    assert_eq!(target.eval_source("(copy.map instanceof Map)+':'+(copy.map.get(copy.map)===copy.map)+':'+copy.map.get(copy.key).set.has(copy.key)+':'+copy.map.get(copy.key).big+':'+copy.regex.lastIndex+':'+copy.boxed.valueOf()+':'+copy.error.name+':'+copy.error.message+':'+(copy.error.cause===copy.key);").unwrap(),JsValue::string("true:true:true:1267650600228229401496703205376:0:9:TypeError:failure:true"));
+    assert!(data.retained_bytes() > encoded.len());
+}

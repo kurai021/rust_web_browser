@@ -1,0 +1,1 @@
+var parsed=new DOMParser().parseFromString('<p data-task-id="42">inert</p>','text/html');root.replaceChildren(...parsed.body.childNodes);var map=structuredClone(new Map([[1n,new Set([1,2])]]));root.firstChild.dataset.state='ready';async function run(){await new Response('data').text();root.firstChild.textContent=String(map.get(1n).size);}run();

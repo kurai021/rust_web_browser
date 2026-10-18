@@ -3,6 +3,7 @@ pub mod browsing;
 pub mod canvas;
 pub mod headers;
 pub mod http;
+pub mod modules;
 pub mod policy;
 pub mod runtime;
 pub mod services;

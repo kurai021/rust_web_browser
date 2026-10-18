@@ -25,17 +25,22 @@ jobs:
       - run: cargo test --workspace --all-targets
         env:
           BROWSER_WPT_REPORT_DIR: target/wpt-reports
+          BROWSER_TEST262_REPORT_DIR: target/test262-reports
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase7-wpt-subsets
-          path: browser/target/wpt-reports
+          name: browser-conformance-subsets
+          path: |
+            browser/target/wpt-reports
+            browser/target/test262-reports
       - run: cargo test --workspace --no-default-features
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: JavaScript differential oracle (tests only)
         run: cargo test -p js --test differential -- --ignored --exact representative_language_results_match_node
+      - name: Modern JavaScript and bytecode differential oracle (tests only)
+        run: cargo test -p js --test modern_differential -- --include-ignored
       - run: sudo apt-get install -y mesa-vulkan-drivers libegl1
       - name: GPU and scalar display-list parity
         env:
@@ -128,7 +133,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --locked
-      - name: Bounded in-house JavaScript parser and interpreter fuzz smoke
+      - name: Bounded owned JavaScript parser, bytecode, jobs, modules and clone fuzz smoke
         working-directory: browser/crates/js
         env:
           ASAN_OPTIONS: quarantine_size_mb=16

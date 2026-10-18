@@ -4,8 +4,34 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub module: bool,
+    pub imports: Vec<ImportEntry>,
+    pub exports: Vec<ExportEntry>,
+    pub requests: Vec<String>,
     pub body: Vec<Stmt>,
     pub strict: bool,
+}
+#[derive(Debug, Clone)]
+pub struct ImportEntry {
+    pub source: String,
+    pub imported: String,
+    pub local: String,
+    pub namespace: bool,
+}
+#[derive(Debug, Clone)]
+pub enum ExportEntry {
+    Local {
+        exported: String,
+        local: String,
+    },
+    Indirect {
+        exported: String,
+        source: String,
+        imported: String,
+    },
+    Star {
+        source: String,
+    },
 }
 #[derive(Debug, Clone)]
 pub struct Expr {
@@ -14,6 +40,7 @@ pub struct Expr {
 }
 #[derive(Debug, Clone)]
 pub enum Literal {
+    BigInt(String),
     Undefined,
     Null,
     Bool(bool),
@@ -23,6 +50,10 @@ pub enum Literal {
 }
 #[derive(Debug, Clone)]
 pub enum ExprKind {
+    Import(Box<Expr>),
+    ImportMeta,
+    Await(Box<Expr>),
+    Yield(Option<Box<Expr>>, bool),
     Literal(Literal),
     Name(String),
     This,
@@ -89,6 +120,8 @@ pub struct Declaration {
 }
 #[derive(Debug, Clone)]
 pub struct Function {
+    pub asynchronous: bool,
+    pub generator: bool,
     pub name: Option<String>,
     pub params: Vec<Pattern>,
     pub body: Vec<Stmt>,
@@ -128,7 +161,7 @@ pub enum StmtKind {
     While(Expr, Box<Stmt>),
     DoWhile(Box<Stmt>, Expr),
     For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
-    ForEach(ForBinding, Expr, Box<Stmt>, bool),
+    ForEach(ForBinding, Expr, Box<Stmt>, bool, bool),
     Return(Option<Expr>),
     Throw(Expr),
     Break(Option<String>),

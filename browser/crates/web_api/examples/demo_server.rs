@@ -10,6 +10,14 @@ const SCRIPT: &str = include_str!("../../shell/tests/fixtures/web-demo/demo.js")
 const STYLE: &str = include_str!("../../shell/tests/fixtures/web-demo/style.css");
 const WORKER: &str = include_str!("../../shell/tests/fixtures/web-demo/worker.js");
 const BADGE: &str = include_str!("../../shell/tests/fixtures/web-demo/badge.svg");
+const MODERN_INDEX: &str = include_str!("../../shell/tests/fixtures/modern-demo/index.html");
+const MODERN_APP: &str = include_str!("../../shell/tests/fixtures/modern-demo/app.js");
+const MODERN_API: &str = include_str!("../../shell/tests/fixtures/modern-demo/api.js");
+const MODERN_STORE: &str = include_str!("../../shell/tests/fixtures/modern-demo/store.js");
+const MODERN_VIEW: &str = include_str!("../../shell/tests/fixtures/modern-demo/view.js");
+const MODERN_DETAILS: &str = include_str!("../../shell/tests/fixtures/modern-demo/details.js");
+const MODERN_WORKER: &str = include_str!("../../shell/tests/fixtures/modern-demo/worker.js");
+const MODERN_STYLE: &str = include_str!("../../shell/tests/fixtures/modern-demo/style.css");
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> io::Result<()> {
     let port = std::env::args()
@@ -20,6 +28,12 @@ async fn main() -> io::Result<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let origin = format!("http://{}", listener.local_addr()?);
     println!("PHASE7_DEMO {origin}/");
+    println!("PHASE8_DEMO {origin}/modern/");
+    let board = Arc::new(std::sync::Mutex::new(vec![
+        serde_json::json!({"id":1,"title":"Explore live module bindings","completed":false}),
+        serde_json::json!({"id":2,"title":"Verify async fetch and microtasks","completed":false}),
+        serde_json::json!({"id":3,"title":"Keep workers isolated","completed":true}),
+    ]));
     let slots = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
         let (stream, _) = listener.accept().await?;
@@ -27,17 +41,22 @@ async fn main() -> io::Result<()> {
             continue;
         };
         let origin = origin.clone();
+        let board = board.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(error) =
-                tokio::time::timeout(Duration::from_secs(30), serve(stream, origin)).await
+                tokio::time::timeout(Duration::from_secs(30), serve(stream, origin, board)).await
             {
                 eprintln!("demo request deadline: {error}");
             }
         });
     }
 }
-async fn serve(mut stream: TcpStream, origin: String) -> io::Result<()> {
+async fn serve(
+    mut stream: TcpStream,
+    origin: String,
+    board: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> io::Result<()> {
     let mut peek = [0; 1024];
     let n = stream.peek(&mut peek).await?;
     if String::from_utf8_lossy(&peek[..n]).starts_with("GET /ws ") {
@@ -94,6 +113,13 @@ async fn serve(mut stream: TcpStream, origin: String) -> io::Result<()> {
     }
     let mut extra = String::new();
     let (mime,body)=match path{
+        "/modern/app.js"=>("text/javascript",MODERN_APP.into()),"/modern/api.js"=>("text/javascript",MODERN_API.into()),"/modern/store.js"=>("text/javascript",MODERN_STORE.into()),"/modern/view.js"=>("text/javascript",MODERN_VIEW.into()),"/modern/details.js"=>("text/javascript",MODERN_DETAILS.into()),"/modern/worker.js"=>("text/javascript",MODERN_WORKER.into()),"/modern/style.css"=>("text/css",MODERN_STYLE.into()),
+        path if path.starts_with("/modern")=>("text/html",MODERN_INDEX.into()),
+        path if path=="/api/tasks"||path.starts_with("/api/tasks/")=>{
+            let method=header.split_whitespace().next().unwrap_or("GET");let input=serde_json::from_slice::<serde_json::Value>(&data[end..end+length]).unwrap_or_default();let mut rows=board.lock().unwrap_or_else(|e|e.into_inner());
+            let value=if method=="POST"&&rows.len()<1000{let id=rows.iter().filter_map(|row|row["id"].as_u64()).max().unwrap_or(0)+1;let title=input["title"].as_str().unwrap_or("Untitled").chars().take(120).collect::<String>();let item=serde_json::json!({"id":id,"title":title,"completed":false});rows.push(item.clone());serde_json::json!({"item":item})}else if method=="PATCH"{let id=path.rsplit('/').next().and_then(|id|id.parse::<u64>().ok()).unwrap_or(0);let item=rows.iter_mut().find(|row|row["id"].as_u64()==Some(id));if let Some(item)=item{item["completed"]=serde_json::Value::Bool(input["completed"].as_bool().unwrap_or(false));serde_json::json!({"item":item})}else{serde_json::json!({"error":"not found"})}}else{serde_json::json!({"items":*rows})};
+            ("application/json",value.to_string())
+        },
         "/demo.js"=>("text/javascript",SCRIPT.to_owned()),"/style.css"=>("text/css",STYLE.to_owned()),"/worker.js"=>("text/javascript",WORKER.to_owned()),"/badge.svg"=>("image/svg+xml",BADGE.to_owned()),
         "/api/data"=>("application/json",r#"{"rows":[{"label":"Alpha","value":48},{"label":"Beta","value":62},{"label":"Gamma","value":35},{"label":"Delta","value":55}]}"#.into()),
         "/api/login"=>{let value=serde_json::from_slice::<serde_json::Value>(&data[end..end+length]).unwrap_or_default();let ok=value["username"]=="demo"&&value["password"]=="rust";if ok{extra.push_str("Set-Cookie: session=demo-session; HttpOnly; SameSite=Lax; Max-Age=86400; Path=/\r\n");}("application/json",format!("{{\"loggedIn\":{ok}}}"))},

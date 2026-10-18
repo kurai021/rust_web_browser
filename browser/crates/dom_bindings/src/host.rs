@@ -16,6 +16,50 @@ fn dom(error: html::DomError) -> JsError {
 fn arg(args: &[JsValue], i: usize) -> JsValue {
     args.get(i).cloned().unwrap_or(JsValue::Undefined)
 }
+fn event_handler(key: &str) -> Option<&str> {
+    let name = key.strip_prefix("on")?;
+    matches!(
+        name,
+        "click"
+            | "dblclick"
+            | "input"
+            | "change"
+            | "submit"
+            | "reset"
+            | "keydown"
+            | "keyup"
+            | "keypress"
+            | "focus"
+            | "blur"
+            | "load"
+            | "error"
+            | "message"
+            | "messageerror"
+            | "hashchange"
+            | "popstate"
+            | "beforeunload"
+            | "unload"
+            | "resize"
+            | "scroll"
+            | "mousedown"
+            | "mouseup"
+            | "mousemove"
+            | "mouseover"
+            | "mouseout"
+            | "mouseenter"
+            | "mouseleave"
+            | "pointerdown"
+            | "pointerup"
+            | "pointermove"
+            | "wheel"
+            | "contextmenu"
+            | "unhandledrejection"
+            | "rejectionhandled"
+            | "online"
+            | "offline"
+    )
+    .then_some(name)
+}
 fn string(vm: &mut Vm, args: &[JsValue], i: usize) -> Result<String, JsError> {
     vm.to_string(arg(args, i))
 }
@@ -60,6 +104,7 @@ pub(crate) fn install(vm: &mut Vm, state: &Rc<RefCell<State>>) -> Result<(), JsE
         "removeChild",
         "insertBefore",
         "replaceChild",
+        "replaceChildren",
         "cloneNode",
         "contains",
         "insertAdjacentHTML",
@@ -96,6 +141,9 @@ pub(crate) fn install(vm: &mut Vm, state: &Rc<RefCell<State>>) -> Result<(), JsE
         state.borrow_mut().functions.insert(name.into(), function);
     }
     for name in [
+        "addEventListener",
+        "removeEventListener",
+        "dispatchEvent",
         "setTimeout",
         "setInterval",
         "clearTimeout",
@@ -138,10 +186,12 @@ pub(crate) fn install(vm: &mut Vm, state: &Rc<RefCell<State>>) -> Result<(), JsE
         "onload",
         "onbeforeunload",
         "onunload",
+        "onunhandledrejection",
+        "onrejectionhandled",
     ] {
         vm.set_global(name, JsValue::Null)?;
     }
-    Ok(())
+    crate::modern_dom::install(vm, state)
 }
 impl DomHost {
     fn function(&self, name: &str) -> Option<JsValue> {
@@ -226,6 +276,7 @@ impl DomHost {
                 if let Some(source) = state.document.get_attribute(node, &format!("on{name}")) {
                     let function = vm.compile_event_handler(source)?;
                     queue.push(Listener {
+                        handler: true,
                         node,
                         event: name.clone(),
                         callback: function,
@@ -266,6 +317,29 @@ impl DomHost {
     }
 }
 impl HostHooks for DomHost {
+    fn import_module(
+        &mut self,
+        vm: &mut Vm,
+        url: &str,
+        referrer: &str,
+    ) -> Result<JsValue, JsError> {
+        if let Some(extension) = &mut self.extension {
+            return extension.import_module(vm, url, referrer);
+        }
+        Err(error("module loader unavailable"))
+    }
+    fn after_operation(&mut self, vm: &mut Vm) -> Result<(), JsError> {
+        if let Some(extension) = &mut self.extension {
+            extension.after_operation(vm)?;
+        }
+        Ok(())
+    }
+    fn microtask(&mut self, vm: &mut Vm, token: u64) -> Result<HostResult, JsError> {
+        if let Some(extension) = &mut self.extension {
+            return extension.microtask(vm, token);
+        }
+        Ok(HostResult::value(JsValue::Undefined))
+    }
     fn fork(&self) -> Option<Box<dyn HostHooks>> {
         Some(Box::new(Self {
             state: self.state.clone(),
@@ -292,7 +366,10 @@ impl HostHooks for DomHost {
         for line in &state.console {
             bytes = bytes.saturating_add(line.capacity());
         }
-        bytes.saturating_add(self.extension.as_ref().map_or(0, |e| e.retained_bytes()))
+        bytes
+            .saturating_add(state.owners.len() * 48)
+            .saturating_add(state.inert_documents.len() * 32)
+            .saturating_add(self.extension.as_ref().map_or(0, |e| e.retained_bytes()))
     }
     fn print(&mut self, s: &str) {
         let mut state = self.state.borrow_mut();
@@ -321,15 +398,22 @@ impl HostHooks for DomHost {
                 )),
                 "devicePixelRatio" => Some(JsValue::Number(1.0)),
                 "addEventListener" | "removeEventListener" | "dispatchEvent" => self.function(key),
-                key if key.starts_with("on") => Some(
+                key if event_handler(key).is_some() => Some(
                     self.state
                         .borrow()
                         .listeners
                         .iter()
-                        .find(|l| l.node == 0 && l.event == key[2..] && !l.inline)
+                        .find(|l| l.node == 0 && l.event == key[2..] && l.handler)
                         .map_or(JsValue::Null, |l| l.callback.clone()),
                 ),
                 _ => None,
+            });
+        }
+        if (PARSER_BASE..PARSER_END).contains(&id) {
+            return Ok(if key == "parseFromString" {
+                self.function(key)
+            } else {
+                None
             });
         }
         if id >= EVENT_BASE {
@@ -339,6 +423,14 @@ impl HostHooks for DomHost {
             };
             return Ok(match key {
                 "type" => Some(JsValue::string(&event.name)),
+                "target"
+                    if matches!(
+                        event.name.as_str(),
+                        "unhandledrejection" | "rejectionhandled"
+                    ) =>
+                {
+                    Some(vm.global_value())
+                }
                 "target" => Some(wrap(vm, &state.document, Some(event.target))?),
                 "currentTarget" => Some(if event.phase == 0 {
                     JsValue::Null
@@ -355,7 +447,7 @@ impl HostHooks for DomHost {
                 "timeStamp" => Some(JsValue::Number(event.timestamp)),
                 "detail" => Some(event.detail.clone()),
                 "state" | "data" => Some(event.detail.clone()),
-                "oldURL" | "newURL" => {
+                "oldURL" | "newURL" | "promise" | "reason" => {
                     let detail = event.detail.clone();
                     drop(state);
                     return Ok(Some(if detail.object().is_some() {
@@ -386,6 +478,17 @@ impl HostHooks for DomHost {
         }
         let node = node_id(id).ok_or_else(|| error("invalid host"))?;
         let kind = id % 8;
+        if kind == 4 {
+            let attribute = crate::modern_dom::data_attribute(key)?;
+            return Ok(Some(
+                self.state
+                    .borrow()
+                    .document
+                    .get_attribute(node, &attribute)
+                    .map(JsValue::string)
+                    .unwrap_or(JsValue::Undefined),
+            ));
+        }
         if kind == 1 || kind == 3 {
             if matches!(key, "setProperty" | "getPropertyValue" | "removeProperty") {
                 return Ok(self.function(key));
@@ -510,13 +613,13 @@ impl HostHooks for DomHost {
                     }
                     values.push(wrap(vm, document, Some(child))?);
                 }
-                vm.array(values)?
+                crate::modern_dom::list(vm, &state, values)?
             }
             "ownerDocument" => {
-                if node == 0 {
+                if matches!(n.data, NodeData::Document) {
                     JsValue::Null
                 } else {
-                    wrap(vm, document, Some(0))?
+                    wrap(vm, document, Some(state.owner(node)))?
                 }
             }
             "textContent" => {
@@ -536,6 +639,7 @@ impl HostHooks for DomHost {
             "id" => JsValue::string(document.get_attribute(node, "id").unwrap_or("")),
             "className" => JsValue::string(document.get_attribute(node, "class").unwrap_or("")),
             "classList" => vm.host_object(node_host(node, 2), "DOMTokenList")?,
+            "dataset" => vm.host_object(node_host(node, 4), "DOMStringMap")?,
             "style" => vm.host_object(node_host(node, 1), "CSSStyleDeclaration")?,
             "value" => JsValue::string(document.control_value(node)),
             "defaultValue" => JsValue::string(document.get_attribute(node, "value").unwrap_or("")),
@@ -560,11 +664,36 @@ impl HostHooks for DomHost {
             "alt" | "name" | "placeholder" => {
                 JsValue::string(document.get_attribute(node, key).unwrap_or(""))
             }
-            "documentElement" => wrap(vm, document, document.document_element())?,
-            "body" => wrap(vm, document, document.body())?,
-            "head" => wrap(vm, document, document.head())?,
+            "documentElement" => wrap(
+                vm,
+                document,
+                if node == 0 {
+                    document.document_element()
+                } else {
+                    n.children
+                        .iter()
+                        .copied()
+                        .find(|&n| matches!(document.get(n).data, NodeData::Element(_)))
+                },
+            )?,
+            "body" | "head" => wrap(
+                vm,
+                document,
+                document
+                    .elements_from(node)
+                    .into_iter()
+                    .find(|&id| document.is_element_named(id, key)),
+            )?,
+            "location" if node != 0 && state.inert_documents.contains(&node) => JsValue::Null,
             "title" => JsValue::string(document.title().unwrap_or_default()),
             "readyState" => JsValue::string(&state.ready),
+            "defaultView" if matches!(n.data, NodeData::Document) => {
+                if node == 0 {
+                    vm.global_value()
+                } else {
+                    JsValue::Null
+                }
+            }
             "visibilityState" => JsValue::string("visible"),
             "referrer" => JsValue::string(""),
             "domain" => JsValue::string(state.url.host_str().unwrap_or("")),
@@ -587,10 +716,10 @@ impl HostHooks for DomHost {
                     .control_state(node)
                     .map_or("", |c| c.validation_message.as_str()),
             ),
-            s if s.starts_with("on") => state
+            s if event_handler(s).is_some() => state
                 .listeners
                 .iter()
-                .find(|l| l.node == node && l.event == s[2..])
+                .find(|l| l.node == node && l.event == s[2..] && l.handler)
                 .map_or(JsValue::Null, |l| l.callback.clone()),
             _ => return Ok(None),
         };
@@ -602,7 +731,7 @@ impl HostHooks for DomHost {
                 return Ok(true);
             }
         }
-        if id == WINDOW && !key.starts_with("on") {
+        if id == WINDOW && event_handler(key).is_none() {
             return Ok(false);
         }
         let id = if id == WINDOW { 0 } else { id };
@@ -627,6 +756,17 @@ impl HostHooks for DomHost {
         }
         let node = node_id(id).ok_or_else(|| error("invalid host"))?;
         let kind = id % 8;
+        if kind == 4 {
+            let attribute = crate::modern_dom::data_attribute(key)?;
+            let value = vm.to_string(value)?;
+            let mut state = self.state.borrow_mut();
+            state
+                .document
+                .set_attribute(node, &attribute, &value)
+                .map_err(dom)?;
+            state.changed();
+            return Ok(true);
+        }
         if kind == 3 {
             return Err(error("computed style is read-only"));
         }
@@ -654,13 +794,14 @@ impl HostHooks for DomHost {
             state.changed();
             return Ok(true);
         }
-        if let Some(event) = key.strip_prefix("on") {
+        if let Some(event) = event_handler(key) {
             let mut state = self.state.borrow_mut();
             state
                 .listeners
-                .retain(|l| !(l.node == node && l.event == event));
+                .retain(|l| !(l.node == node && l.event == event && l.handler));
             if vm.callable(&value) {
                 state.listeners.push(Listener {
+                    handler: true,
                     node,
                     event: event.into(),
                     callback: value,
@@ -835,6 +976,37 @@ impl HostHooks for DomHost {
                 state.next += 1;
                 vm.host_object(EVENT_TARGET_BASE + state.next * 8, "EventTarget")?
             }
+            "DOMParser" => {
+                let mut state = self.state.borrow_mut();
+                state.next += 1;
+                vm.host_object(PARSER_BASE + state.next, "DOMParser")?
+            }
+            "parseFromString" => {
+                if !(PARSER_BASE..PARSER_END).contains(&host) {
+                    return Err(error("DOMParser receiver"));
+                }
+                let source = string(vm, args, 0)?;
+                let mime = string(vm, args, 1)?;
+                if mime != "text/html" {
+                    return Err(error("DOMParser currently accepts text/html"));
+                }
+                crate::modern_dom::parse(vm, &self.state, source)?
+            }
+            "NodeList" => return Err(error("illegal NodeList constructor")),
+            "NodeList.item" => {
+                let index = vm.to_number(arg(args, 0))?.trunc() as u32;
+                let length = vm.get(this.clone(), "length")?;
+                let length = vm.to_number(length)?;
+                if index as f64 >= length {
+                    JsValue::Null
+                } else {
+                    vm.get(this, &index.to_string())?
+                }
+            }
+            "replaceChildren" => {
+                crate::modern_dom::replace_children(vm, &self.state, node, args)?;
+                JsValue::Undefined
+            }
             "Node" | "Element" | "Document" | "HTMLElement" => {
                 return Err(error("illegal DOM constructor"))
             }
@@ -887,6 +1059,7 @@ impl HostHooks for DomHost {
                     return Err(JsError::new(ErrorKind::MemoryLimit, "DOM node budget"));
                 }
                 let id = state.document.create_element(&tag, Namespace::Html);
+                state.adopt(id, node);
                 wrap(vm, &state.document, Some(id))?
             }
             "createTextNode" | "createDocumentFragment" => {
@@ -900,12 +1073,27 @@ impl HostHooks for DomHost {
                     return Err(JsError::new(ErrorKind::MemoryLimit, "DOM node budget"));
                 }
                 let id = state.document.create_node(data);
+                state.adopt(id, node);
                 wrap(vm, &state.document, Some(id))?
             }
             "getElementById" => {
                 let id = string(vm, args, 0)?;
                 let state = self.state.borrow();
-                wrap(vm, &state.document, state.document.get_element_by_id(&id))?
+                wrap(
+                    vm,
+                    &state.document,
+                    if node == 0 {
+                        state.document.get_element_by_id(&id)
+                    } else {
+                        state
+                            .document
+                            .elements_from(node)
+                            .into_iter()
+                            .find(|&node| {
+                                state.document.get_attribute(node, "id") == Some(id.as_str())
+                            })
+                    },
+                )?
             }
             "querySelector" | "querySelectorAll" | "matches" | "closest" => {
                 let selector = string(vm, args, 0)?;
@@ -938,7 +1126,7 @@ impl HostHooks for DomHost {
                         for n in nodes {
                             values.push(wrap(vm, &self.state.borrow().document, Some(n))?);
                         }
-                        vm.array(values)?
+                        crate::modern_dom::list(vm, &self.state.borrow(), values)?
                     }
                 }
             }
@@ -1019,6 +1207,7 @@ impl HostHooks for DomHost {
                     }
                     state.document.detach(child);
                 } else {
+                    state.adopt(child, node);
                     state
                         .document
                         .append_checked(node, child, reference)
@@ -1054,6 +1243,7 @@ impl HostHooks for DomHost {
                             .create_node(NodeData::Text(text))
                     };
                     let mut state = self.state.borrow_mut();
+                    state.adopt(child, node);
                     let before = if name == "prepend" {
                         state.document.get(node).children.first().copied()
                     } else {
@@ -1305,6 +1495,7 @@ impl HostHooks for DomHost {
                         return Err(JsError::new(ErrorKind::MemoryLimit, "listener budget"));
                     }
                     state.listeners.push(Listener {
+                        handler: false,
                         node,
                         event,
                         callback,
@@ -1591,8 +1782,45 @@ impl HostHooks for DomHost {
                 .mutation_roots()
                 .map(|node| node_host(node, 0)),
         );
+        let state = self.state.borrow();
+        for host in live {
+            if let Some(node) = node_id(*host) {
+                let owner = state.owner(node);
+                if owner != 0 {
+                    result.push(node_host(owner, 0));
+                }
+            }
+        }
+        drop(state);
         if let Some(extension) = &self.extension {
             result.extend(extension.host_references(live));
+        }
+        result
+    }
+    fn trace_native_edges(&self, live: &HashSet<u64>, candidates: &HashSet<u64>) -> Vec<u64> {
+        let state = self.state.borrow();
+        let mut marked = HashSet::new();
+        let mut work = vec![0];
+        work.extend(live.iter().copied().filter_map(node_id));
+        while let Some(id) = work.pop() {
+            if !marked.insert(id) {
+                continue;
+            }
+            if let Some(node) = state.document.try_get(id) {
+                work.extend(node.children.iter().copied());
+                work.extend(node.parent);
+                if let Some(fragment) = state.document.template_contents(id) {
+                    work.push(fragment);
+                }
+            }
+        }
+        let mut result = candidates
+            .iter()
+            .copied()
+            .filter(|id| node_id(*id).is_some_and(|node| marked.contains(&node)))
+            .collect::<Vec<_>>();
+        if let Some(extension) = &self.extension {
+            result.extend(extension.trace_native_edges(live, candidates));
         }
         result
     }
@@ -1620,6 +1848,19 @@ impl HostHooks for DomHost {
         });
         state.events.retain(|id, _| live.contains(id));
         state.document.sweep_detached(&roots);
+        let documents = state
+            .inert_documents
+            .iter()
+            .copied()
+            .filter(|&root| {
+                state
+                    .document
+                    .try_get(root)
+                    .is_some_and(|node| matches!(node.data, NodeData::Document))
+            })
+            .collect::<HashSet<_>>();
+        state.owners.retain(|_, owner| documents.contains(owner));
+        state.inert_documents = documents;
         if state
             .focused
             .is_some_and(|node| !state.document.contains(0, node))

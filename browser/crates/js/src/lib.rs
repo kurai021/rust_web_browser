@@ -2,16 +2,21 @@
 //! External crates supply JSON/regular-expression/date auxiliaries, not JS.
 
 pub mod ast;
+pub mod bigint;
 mod builtins;
+pub mod bytecode;
 mod lexer;
 mod parser;
+mod symbols;
 pub mod value;
 mod vm;
 mod wire;
+pub use vm::modules::resolve_module_url;
+pub use vm::promises::PromiseNotification;
 pub use wire::{CloneData, CloneNode, CloneValue};
 
 pub use ast::Program;
-pub use parser::{parse, ParseOpts};
+pub use parser::{parse, parse_module, ParseOpts};
 pub use value::{JsValue, ObjectId, PropertyKey};
 pub use vm::{HostHooks, HostResult, Limits, NullHost, Vm};
 

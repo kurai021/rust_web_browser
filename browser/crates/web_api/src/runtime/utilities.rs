@@ -33,7 +33,7 @@ impl WebHost {
                 let node = node
                     .ok_or_else(|| error(vm, ApiError::new("TypeError", "fullscreen element")))?;
                 let promise = self.permission(vm, "fullscreen")?;
-                if let Some(id) = vm.host_id(&promise) {
+                if let Some(id) = self.promise_token(&promise) {
                     self.state.borrow_mut().fullscreen_requests.insert(id, node);
                 }
                 promise
@@ -627,7 +627,7 @@ impl WebHost {
                     return self.ready(vm, Ok(JsValue::Bool(false))).map(Some);
                 }
                 let promise = self.permission(vm, "persistent-storage")?;
-                if let Some(id) = vm.host_id(&promise) {
+                if let Some(id) = self.promise_token(&promise) {
                     let mut state = self.state.borrow_mut();
                     if let Some(Object {
                         kind:

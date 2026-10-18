@@ -314,6 +314,23 @@ pub(crate) fn install(vm: &mut Vm) {
     for key in ["test", "exec", "toString"] {
         method(vm, vm.regexp_proto, key, &format!("RegExp.prototype.{key}"));
     }
+    for (key, name) in [
+        (crate::symbols::MATCH, "match"),
+        (crate::symbols::REPLACE, "replace"),
+        (crate::symbols::SEARCH, "search"),
+        (crate::symbols::SPLIT, "split"),
+    ] {
+        if let Ok(value) = vm.native(&format!("RegExp.symbol.{name}")) {
+            let _ = vm.define(
+                vm.regexp_proto,
+                PropertyKey::Symbol(key),
+                Property {
+                    enumerable: false,
+                    ..Property::data(value)
+                },
+            );
+        }
+    }
     method(vm, vm.error_proto, "toString", "Error.prototype.toString");
     for (constructor, keys) in [
         (
@@ -437,6 +454,27 @@ pub(crate) fn call(
     construct: bool,
     env: Option<usize>,
 ) -> Result<JsValue, JsError> {
+    if let Some(result) = vm.promise_builtin(name, this.clone(), &args, construct) {
+        return result;
+    }
+    if let Some(result) = vm.iterator_builtin(name, this.clone(), &args) {
+        return result;
+    }
+    if let Some(result) = vm.bigint_builtin(name, this.clone(), &args, construct) {
+        return result;
+    }
+    if let Some(result) = vm.generator_builtin(name, this.clone(), &args) {
+        return result;
+    }
+    if let Some(result) = vm.collection_builtin(name, this.clone(), &args, construct) {
+        return result;
+    }
+    if let Some(result) = vm.proxy_builtin(name, this.clone(), &args, construct) {
+        return result;
+    }
+    if let Some(result) = vm.symbol_builtin(name, this.clone(), &args, construct) {
+        return result;
+    }
     if name.starts_with("console.") {
         if name == "console.assert" && arg(&args, 0).truthy() {
             return Ok(JsValue::Undefined);
@@ -466,6 +504,19 @@ pub(crate) fn call(
     }
     if let Some(method) = name.strip_prefix("Date.prototype.") {
         return date_call(vm, method, this, &args);
+    }
+    if let Some(method) = name.strip_prefix("RegExp.symbol.") {
+        if !this.object().is_some_and(|id| {
+            vm.heap
+                .get(id)
+                .is_ok_and(|o| matches!(o.kind, ObjectKind::RegExp { .. }))
+        }) {
+            return Err(error("RegExp symbol receiver"));
+        }
+        let input = arg(&args, 0);
+        let mut values = vec![this];
+        values.extend(args.iter().skip(1).cloned());
+        return string_call_value(vm, method, input, &values);
     }
     if let Some(method) = name.strip_prefix("RegExp.prototype.") {
         return regexp_call(vm, method, this, &args);
@@ -593,11 +644,7 @@ pub(crate) fn call(
             if matches!(value, JsValue::Null | JsValue::Undefined) {
                 vm.object()
             } else {
-                let prototype = match value {
-                    JsValue::String(_) => vm.string_proto,
-                    JsValue::Bool(_) => vm.boolean_proto,
-                    _ => vm.number_proto,
-                };
+                let prototype = vm.primitive_prototype(&value);
                 Ok(JsValue::Object(
                     vm.allocate(ObjectKind::Boxed(value), Some(prototype))?,
                 ))
@@ -624,22 +671,64 @@ pub(crate) fn call(
         )),
         "Array.of" => vm.array(args),
         "Array.from" => {
-            let values = vm.array_values(arg(&args, 0))?;
-            if vm.callable(&arg(&args, 1)) {
-                let mut mapped = Vec::new();
-                for (i, v) in values.into_iter().enumerate() {
-                    mapped.push(vm.call_inner(
-                        arg(&args, 1),
+            let input = arg(&args, 0);
+            let callback = arg(&args, 1);
+            if callback != JsValue::Undefined && !vm.callable(&callback) {
+                return Err(error("Array.from mapper is not callable"));
+            }
+            let iterable =
+                vm.get_key(input.clone(), PropertyKey::Symbol(crate::symbols::ITERATOR))?;
+            let mut iterator = if matches!(iterable, JsValue::Undefined | JsValue::Null) {
+                None
+            } else {
+                Some(vm.get_iterator(input.clone())?)
+            };
+            let mut out = Vec::new();
+            let length = if iterator.is_none() {
+                vm.array_length(input.clone())?
+            } else {
+                0
+            };
+            loop {
+                let value = if let Some(iterator) = &mut iterator {
+                    vm.iterator_step(iterator)?
+                } else if out.len() < length {
+                    Some(vm.get(input.clone(), &out.len().to_string())?)
+                } else {
+                    None
+                };
+                let Some(value) = value else {
+                    break;
+                };
+                if out.len() >= 100_000 {
+                    return Err(JsError::new(
+                        ErrorKind::MemoryLimit,
+                        "Array.from item quota",
+                    ));
+                }
+                let value = if callback != JsValue::Undefined {
+                    match vm.call_inner(
+                        callback.clone(),
                         arg(&args, 2),
-                        vec![v, JsValue::Number(i as f64)],
+                        vec![value, JsValue::Number(out.len() as f64)],
                         false,
                         None,
-                    )?);
-                }
-                vm.array(mapped)
-            } else {
-                vm.array(values)
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if let Some(iterator) = &mut iterator {
+                                let _ = vm.close_iterator(iterator);
+                            }
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    value
+                };
+                vm.check_temporary((out.len() + 1) * 64)?;
+                out.push(value);
             }
+            vm.array(out)
         }
         "String" => {
             let s = if args.is_empty() {
@@ -681,7 +770,12 @@ pub(crate) fn call(
             let value = JsValue::Number(if args.is_empty() {
                 0.0
             } else {
-                vm.to_number(args[0].clone())?
+                let primitive = vm.coerce_primitive(args[0].clone(), true)?;
+                if let JsValue::BigInt(value) = primitive {
+                    value.to_f64()
+                } else {
+                    vm.to_number(primitive)?
+                }
             });
             if construct {
                 Ok(JsValue::Object(vm.allocate(
@@ -903,8 +997,32 @@ pub(crate) fn call(
             vm.define(
                 id,
                 "message".into(),
-                Property::data(JsValue::string(message)),
+                Property {
+                    enumerable: false,
+                    ..Property::data(JsValue::string(&message))
+                },
             )?;
+            let stack = format!("{name}: {message}\n{}", vm.current_stack().join("\n"));
+            vm.define(
+                id,
+                "stack".into(),
+                Property {
+                    enumerable: false,
+                    ..Property::data(JsValue::string(stack))
+                },
+            )?;
+            let options = arg(&args, 1);
+            if options.object().is_some() && vm.has(options.clone(), "cause".into())? {
+                let cause = vm.get(options, "cause")?;
+                vm.define(
+                    id,
+                    "cause".into(),
+                    Property {
+                        enumerable: false,
+                        ..Property::data(cause)
+                    },
+                )?;
+            }
             Ok(JsValue::Object(id))
         }
         "Error.prototype.toString" => {
@@ -976,7 +1094,17 @@ fn object_call(
     match method {
         "prototype.valueOf" => Ok(this),
         "prototype.toString" => {
+            if !matches!(this, JsValue::Null | JsValue::Undefined) {
+                let tag = vm.get_key(
+                    this.clone(),
+                    PropertyKey::Symbol(crate::symbols::TO_STRING_TAG),
+                )?;
+                if let JsValue::String(tag) = tag {
+                    return Ok(JsValue::string(format!("[object {tag}]")));
+                }
+            }
             let tag = match &this {
+                JsValue::BigInt(_) => "BigInt",
                 JsValue::Undefined => "Undefined",
                 JsValue::Null => "Null",
                 JsValue::String(_) => "String",
@@ -999,11 +1127,12 @@ fn object_call(
         }
         "prototype.hasOwnProperty" | "prototype.propertyIsEnumerable" => {
             let key = vm.property_key(arg(args, 0))?;
-            let result = this
-                .object()
-                .and_then(|id| vm.heap.get(id).ok())
-                .and_then(|o| o.properties.get(&key))
-                .is_some_and(|p| method == "prototype.hasOwnProperty" || p.enumerable);
+            let result = if this.object().is_some() {
+                vm.own_descriptor(this, &key)?
+                    .is_some_and(|p| method == "prototype.hasOwnProperty" || p.enumerable)
+            } else {
+                false
+            };
             Ok(JsValue::Bool(result))
         }
         "prototype.isPrototypeOf" => {
@@ -1033,7 +1162,7 @@ fn object_call(
                         Some(JsValue::string(s))
                     }
                     PropertyKey::Symbol(id) if method == "getOwnPropertySymbols" => {
-                        Some(JsValue::Symbol(id, "".into()))
+                        Some(vm.symbol_value(id))
                     }
                     _ => None,
                 })
@@ -1051,45 +1180,25 @@ fn object_call(
             }
             Ok(object)
         }
-        "getPrototypeOf" => {
-            let id = arg(args, 0)
-                .object()
-                .ok_or_else(|| error("getPrototypeOf expects object"))?;
-            Ok(vm
-                .heap
-                .get(id)?
-                .prototype
-                .map(JsValue::Object)
-                .unwrap_or(JsValue::Null))
-        }
+        "getPrototypeOf" => vm.object_prototype(arg(args, 0)),
         "setPrototypeOf" => {
             let object = arg(args, 0);
-            let id = object
-                .object()
-                .ok_or_else(|| error("setPrototypeOf target"))?;
             let proto = arg(args, 1);
-            if !matches!(proto, JsValue::Object(_) | JsValue::Null) {
-                return Err(error("invalid prototype"));
+            if !vm.set_object_prototype(object.clone(), proto)? {
+                return Err(error("setPrototypeOf rejected"));
             }
-            let mut current = proto.object();
-            let mut seen = HashSet::new();
-            while let Some(p) = current {
-                if p == id || !seen.insert(p) {
-                    return Err(error("cyclic prototype"));
-                }
-                current = vm.heap.get(p)?.prototype;
-            }
-            vm.heap.get_mut(id)?.prototype = proto.object();
             Ok(object)
         }
         "defineProperty" => {
             let object = arg(args, 0);
-            let id = object
+            object
                 .object()
                 .ok_or_else(|| error("defineProperty expects object"))?;
             let key = vm.property_key(arg(args, 1))?;
-            let descriptor = descriptor(vm, arg(args, 2))?;
-            vm.define(id, key, descriptor)?;
+            let descriptor = vm.read_descriptor(arg(args, 2))?;
+            if !vm.reflect_define_partial(object.clone(), key, descriptor)? {
+                return Err(error("defineProperty rejected"));
+            }
             Ok(object)
         }
         "defineProperties" => {
@@ -1099,9 +1208,8 @@ fn object_call(
         }
         "getOwnPropertyDescriptor" => {
             let object = arg(args, 0);
-            let id = object.object().ok_or_else(|| error("descriptor target"))?;
             let key = vm.property_key(arg(args, 1))?;
-            let Some(property) = vm.heap.get(id)?.properties.get(&key).cloned() else {
+            let Some(property) = vm.own_descriptor(object, &key)? else {
                 return Ok(JsValue::Undefined);
             };
             let result = vm.object()?;
@@ -1142,35 +1250,54 @@ fn object_call(
         }
         "freeze" | "seal" | "preventExtensions" => {
             let value = arg(args, 0);
-            if let Some(id) = value.object() {
-                let object = vm.heap.get_mut(id)?;
-                object.extensible = false;
-                for p in object.properties.values_mut() {
-                    if method != "preventExtensions" {
-                        p.configurable = false;
-                    }
-                    if method == "freeze" {
-                        p.writable = false;
+            if value.object().is_some() {
+                if !vm.prevent_extensions(value.clone())? {
+                    return Err(error("preventExtensions rejected"));
+                }
+                if method != "preventExtensions" {
+                    for key in vm.keys(&value, false)? {
+                        if let Some(mut property) = vm.own_descriptor(value.clone(), &key)? {
+                            property.configurable = false;
+                            if method == "freeze"
+                                && matches!(property.value, PropertyValue::Data(_))
+                            {
+                                property.writable = false;
+                            }
+                            if !vm.reflect_define(value.clone(), key, property)? {
+                                return Err(error("freeze/seal rejected"));
+                            }
+                        }
                     }
                 }
             }
             Ok(value)
         }
         "isExtensible" | "isFrozen" | "isSealed" => {
-            let result = if let Some(id) = arg(args, 0).object() {
-                let o = vm.heap.get(id)?;
-                match method {
-                    "isExtensible" => o.extensible,
-                    "isFrozen" => {
-                        !o.extensible
-                            && o.properties
-                                .values()
-                                .all(|p| !p.configurable && !p.writable)
-                    }
-                    _ => !o.extensible && o.properties.values().all(|p| !p.configurable),
-                }
-            } else {
+            let value = arg(args, 0);
+            let result = if value.object().is_none() {
                 method != "isExtensible"
+            } else {
+                let extensible = vm.object_extensible(value.clone())?;
+                if method == "isExtensible" {
+                    extensible
+                } else if extensible {
+                    false
+                } else {
+                    let mut result = true;
+                    for key in vm.keys(&value, false)? {
+                        if let Some(p) = vm.own_descriptor(value.clone(), &key)? {
+                            if p.configurable
+                                || method == "isFrozen"
+                                    && matches!(p.value, PropertyValue::Data(_))
+                                    && p.writable
+                            {
+                                result = false;
+                                break;
+                            }
+                        }
+                    }
+                    result
+                }
             };
             Ok(JsValue::Bool(result))
         }
@@ -1188,44 +1315,20 @@ fn object_call(
         _ => Err(error("unknown Object method")),
     }
 }
-fn descriptor(vm: &mut Vm, value: JsValue) -> Result<Property, JsError> {
-    if value.object().is_none() {
-        return Err(error("property descriptor must be object"));
-    }
-    let get = vm.get(value.clone(), "get")?;
-    let set = vm.get(value.clone(), "set")?;
-    let data =
-        vm.has(value.clone(), "value".into())? || vm.has(value.clone(), "writable".into())?;
-    let accessor = get != JsValue::Undefined || set != JsValue::Undefined;
-    if data && accessor {
-        return Err(error("mixed property descriptor"));
-    }
-    if accessor
-        && ((get != JsValue::Undefined && !vm.callable(&get))
-            || (set != JsValue::Undefined && !vm.callable(&set)))
-    {
-        return Err(error("invalid accessor"));
-    }
-    Ok(Property {
-        value: if accessor {
-            PropertyValue::Accessor { get, set }
-        } else {
-            PropertyValue::Data(vm.get(value.clone(), "value")?)
-        },
-        writable: vm.get(value.clone(), "writable")?.truthy(),
-        enumerable: vm.get(value.clone(), "enumerable")?.truthy(),
-        configurable: vm.get(value, "configurable")?.truthy(),
-    })
+pub(crate) fn descriptor(vm: &mut Vm, value: JsValue) -> Result<Property, JsError> {
+    Ok(vm.read_descriptor(value)?.complete(None))
 }
 fn define_properties(vm: &mut Vm, target: JsValue, source: JsValue) -> Result<(), JsError> {
-    let id = target.object().ok_or_else(|| error("descriptor target"))?;
+    target.object().ok_or_else(|| error("descriptor target"))?;
     let mut properties = Vec::new();
     for key in vm.keys(&source, true)? {
         let value = vm.get_key(source.clone(), key.clone())?;
-        properties.push((key, descriptor(vm, value)?));
+        properties.push((key, vm.read_descriptor(value)?));
     }
     for (key, p) in properties {
-        vm.define(id, key, p)?;
+        if !vm.reflect_define_partial(target.clone(), key, p)? {
+            return Err(error("defineProperties rejected"));
+        }
     }
     Ok(())
 }
@@ -1319,13 +1422,22 @@ fn array_call(
             vm.array(removed)
         }
         "concat" => {
-            let mut out = vm.array_values(this)?;
-            for value in args {
-                if value
-                    .object()
-                    .and_then(|id| vm.heap.get(id).ok())
-                    .is_some_and(|o| matches!(o.kind, ObjectKind::Array))
-                {
+            let mut out = Vec::new();
+            for value in std::iter::once(&this).chain(args) {
+                let spread = if value.object().is_some() {
+                    let flag = vm.get_key(
+                        value.clone(),
+                        PropertyKey::Symbol(crate::symbols::IS_CONCAT_SPREADABLE),
+                    )?;
+                    if flag == JsValue::Undefined {
+                        vm.is_array(value)
+                    } else {
+                        flag.truthy()
+                    }
+                } else {
+                    false
+                };
+                if spread {
                     out.extend(vm.array_values(value.clone())?);
                 } else {
                     out.push(value.clone());
@@ -1509,6 +1621,38 @@ fn num_default(vm: &mut Vm, args: &[JsValue], i: usize, default: f64) -> Result<
     }
 }
 fn string_call(
+    vm: &mut Vm,
+    method: &str,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, JsError> {
+    if matches!(this, JsValue::Undefined | JsValue::Null) {
+        return Err(error("String method receiver"));
+    }
+    let symbol = match method {
+        "match" => Some(crate::symbols::MATCH),
+        "replace" => Some(crate::symbols::REPLACE),
+        "search" => Some(crate::symbols::SEARCH),
+        "split" => Some(crate::symbols::SPLIT),
+        _ => None,
+    };
+    if let Some(symbol) = symbol {
+        let pattern = arg(args, 0);
+        if !matches!(pattern, JsValue::Undefined | JsValue::Null) {
+            let method = vm.get_key(pattern.clone(), PropertyKey::Symbol(symbol))?;
+            if !matches!(method, JsValue::Undefined | JsValue::Null) {
+                if !vm.callable(&method) {
+                    return Err(error("symbol string hook is not callable"));
+                }
+                let mut call = vec![this];
+                call.extend(args.iter().skip(1).cloned());
+                return vm.call_inner(method, pattern, call, false, None);
+            }
+        }
+    }
+    string_call_value(vm, method, this, args)
+}
+fn string_call_value(
     vm: &mut Vm,
     method: &str,
     this: JsValue,
@@ -2084,6 +2228,7 @@ fn to_json(
         return Err(JsError::new(ErrorKind::RangeError, "JSON depth"));
     }
     Ok(Some(match value {
+        JsValue::BigInt(_) => return Err(error("BigInt cannot be serialized as JSON")),
         JsValue::Undefined | JsValue::Symbol(..) => return Ok(None),
         JsValue::Null => serde_json::Value::Null,
         JsValue::Bool(b) => b.into(),

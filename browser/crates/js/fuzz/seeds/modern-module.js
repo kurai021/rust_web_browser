@@ -1,0 +1,1 @@
+export const value=await Promise.resolve(42);export default import.meta;export async function read(){var module=await import('./main.js');return module.value;}export async function* stream(){yield* [value,1n];}

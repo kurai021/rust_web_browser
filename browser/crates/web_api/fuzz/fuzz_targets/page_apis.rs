@@ -37,6 +37,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     r.vm.limits = Limits {
+        // ASan fake-stack addresses are not a native stack-depth measurement;
+        // this harness keeps the independent call-depth cap at sixteen.
+        max_native_stack_bytes: usize::MAX,
         max_steps: 10000,
         max_duration: std::time::Duration::from_millis(50),
         max_call_depth: 16,

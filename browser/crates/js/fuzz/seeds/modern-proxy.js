@@ -1,0 +1,1 @@
+var key=Symbol('key');var target={x:1,[key]:2};var proxy=new Proxy(target,{get(t,k,r){return Reflect.get(t,k,r);},defineProperty(t,k,d){return Reflect.defineProperty(t,k,d);},ownKeys(t){return Reflect.ownKeys(t);}});proxy.x++;Object.defineProperty(proxy,'x',{value:3});Object.freeze(proxy);try{proxy.x=4;}catch(e){}Reflect.ownKeys(proxy);

@@ -501,6 +501,12 @@ fn forward_services(
                     Ok(None) => {}
                     Err(error) => {
                         let completion = match fallback {
+                            WebCommand::ModuleLoad { id, .. } => {
+                                Some(web_api::WebCompletion::Module {
+                                    id,
+                                    result: Err(error.clone()),
+                                })
+                            }
                             WebCommand::Fetch { id, .. } => Some(web_api::WebCompletion::Fetch {
                                 id,
                                 result: Err(error.clone()),

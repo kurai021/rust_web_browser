@@ -174,6 +174,7 @@ pub async fn settle(
     Ok(())
 }
 struct Loader<'a> {
+    source_url: Url,
     client: &'a Client,
     document: &'a Url,
     policy: Policy,
@@ -201,7 +202,8 @@ impl Loader<'_> {
         ) {
             return Ok(None);
         }
-        if document.get_attribute(node, "nomodule").is_some() { /* Level 1 supports classic scripts, not modules. */
+        if document.get_attribute(node, "nomodule").is_some() {
+            return Ok(None);
         }
         let nonce = document.get_attribute(node, "nonce");
         let source = if let Some(src) = document.get_attribute(node, "src") {
@@ -236,8 +238,10 @@ impl Loader<'_> {
                 return Err(JsError::new(ErrorKind::Error, "script MIME rejected"));
             }
             self.bytes += fetched.bytes.len();
+            self.source_url = fetched.url.clone();
             String::from_utf8_lossy(&fetched.bytes).into_owned()
         } else {
+            self.source_url = self.document.clone();
             let source = document.text_content(node);
             if !self.policy.inline_allowed(&source, nonce) {
                 return Err(JsError::new(ErrorKind::Error, "CSP blocks inline script"));
@@ -249,6 +253,55 @@ impl Loader<'_> {
             source
         };
         Ok(Some(source))
+    }
+    async fn module(
+        &mut self,
+        runtime: &mut PageRuntime,
+        document: &Document,
+        node: NodeId,
+    ) -> Result<(), JsError> {
+        let nonce = document.get_attribute(node, "nonce").map(str::to_owned);
+        let (source, url) = if let Some(src) = document.get_attribute(node, "src") {
+            (
+                None,
+                self.document
+                    .join(src)
+                    .map_err(|e| JsError::new(ErrorKind::TypeError, e.to_string()))?,
+            )
+        } else {
+            let source = document.text_content(node);
+            if !self.policy.inline_allowed(&source, nonce.as_deref()) {
+                return Err(JsError::new(ErrorKind::Error, "CSP blocks inline module"));
+            }
+            let mut key = self.document.clone();
+            key.set_fragment(Some(&format!("~inline-module-{node}")));
+            (Some(source), key)
+        };
+        if runtime.vm.has_module(url.as_str()) {
+            runtime.vm.begin_task();
+            runtime.vm.evaluate_module_in_task(url.as_str())?;
+            return Ok(());
+        }
+        if self.requests >= MAX_SCRIPT_REQUESTS {
+            return Err(JsError::new(ErrorKind::MemoryLimit, "page module requests"));
+        }
+        let policy = web_api::policy::Csp {
+            inner: self.policy.clone(),
+        };
+        let known = runtime.vm.loaded_module_urls();
+        let graph = tokio::select! {graph=web_api::modules::load_graph_cached(self.client,url,self.document,&policy,nonce,source,&known)=>graph.map_err(|e|JsError::new(ErrorKind::Error,e.to_string()))?,_=wait_cancelled(&self.active)=>return Err(JsError::new(ErrorKind::Cancelled,"module navigation cancelled"))};
+        self.requests += graph.sources.len();
+        self.bytes = self
+            .bytes
+            .saturating_add(graph.sources.iter().map(|s| s.source.len()).sum::<usize>());
+        if self.bytes > MAX_SCRIPT_BYTES || self.requests > MAX_SCRIPT_REQUESTS {
+            return Err(JsError::new(
+                ErrorKind::MemoryLimit,
+                "page module source budget",
+            ));
+        }
+        runtime.eval_module_graph(&graph)?;
+        Ok(())
     }
 }
 
@@ -291,7 +344,10 @@ pub async fn load_scripts_configured(
         config,
     )?;
     runtime.vm.limits.navigation = active.clone();
+    // The shell's JS worker and explicit headless runner use 8 MiB stacks.
+    runtime.vm.limits.max_native_stack_bytes = 4 * 1024 * 1024;
     let mut loader = Loader {
+        source_url: fetched.url.clone(),
         client,
         document: &fetched.url,
         policy,
@@ -315,14 +371,19 @@ pub async fn load_scripts_configured(
                 .find(|node| !seen.contains(node))
             {
                 seen.insert(node);
-                let is_deferred = document.get_attribute(node, "src").is_some()
-                    && (document.get_attribute(node, "defer").is_some()
-                        || document.get_attribute(node, "async").is_some());
+                let is_module = document
+                    .get_attribute(node, "type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("module"));
+                let is_deferred = is_module
+                    || document.get_attribute(node, "src").is_some()
+                        && (document.get_attribute(node, "defer").is_some()
+                            || document.get_attribute(node, "async").is_some());
                 if is_deferred {
                     deferred.push(node);
                 } else {
                     match loader.source(&document, node).await {
                         Ok(Some(source)) => {
+                            runtime.vm.set_source_url(loader.source_url.as_str());
                             if let Err(error) = runtime.eval(&source) {
                                 if error.is_resource_limit() {
                                     return Err(error);
@@ -358,8 +419,22 @@ pub async fn load_scripts_configured(
     runtime.stylesheets(page.stylesheets.clone());
     runtime.set_ready("interactive");
     for node in deferred {
+        let document = runtime.document();
+        if document
+            .get_attribute(node, "type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("module"))
+        {
+            if let Err(error) = loader.module(&mut runtime, &document, node).await {
+                if error.is_resource_limit() {
+                    return Err(error);
+                }
+                errors.push(error.to_string());
+            }
+            continue;
+        }
         match loader.source(&runtime.document(), node).await {
             Ok(Some(source)) => {
+                runtime.vm.set_source_url(loader.source_url.as_str());
                 if let Err(error) = runtime.eval(&source) {
                     if error.is_resource_limit() {
                         return Err(error);

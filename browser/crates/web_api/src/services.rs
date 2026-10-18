@@ -51,6 +51,26 @@ impl Services {
     pub fn dispatch(&mut self, command: Command) -> Result<Option<Command>> {
         self.tasks.retain(|_, task| !task.is_finished());
         match command {
+            Command::ModuleLoad {
+                known,
+                id,
+                url,
+                document,
+                policy,
+            } => {
+                self.capacity()?;
+                let (client, tx) = (self.client.clone(), self.tx.clone());
+                self.tasks.insert(
+                    id,
+                    self.handle.spawn(async move {
+                        let result = crate::modules::load_graph_cached(
+                            &client, url, &document, &policy, None, None, &known,
+                        )
+                        .await;
+                        let _ = tx.send(Completion::Module { id, result }).await;
+                    }),
+                );
+            }
             Command::Fetch {
                 id,
                 request,

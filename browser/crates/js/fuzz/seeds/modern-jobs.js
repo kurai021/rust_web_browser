@@ -1,0 +1,1 @@
+var values=[];async function* source(){try{yield await Promise.resolve(1);yield* [2,3];}finally{values.push('closed');}}async function run(){for await(var value of source()){values.push(value);if(value===2)break;}return values;}run().then(v=>structuredClone(v));queueMicrotask(()=>values.push('micro'));

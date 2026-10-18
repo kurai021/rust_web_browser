@@ -8,6 +8,24 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
+#[path = "bigint_builtins.rs"]
+mod bigint_builtins;
+#[path = "collections.rs"]
+pub(crate) mod collections;
+#[path = "descriptors.rs"]
+pub(crate) mod descriptors;
+#[path = "execution.rs"]
+pub(crate) mod execution;
+#[path = "iterators.rs"]
+pub(crate) mod iterators;
+#[path = "modules.rs"]
+pub(crate) mod modules;
+#[path = "promises.rs"]
+pub(crate) mod promises;
+#[path = "proxy.rs"]
+pub(crate) mod proxy;
+#[path = "symbol_builtins.rs"]
+mod symbol_builtins;
 
 pub struct HostResult {
     pub value: JsValue,
@@ -72,6 +90,15 @@ pub trait HostHooks {
     fn host_references(&self, _live_hosts: &HashSet<u64>) -> Vec<u64> {
         Vec::new()
     }
+    /// Trace native graph edges to already-created wrappers (e.g. DOM children).
+    /// Candidate identities are realm-local and never exposed to JavaScript.
+    fn trace_native_edges(
+        &self,
+        _live_hosts: &HashSet<u64>,
+        _candidates: &HashSet<u64>,
+    ) -> Vec<u64> {
+        Vec::new()
+    }
     fn sweep(&mut self, _live_hosts: &HashSet<u64>) {}
     fn allow_dynamic_code(&self) -> bool {
         true
@@ -80,11 +107,31 @@ pub trait HostHooks {
         0
     }
     fn run_event_loop(&mut self, _vm: &mut Vm) {}
+    fn import_module(
+        &mut self,
+        _vm: &mut Vm,
+        _url: &str,
+        _referrer: &str,
+    ) -> Result<JsValue, JsError> {
+        Err(JsError::new(
+            ErrorKind::TypeError,
+            "no module loader in this realm",
+        ))
+    }
+    fn after_operation(&mut self, _vm: &mut Vm) -> Result<(), JsError> {
+        Ok(())
+    }
+    fn microtask(&mut self, _vm: &mut Vm, _token: u64) -> Result<HostResult, JsError> {
+        Ok(HostResult::value(JsValue::Undefined))
+    }
 }
 pub struct NullHost;
 impl HostHooks for NullHost {}
 #[derive(Clone)]
 pub struct Limits {
+    /// Native-stack headroom. Embedders with an 8 MiB JS thread may raise this
+    /// to 4 MiB; the default leaves room in Rust's 2 MiB test/worker threads.
+    pub max_native_stack_bytes: usize,
     pub navigation: Option<(Arc<AtomicU64>, u64)>,
     pub max_steps: u64,
     pub max_duration: Duration,
@@ -98,6 +145,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_native_stack_bytes: 1024 * 1024,
             navigation: None,
             max_steps: 2_000_000,
             max_duration: Duration::from_secs(5),
@@ -119,6 +167,7 @@ struct Binding {
 }
 #[derive(Clone)]
 struct Environment {
+    aliases: BTreeMap<String, (usize, String)>,
     parent: Option<usize>,
     bindings: BTreeMap<String, Binding>,
     function: bool,
@@ -136,6 +185,33 @@ enum Reference {
     Property(JsValue, PropertyKey),
 }
 pub struct Vm {
+    stack_base: usize,
+    call_stack: Vec<(String, String, Span)>,
+    gc_requested: bool,
+    current_module: Option<usize>,
+    symbol_proto: ObjectId,
+    symbol_registry: BTreeMap<String, JsValue>,
+    registered_symbols: HashSet<u64>,
+    symbol_descriptions: HashMap<u64, Option<String>>,
+    source_url: String,
+    modules: Vec<modules::Module>,
+    module_urls: HashMap<String, usize>,
+    module_loads: HashMap<String, JsValue>,
+    proxy_depth: usize,
+    collection_protos: [ObjectId; 3],
+    generator_proto: ObjectId,
+    async_generator_proto: ObjectId,
+    ast_reference: bool,
+    bigint_proto: ObjectId,
+    promise_proto: ObjectId,
+    promise_ctor: ObjectId,
+    aggregate_error_proto: ObjectId,
+    iterator_proto: ObjectId,
+    microtasks: std::collections::VecDeque<promises::Job>,
+    rejected_promises: Vec<ObjectId>,
+    promise_notifications: Vec<promises::PromiseNotification>,
+    async_errors: Vec<JsError>,
+    draining_microtasks: bool,
     pub(crate) heap: Heap,
     environments: Vec<Option<Environment>>,
     free_env: Vec<usize>,
@@ -173,8 +249,36 @@ impl Vm {
         let function_proto = heap.alloc(Object::new(ObjectKind::Ordinary, Some(object_proto)));
         let global = heap.alloc(Object::new(ObjectKind::Ordinary, Some(object_proto)));
         let mut vm = Self {
+            stack_base: 0,
+            call_stack: Vec::new(),
+            gc_requested: false,
+            current_module: None,
+            symbol_proto: object_proto,
+            symbol_registry: BTreeMap::new(),
+            registered_symbols: HashSet::new(),
+            symbol_descriptions: HashMap::new(),
+            source_url: String::new(),
+            modules: Vec::new(),
+            module_urls: HashMap::new(),
+            module_loads: HashMap::new(),
+            proxy_depth: 0,
+            collection_protos: [object_proto; 3],
+            generator_proto: object_proto,
+            async_generator_proto: object_proto,
+            ast_reference: false,
+            bigint_proto: object_proto,
+            promise_proto: object_proto,
+            promise_ctor: object_proto,
+            aggregate_error_proto: object_proto,
+            iterator_proto: object_proto,
+            microtasks: Default::default(),
+            rejected_promises: Vec::new(),
+            promise_notifications: Vec::new(),
+            async_errors: Vec::new(),
+            draining_microtasks: false,
             heap,
             environments: vec![Some(Environment {
+                aliases: BTreeMap::new(),
                 parent: None,
                 bindings: BTreeMap::new(),
                 function: true,
@@ -208,6 +312,13 @@ impl Vm {
             memory_bytes: 1024,
         };
         crate::builtins::install(&mut vm);
+        let _ = vm.install_iterators();
+        let _ = vm.install_promises();
+        let _ = vm.install_bigint();
+        let _ = vm.install_generators();
+        let _ = vm.install_collections();
+        let _ = vm.install_proxy();
+        let _ = vm.install_symbols();
         vm
     }
     pub fn global_value(&self) -> JsValue {
@@ -326,7 +437,10 @@ impl Vm {
         prototype: JsValue,
     ) -> Result<(), JsError> {
         if let (Some(id), Some(prototype)) = (value.object(), prototype.object()) {
-            if matches!(self.heap.get(id)?.kind, ObjectKind::Host { .. }) {
+            if matches!(
+                self.heap.get(id)?.kind,
+                ObjectKind::Host { .. } | ObjectKind::Ordinary
+            ) {
                 self.heap.get_mut(id)?.prototype = Some(prototype);
             }
         }
@@ -337,6 +451,38 @@ impl Vm {
             .object()
             .and_then(|id| self.heap.get(id).ok())
             .is_some_and(|o| matches!(o.kind, ObjectKind::Array))
+    }
+    pub(crate) fn box_for_clone(&mut self, value: JsValue) -> Result<JsValue, JsError> {
+        let id = self.allocate(ObjectKind::Boxed(value.clone()), Some(self.object_proto))?;
+        let object = JsValue::Object(id);
+        self.fill_box_for_clone(&object, value)?;
+        Ok(object)
+    }
+    pub(crate) fn fill_box_for_clone(
+        &mut self,
+        object: &JsValue,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let prototype = match value {
+            JsValue::BigInt(_) => self.bigint_proto,
+            JsValue::String(_) => self.string_proto,
+            JsValue::Number(_) => self.number_proto,
+            JsValue::Bool(_) => self.boolean_proto,
+            _ => self.object_proto,
+        };
+        let id = object
+            .object()
+            .ok_or_else(|| JsError::new(ErrorKind::TypeError, "clone boxed primitive"))?;
+        self.heap.get_mut(id)?.kind = ObjectKind::Boxed(value);
+        self.heap.get_mut(id)?.prototype = Some(prototype);
+        Ok(())
+    }
+    pub(crate) fn regexp_for_clone(
+        &mut self,
+        source: &str,
+        flags: &str,
+    ) -> Result<JsValue, JsError> {
+        self.regexp(source, flags)
     }
     pub fn date_value(&self, value: &JsValue) -> Option<f64> {
         match value
@@ -504,6 +650,15 @@ impl Vm {
         } else {
             self.memory_bytes = self.memory_bytes.saturating_sub(old - new);
         }
+        if !self.heap.get(id)?.properties.contains_key(&key) {
+            self.reserve_memory(
+                48 + match &key {
+                    PropertyKey::String(s) => s.len(),
+                    _ => 0,
+                },
+            )?;
+            self.heap.get_mut(id)?.property_order.push(key.clone());
+        }
         self.heap.get_mut(id)?.properties.insert(key, property);
         Ok(())
     }
@@ -513,6 +668,15 @@ impl Vm {
         key: PropertyKey,
         property: Property,
     ) -> Result<(), JsError> {
+        if matches!(self.heap.get(id)?.kind, ObjectKind::Proxy(_)) {
+            if self.reflect_define(JsValue::Object(id), key, property)? {
+                return Ok(());
+            }
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "Proxy defineProperty returned false",
+            ));
+        }
         let object = self.heap.get_mut(id)?;
         if !object.extensible && !object.properties.contains_key(&key) {
             return Err(JsError::new(
@@ -566,20 +730,30 @@ impl Vm {
             JsValue::Object(id) => Some(*id),
             JsValue::String(_) => Some(self.string_proto),
             JsValue::Number(_) => Some(self.number_proto),
+            JsValue::BigInt(_) => Some(self.bigint_proto),
+            JsValue::Symbol(..) => Some(self.symbol_proto),
             JsValue::Bool(_) => Some(self.boolean_proto),
             _ => Some(self.object_proto),
         };
         let mut seen = HashSet::new();
         while let Some(id) = current {
-            if !seen.insert(id) {
-                break;
-            }
             let object = self.heap.get(id)?;
-            let kind = object.kind.clone();
+            let (module, proxy, host) = match &object.kind {
+                ObjectKind::ModuleNamespace(module) => (Some(*module), false, None),
+                ObjectKind::Proxy(_) => (None, true, None),
+                ObjectKind::Host { id, .. } => (None, false, Some(*id)),
+                _ => (None, false, None),
+            };
             let property = object.properties.get(&key).cloned();
             let prototype = object.prototype;
-            if let (ObjectKind::Host { id: host, .. }, PropertyKey::String(k)) = (&kind, &key) {
-                if let Some(v) = self.with_host(|h, vm| h.get(vm, *host, k))? {
+            if let (Some(module), PropertyKey::String(_)) = (module, &key) {
+                return self.module_get(module, &key);
+            }
+            if proxy {
+                return self.proxy_get(id, key, receiver);
+            }
+            if let (Some(host), PropertyKey::String(k)) = (host, &key) {
+                if let Some(v) = self.with_host(|h, vm| h.get(vm, host, k))? {
                     return Ok(v);
                 }
             }
@@ -594,6 +768,9 @@ impl Vm {
                         }
                     }
                 };
+            }
+            if !seen.insert(id) {
+                break;
             }
             current = prototype;
         }
@@ -617,11 +794,32 @@ impl Vm {
             }
             return Ok(());
         };
+        if matches!(self.heap.get(id)?.kind, ObjectKind::Proxy(_)) {
+            let success = self.proxy_set(id, key, new, value)?;
+            if !success && self.strict {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Proxy set returned false",
+                ));
+            }
+            return Ok(());
+        }
+        if matches!(self.heap.get(id)?.kind, ObjectKind::ModuleNamespace(_)) {
+            return if self.strict {
+                Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "module namespace is read only",
+                ))
+            } else {
+                Ok(())
+            };
+        }
         if let (ObjectKind::Host { id: host, .. }, PropertyKey::String(k)) =
             (self.heap.get(id)?.kind.clone(), &key)
         {
             let large = matches!(&new, JsValue::String(s) if s.len() > 4096);
             if self.with_host(|h, vm| h.set(vm, host, k, new.clone()))? {
+                self.with_host(|h, vm| h.after_operation(vm))?;
                 self.checkpoint()?;
                 if large {
                     self.finish_memory_check(JsValue::Undefined)?;
@@ -672,6 +870,10 @@ impl Vm {
                         return Err(JsError::new(ErrorKind::RangeError, "invalid array length"));
                     }
                     self.heap.get_mut(id)?.properties.retain(|k,_|!matches!(k,PropertyKey::String(s)if s.parse::<u32>().is_ok_and(|i|i>=n as u32)));
+                    let object = self.heap.get_mut(id)?;
+                    object
+                        .property_order
+                        .retain(|key| object.properties.contains_key(key));
                 } else if let Ok(index) = k.parse::<u32>() {
                     if index != u32::MAX {
                         let len = self.array_length(JsValue::Object(id))?;
@@ -711,6 +913,25 @@ impl Vm {
         self.store_property(id, key, property)
     }
     pub fn delete(&mut self, value: JsValue, key: PropertyKey) -> Result<bool, JsError> {
+        if let Some(id) = value.object() {
+            if let ObjectKind::ModuleNamespace(module) = self.heap.get(id)?.kind {
+                if matches!(&key,PropertyKey::String(name)if self.module_names(module)?.contains(name))
+                {
+                    if self.strict {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "module export cannot be deleted",
+                        ));
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+        if let Some(id) = value.object() {
+            if matches!(self.heap.get(id)?.kind, ObjectKind::Proxy(_)) {
+                return self.proxy_delete(id, key);
+            }
+        }
         let Some(id) = value.object() else {
             return Ok(true);
         };
@@ -730,33 +951,69 @@ impl Vm {
             return Ok(false);
         }
         if let Some(property) = self.heap.get_mut(id)?.properties.remove(&key) {
+            self.heap.get_mut(id)?.property_order.retain(|k| *k != key);
             self.memory_bytes = self
                 .memory_bytes
                 .saturating_sub(property.retained_bytes(&key));
         }
         Ok(true)
     }
-    pub fn keys(&self, value: &JsValue, enumerable: bool) -> Result<Vec<PropertyKey>, JsError> {
+    pub fn keys(&mut self, value: &JsValue, enumerable: bool) -> Result<Vec<PropertyKey>, JsError> {
+        if let Some(id) = value.object() {
+            if let ObjectKind::ModuleNamespace(module) = self.heap.get(id)?.kind {
+                let mut keys = self
+                    .module_names(module)?
+                    .into_iter()
+                    .map(PropertyKey::String)
+                    .collect::<Vec<_>>();
+                if !enumerable {
+                    keys.extend(self.heap.get(id)?.properties.keys().cloned());
+                }
+                return Ok(keys);
+            }
+        }
+        if let Some(id) = value.object() {
+            if matches!(self.heap.get(id)?.kind, ObjectKind::Proxy(_)) {
+                return self.proxy_keys(id, enumerable);
+            }
+        }
         let Some(id) = value.object() else {
-            return Ok(Vec::new());
+            let mut keys = Vec::new();
+            if let JsValue::String(value) = value {
+                keys.extend(
+                    (0..value.encode_utf16().count())
+                        .map(|index| PropertyKey::String(index.to_string())),
+                );
+                if !enumerable {
+                    keys.push("length".into());
+                }
+            }
+            return Ok(keys);
         };
         let object = self.heap.get(id)?;
         let mut keys = object
-            .properties
+            .property_order
             .iter()
-            .filter(|(_, p)| !enumerable || p.enumerable)
-            .map(|(k, _)| k.clone())
+            .filter(|key| {
+                object
+                    .properties
+                    .get(*key)
+                    .is_some_and(|p| !enumerable || p.enumerable)
+            })
+            .cloned()
             .collect::<Vec<_>>();
-        keys.sort_by(|a, b| match (a, b) {
-            (PropertyKey::String(a), PropertyKey::String(b)) => {
-                match (a.parse::<u32>().ok(), b.parse::<u32>().ok()) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    _ => a.cmp(b),
-                }
-            }
-            _ => a.cmp(b),
+        fn index(key: &PropertyKey) -> Option<u32> {
+            let PropertyKey::String(key) = key else {
+                return None;
+            };
+            let index = key.parse::<u32>().ok()?;
+            (index != u32::MAX && index.to_string() == *key).then_some(index)
+        }
+        keys.sort_by(|a, b| match (index(a), index(b)) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => matches!(a, PropertyKey::Symbol(_)).cmp(&matches!(b, PropertyKey::Symbol(_))),
         });
         Ok(keys)
     }
@@ -784,6 +1041,7 @@ impl Vm {
     }
     pub fn to_string(&mut self, value: JsValue) -> Result<String, JsError> {
         match value {
+            JsValue::BigInt(value) => value.to_radix(10),
             JsValue::Undefined => Ok("undefined".into()),
             JsValue::Null => Ok("null".into()),
             JsValue::Bool(b) => Ok(b.to_string()),
@@ -801,6 +1059,10 @@ impl Vm {
     }
     pub fn to_number(&mut self, value: JsValue) -> Result<f64, JsError> {
         match value {
+            JsValue::BigInt(_) => Err(JsError::new(
+                ErrorKind::TypeError,
+                "cannot implicitly convert BigInt to Number",
+            )),
             JsValue::Undefined => Ok(f64::NAN),
             JsValue::Null => Ok(0.0),
             JsValue::Bool(b) => Ok(if b { 1.0 } else { 0.0 }),
@@ -831,13 +1093,45 @@ impl Vm {
             }
         }
     }
-    fn coerce_primitive(&mut self, value: JsValue, number: bool) -> Result<JsValue, JsError> {
+    pub(crate) fn coerce_primitive(
+        &mut self,
+        value: JsValue,
+        number: bool,
+    ) -> Result<JsValue, JsError> {
+        self.coerce_primitive_hint(value, if number { "number" } else { "string" })
+    }
+    fn coerce_primitive_hint(&mut self, value: JsValue, hint: &str) -> Result<JsValue, JsError> {
         let Some(id) = value.object() else {
             return Ok(value);
         };
-        if let ObjectKind::Boxed(v) = self.heap.get(id)?.kind.clone() {
-            return Ok(v);
+        let exotic = self.get_key(
+            value.clone(),
+            PropertyKey::Symbol(crate::symbols::TO_PRIMITIVE),
+        )?;
+        if !matches!(exotic, JsValue::Undefined | JsValue::Null) {
+            if !self.callable(&exotic) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Symbol.toPrimitive is not callable",
+                ));
+            }
+            let result = self.call_inner(
+                exotic,
+                value.clone(),
+                vec![JsValue::string(hint)],
+                false,
+                None,
+            )?;
+            if result.object().is_some() {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Symbol.toPrimitive returned an object",
+                ));
+            }
+            return Ok(result);
         }
+        let number = hint == "number"
+            || hint == "default" && !matches!(self.heap.get(id)?.kind, ObjectKind::Date(_));
         for key in if number {
             ["valueOf", "toString"]
         } else {
@@ -857,6 +1151,11 @@ impl Vm {
         ))
     }
     pub fn property_key(&mut self, value: JsValue) -> Result<PropertyKey, JsError> {
+        let value = if value.object().is_some() {
+            self.coerce_primitive(value, false)?
+        } else {
+            value
+        };
         if let JsValue::Symbol(id, _) = value {
             Ok(PropertyKey::Symbol(id))
         } else {
@@ -864,13 +1163,26 @@ impl Vm {
         }
     }
     pub fn callable(&self, value: &JsValue) -> bool {
+        if let Some(id) = value.object() {
+            if let Ok(Object {
+                kind: ObjectKind::Proxy(data),
+                ..
+            }) = self.heap.get(id)
+            {
+                return data.callable;
+            }
+        }
         value
             .object()
             .and_then(|id| self.heap.get(id).ok())
             .is_some_and(|o| {
                 matches!(
                     o.kind,
-                    ObjectKind::Function(_) | ObjectKind::Native(_) | ObjectKind::Bound { .. }
+                    ObjectKind::Function(_)
+                        | ObjectKind::Native(_)
+                        | ObjectKind::Bound { .. }
+                        | ObjectKind::PromiseClosure(_)
+                        | ObjectKind::ProxyRevoker(_)
                 )
             })
     }
@@ -883,6 +1195,7 @@ impl Vm {
         }
         self.reserve_memory(256usize.saturating_add(this.retained_bytes()))?;
         let environment = Environment {
+            aliases: BTreeMap::new(),
             parent: Some(parent),
             bindings: BTreeMap::new(),
             function,
@@ -906,6 +1219,9 @@ impl Vm {
     fn lookup(&mut self, mut env: usize, name: &str) -> Result<JsValue, JsError> {
         loop {
             let scope = self.scope(env)?;
+            if let Some((target, name)) = scope.aliases.get(name).cloned() {
+                return self.lookup(target, &name);
+            }
             if let Some(b) = scope.bindings.get(name) {
                 if !b.initialized {
                     return Err(JsError::new(
@@ -934,10 +1250,10 @@ impl Vm {
             ))
         }
     }
-    fn binding_exists(&self, mut env: usize, name: &str) -> Result<bool, JsError> {
+    fn binding_exists(&mut self, mut env: usize, name: &str) -> Result<bool, JsError> {
         loop {
             let scope = self.scope(env)?;
-            if scope.bindings.contains_key(name) {
+            if scope.bindings.contains_key(name) || scope.aliases.contains_key(name) {
                 return Ok(true);
             }
             let Some(parent) = scope.parent else {
@@ -950,6 +1266,12 @@ impl Vm {
     fn assign_name(&mut self, mut env: usize, name: &str, value: JsValue) -> Result<(), JsError> {
         loop {
             let scope = self.scope(env)?;
+            if scope.aliases.contains_key(name) {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "assignment to import binding",
+                ));
+            }
             if let Some(b) = scope.bindings.get(name) {
                 if !b.initialized {
                     return Err(JsError::new(
@@ -1173,6 +1495,16 @@ impl Vm {
         Ok(())
     }
     pub(crate) fn tick(&mut self) -> Result<(), JsError> {
+        let stack_marker = 0u8;
+        let stack = (&stack_marker as *const u8) as usize;
+        if self.stack_base != 0
+            && self.stack_base.abs_diff(stack) > self.limits.max_native_stack_bytes
+        {
+            return Err(JsError::new(
+                ErrorKind::RangeError,
+                "native JavaScript stack budget exceeded",
+            ));
+        }
         self.steps += 1;
         if self.steps > self.limits.max_steps {
             return Err(JsError::new(
@@ -1209,6 +1541,8 @@ impl Vm {
     }
     /// Start a bounded native task before decoding service results or messages.
     pub fn begin_task(&mut self) {
+        let stack_marker = 0u8;
+        self.stack_base = (&stack_marker as *const u8) as usize;
         self.steps = 0;
         self.started = Instant::now();
         self.depth = 0;
@@ -1220,6 +1554,12 @@ impl Vm {
         }
     }
     pub fn eval(&mut self, program: &Program) -> Result<JsValue, JsError> {
+        if program.module {
+            return Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "modules require a linked module record",
+            ));
+        }
         self.begin_task();
         let old = self.strict;
         self.strict = program.strict;
@@ -1232,7 +1572,31 @@ impl Vm {
         }
         result
     }
+    /// Execute immutable realm-independent bytecode without reparsing/recompiling.
+    /// Module chunks must use the linker instead of the classic global scope.
+    pub fn eval_compiled(&mut self, code: Arc<crate::bytecode::Chunk>) -> Result<JsValue, JsError> {
+        if code.module || code.function {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "expected classic script bytecode",
+            ));
+        }
+        self.begin_task();
+        let strict = self.strict;
+        self.strict = code.strict;
+        let result = self
+            .execute_chunk(code, 0)
+            .and_then(|value| self.finish_memory_check(value));
+        self.strict = strict;
+        if let Ok(value) = &result {
+            self.last = value.clone();
+        }
+        result
+    }
     pub(crate) fn eval_body(&mut self, program: &Program, env: usize) -> Result<JsValue, JsError> {
+        if !self.ast_reference {
+            return self.execute_chunk(crate::bytecode::compile(program)?, env);
+        }
         self.hoist(&program.body, env, true)?;
         match self.statements(&program.body, env)? {
             Completion::Normal(v) | Completion::Return(v) => Ok(v),
@@ -1252,6 +1616,14 @@ impl Vm {
             thrown: None,
         })?;
         self.eval(&program)
+    }
+    /// Owned Level 1 oracle for bytecode migration tests and benches.
+    pub fn eval_ast_reference(&mut self, program: &Program) -> Result<JsValue, JsError> {
+        let old = self.ast_reference;
+        self.ast_reference = true;
+        let result = self.eval(program);
+        self.ast_reference = old;
+        result
     }
     /// Compile an already CSP-approved inline handler inside the current task.
     /// Resetting task limits here would let nested dispatch bypass the killer.
@@ -1280,7 +1652,19 @@ impl Vm {
         }
         result
     }
+    pub fn call_in_task(
+        &mut self,
+        function: JsValue,
+        this: JsValue,
+        args: Vec<JsValue>,
+    ) -> Result<JsValue, JsError> {
+        self.call_inner(function, this, args, false, None)
+            .and_then(|v| self.finish_memory_check(v))
+    }
     pub fn run_event_loop(&mut self) {
+        if let Err(error) = self.drain_microtasks() {
+            self.async_errors.push(error);
+        }
         let _ = self.with_host(|host, vm| {
             host.run_event_loop(vm);
             Ok(())
@@ -1318,6 +1702,14 @@ impl Vm {
         })
     }
     fn stmt_inner(&mut self, stmt: &Stmt, env: usize) -> Result<Completion, JsError> {
+        self.stmt_labeled(stmt, env, None)
+    }
+    fn stmt_labeled(
+        &mut self,
+        stmt: &Stmt,
+        env: usize,
+        label: Option<&str>,
+    ) -> Result<Completion, JsError> {
         let undefined = Completion::Normal(JsValue::Undefined);
         match &stmt.kind {
             StmtKind::Empty | StmtKind::Function(..) => Ok(undefined),
@@ -1355,6 +1747,8 @@ impl Vm {
             StmtKind::While(test, body) => {
                 while self.expr(test, env)?.truthy() {
                     match self.stmt(body, env)? {
+                        Completion::Continue(Some(name)) if label == Some(name.as_str()) => {}
+                        Completion::Break(Some(name)) if label == Some(name.as_str()) => break,
                         Completion::Normal(_) | Completion::Continue(None) => {}
                         Completion::Break(None) => break,
                         other => return Ok(other),
@@ -1365,6 +1759,8 @@ impl Vm {
             StmtKind::DoWhile(body, test) => {
                 loop {
                     match self.stmt(body, env)? {
+                        Completion::Continue(Some(name)) if label == Some(name.as_str()) => {}
+                        Completion::Break(Some(name)) if label == Some(name.as_str()) => break,
                         Completion::Normal(_) | Completion::Continue(None) => {}
                         Completion::Break(None) => break,
                         other => return Ok(other),
@@ -1390,6 +1786,8 @@ impl Vm {
                         }
                     }
                     match self.stmt(body, iter_env)? {
+                        Completion::Continue(Some(name)) if label == Some(name.as_str()) => {}
+                        Completion::Break(Some(name)) if label == Some(name.as_str()) => break,
                         Completion::Normal(_) | Completion::Continue(None) => {}
                         Completion::Break(None) => break,
                         other => return Ok(other),
@@ -1409,7 +1807,13 @@ impl Vm {
                 }
                 Ok(undefined)
             }
-            StmtKind::ForEach(binding, source, body, of) => {
+            StmtKind::ForEach(binding, source, body, of, asynchronous) => {
+                if *asynchronous {
+                    return Err(JsError::new(
+                        ErrorKind::SyntaxError,
+                        "async iteration requires resumable bytecode",
+                    ));
+                }
                 let source = self.expr(source, env)?;
                 let values = if *of {
                     self.array_values(source)?
@@ -1432,6 +1836,8 @@ impl Vm {
                         ForBinding::Target(target) => self.assign_target(target, value, env)?,
                     }
                     match self.stmt(body, child)? {
+                        Completion::Continue(Some(name)) if label == Some(name.as_str()) => {}
+                        Completion::Break(Some(name)) if label == Some(name.as_str()) => break,
                         Completion::Normal(_) | Completion::Continue(None) => {}
                         Completion::Break(None) => break,
                         other => return Ok(other),
@@ -1506,22 +1912,26 @@ impl Vm {
                 }
                 Ok(Completion::Normal(last))
             }
-            StmtKind::Label(label, body) => match self.stmt(body, env)? {
+            StmtKind::Label(label, body) => match self.stmt_labeled(body, env, Some(label))? {
                 Completion::Break(Some(l)) if l == *label => Ok(undefined),
                 other => Ok(other),
             },
         }
     }
     fn function(&mut self, function: Arc<Function>, env: usize) -> Result<JsValue, JsError> {
+        let code = crate::bytecode::compile_body(&function.body, true)?;
         let lexical_this = if function.arrow {
             Some(self.scope(env)?.this.clone())
         } else {
             None
         };
-        let constructable = !function.arrow;
+        let constructable = !function.arrow && !function.asynchronous && !function.generator;
         let strict = self.strict || function.strict;
         let id = self.allocate(
             ObjectKind::Function(UserFunction {
+                module: self.current_module,
+                source_url: self.source_url.clone(),
+                code,
                 function: function.clone(),
                 environment: env,
                 lexical_this,
@@ -1576,6 +1986,8 @@ impl Vm {
             .iter()
             .find(|m| !m.is_static && matches!(&m.name,PropertyName::String(s)if s=="constructor"));
         let default = Arc::new(Function {
+            asynchronous: false,
+            generator: false,
             name: class.name.clone(),
             params: Vec::new(),
             body: Vec::new(),
@@ -1700,6 +2112,9 @@ impl Vm {
         Ok(values)
     }
     fn expr(&mut self, expr: &Expr, env: usize) -> Result<JsValue, JsError> {
+        if !self.ast_reference {
+            return self.execute_chunk(crate::bytecode::compile_expression(expr)?, env);
+        }
         self.tick()?;
         let result = self.expr_inner(expr, env);
         let result = result.and_then(|value| {
@@ -1716,7 +2131,18 @@ impl Vm {
     }
     fn expr_inner(&mut self, expr: &Expr, env: usize) -> Result<JsValue, JsError> {
         match &expr.kind {
+            ExprKind::Import(_) | ExprKind::ImportMeta => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "module expressions require bytecode",
+            )),
+            ExprKind::Await(_) | ExprKind::Yield(..) => Err(JsError::new(
+                ErrorKind::SyntaxError,
+                "suspension requires a resumable execution frame",
+            )),
             ExprKind::Literal(l) => match l {
+                Literal::BigInt(value) => Ok(JsValue::BigInt(Arc::new(
+                    crate::bigint::BigInt::parse(value)?,
+                ))),
                 Literal::Undefined => Ok(JsValue::Undefined),
                 Literal::Null => Ok(JsValue::Null),
                 Literal::Bool(b) => Ok(JsValue::Bool(*b)),
@@ -1908,6 +2334,23 @@ impl Vm {
                     return Ok(JsValue::Bool(false));
                 }
                 let value = self.expr(operand, env)?;
+                let value = if matches!(op.as_str(), "-" | "~") {
+                    self.coerce_primitive(value, true)?
+                } else {
+                    value
+                };
+                if let JsValue::BigInt(n) = &value {
+                    return match op.as_str() {
+                        "-" => Ok(JsValue::BigInt(Arc::new(n.negated()))),
+                        "~" => Ok(JsValue::BigInt(Arc::new(n.not()?))),
+                        "!" => Ok(JsValue::Bool(!value.truthy())),
+                        "void" => Ok(JsValue::Undefined),
+                        _ => Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "unary plus cannot convert BigInt",
+                        )),
+                    };
+                }
                 match op.as_str() {
                     "!" => Ok(JsValue::Bool(!value.truthy())),
                     "void" => Ok(JsValue::Undefined),
@@ -1923,6 +2366,17 @@ impl Vm {
             ExprKind::Update(op, target, prefix) => {
                 let reference = self.reference(target, env)?;
                 let old = self.read_reference(&reference, env)?;
+                let old = self.coerce_primitive(old, true)?;
+                if let JsValue::BigInt(n) = &old {
+                    let value = if op == "++" {
+                        n.add(&crate::bigint::BigInt::one())?
+                    } else {
+                        n.sub(&crate::bigint::BigInt::one())?
+                    };
+                    let value = JsValue::BigInt(Arc::new(value));
+                    self.write_reference(reference, value.clone(), env)?;
+                    return Ok(if *prefix { value } else { old });
+                }
                 let old = self.to_number(old)?;
                 let new = JsValue::Number(old + if op == "++" { 1.0 } else { -1.0 });
                 self.write_reference(reference, new.clone(), env)?;
@@ -2052,6 +2506,27 @@ impl Vm {
                 return Ok(JsValue::Bool(self.has(right, key)?));
             }
             "instanceof" => {
+                if right.object().is_none() {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "instanceof rhs is not an object",
+                    ));
+                }
+                let method = self.get_key(
+                    right.clone(),
+                    PropertyKey::Symbol(crate::symbols::HAS_INSTANCE),
+                )?;
+                if !matches!(method, JsValue::Undefined | JsValue::Null) {
+                    if !self.callable(&method) {
+                        return Err(JsError::new(
+                            ErrorKind::TypeError,
+                            "Symbol.hasInstance is not callable",
+                        ));
+                    }
+                    return self
+                        .call_inner(method, right, vec![left], false, None)
+                        .map(|v| JsValue::Bool(v.truthy()));
+                }
                 if !self.callable(&right) {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -2079,13 +2554,14 @@ impl Vm {
             }
             _ => {}
         }
+        let hint = if op == "+" { "default" } else { "number" };
         let left = if matches!(left, JsValue::Object(_)) {
-            self.coerce_primitive(left, true)?
+            self.coerce_primitive_hint(left, hint)?
         } else {
             left
         };
         let right = if matches!(right, JsValue::Object(_)) {
-            self.coerce_primitive(right, true)?
+            self.coerce_primitive_hint(right, hint)?
         } else {
             right
         };
@@ -2099,6 +2575,35 @@ impl Vm {
             return Ok(JsValue::string(out));
         }
         if matches!(op, "<" | ">" | "<=" | ">=") {
+            let comparison = match (&left, &right) {
+                (JsValue::BigInt(a), JsValue::BigInt(b)) => Some(Some(a.compare(b))),
+                (JsValue::BigInt(a), JsValue::Number(b)) => Some(a.compare_number(*b)),
+                (JsValue::Number(a), JsValue::BigInt(b)) => {
+                    Some(b.compare_number(*a).map(std::cmp::Ordering::reverse))
+                }
+                (JsValue::BigInt(a), JsValue::String(b)) => {
+                    Some(crate::bigint::BigInt::parse(b).ok().map(|b| a.compare(&b)))
+                }
+                (JsValue::String(a), JsValue::BigInt(b)) => {
+                    Some(crate::bigint::BigInt::parse(a).ok().map(|a| a.compare(b)))
+                }
+                (JsValue::BigInt(a), value) => {
+                    Some(a.compare_number(self.to_number(value.clone())?))
+                }
+                (value, JsValue::BigInt(b)) => Some(
+                    b.compare_number(self.to_number(value.clone())?)
+                        .map(std::cmp::Ordering::reverse),
+                ),
+                _ => None,
+            };
+            if let Some(order) = comparison {
+                return Ok(JsValue::Bool(order.is_some_and(|c| match op {
+                    "<" => c.is_lt(),
+                    ">" => c.is_gt(),
+                    "<=" => !c.is_gt(),
+                    _ => !c.is_lt(),
+                })));
+            }
             if let (JsValue::String(a), JsValue::String(b)) = (&left, &right) {
                 let cmp = a.encode_utf16().cmp(b.encode_utf16());
                 return Ok(JsValue::Bool(match op {
@@ -2108,6 +2613,27 @@ impl Vm {
                     _ => !cmp.is_lt(),
                 }));
             }
+        }
+        if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (&left, &right) {
+            let out = match op {
+                "+" => a.add(b)?,
+                "-" => a.sub(b)?,
+                "*" => a.mul(b)?,
+                "/" => a.div_rem(b)?.0,
+                "%" => a.div_rem(b)?.1,
+                "**" => a.pow(b)?,
+                "&" | "|" | "^" => a.bitwise(b, op)?,
+                "<<" => a.shift(b, true)?,
+                ">>" => a.shift(b, false)?,
+                _ => return Err(JsError::new(ErrorKind::TypeError, "BigInt operator")),
+            };
+            return Ok(JsValue::BigInt(Arc::new(out)));
+        }
+        if matches!(left, JsValue::BigInt(_)) || matches!(right, JsValue::BigInt(_)) {
+            return Err(JsError::new(
+                ErrorKind::TypeError,
+                "cannot mix BigInt and Number",
+            ));
         }
         let a = self.to_number(left)?;
         let b = self.to_number(right)?;
@@ -2147,30 +2673,55 @@ impl Vm {
             return Ok(true);
         }
         match (&a, &b) {
-            (JsValue::Bool(_), _)
-            | (_, JsValue::Bool(_))
-            | (JsValue::Number(_), JsValue::String(_))
-            | (JsValue::String(_), JsValue::Number(_)) => {
-                Ok(self.to_number(a)? == self.to_number(b)?)
+            (JsValue::BigInt(x), JsValue::String(y)) | (JsValue::String(y), JsValue::BigInt(x)) => {
+                Ok(crate::bigint::BigInt::parse(y).is_ok_and(|y| x.as_ref() == &y))
             }
-            (JsValue::Object(_), JsValue::String(_) | JsValue::Number(_)) => {
-                let a = self.coerce_primitive(a, true)?;
+            (JsValue::BigInt(x), JsValue::Number(y)) | (JsValue::Number(y), JsValue::BigInt(x)) => {
+                Ok(x.compare_number(*y) == Some(std::cmp::Ordering::Equal))
+            }
+            (JsValue::BigInt(_), JsValue::Object(_)) => {
+                let b = self.coerce_primitive_hint(b, "default")?;
                 self.equal(a, b)
             }
-            (JsValue::String(_) | JsValue::Number(_), JsValue::Object(_)) => {
-                let b = self.coerce_primitive(b, true)?;
+            (JsValue::Object(_), JsValue::BigInt(_)) => {
+                let a = self.coerce_primitive_hint(a, "default")?;
+                self.equal(a, b)
+            }
+            (JsValue::Bool(value), _) => {
+                self.equal(JsValue::Number(if *value { 1.0 } else { 0.0 }), b)
+            }
+            (_, JsValue::Bool(value)) => {
+                self.equal(a, JsValue::Number(if *value { 1.0 } else { 0.0 }))
+            }
+            (JsValue::Number(_), JsValue::String(_)) | (JsValue::String(_), JsValue::Number(_)) => {
+                Ok(self.to_number(a)? == self.to_number(b)?)
+            }
+            (JsValue::Object(_), JsValue::String(_) | JsValue::Number(_) | JsValue::Symbol(..)) => {
+                let a = self.coerce_primitive_hint(a, "default")?;
+                self.equal(a, b)
+            }
+            (JsValue::String(_) | JsValue::Number(_) | JsValue::Symbol(..), JsValue::Object(_)) => {
+                let b = self.coerce_primitive_hint(b, "default")?;
                 self.equal(a, b)
             }
             _ => Ok(false),
         }
     }
-    pub fn has(&self, value: JsValue, key: PropertyKey) -> Result<bool, JsError> {
+    pub fn has(&mut self, value: JsValue, key: PropertyKey) -> Result<bool, JsError> {
         let Some(mut id) = value.object() else {
             return Err(JsError::new(ErrorKind::TypeError, "in requires object"));
         };
         let mut seen = HashSet::new();
         while seen.insert(id) {
             let object = self.heap.get(id)?;
+            if let ObjectKind::ModuleNamespace(module) = object.kind {
+                if let PropertyKey::String(name) = &key {
+                    return Ok(self.module_names(module)?.contains(name));
+                }
+            }
+            if matches!(object.kind, ObjectKind::Proxy(_)) {
+                return self.proxy_has(id, key);
+            }
             if object.properties.contains_key(&key) {
                 return Ok(true);
             }
@@ -2182,7 +2733,7 @@ impl Vm {
         }
         Ok(false)
     }
-    fn enumerable_keys(&self, value: JsValue) -> Result<Vec<PropertyKey>, JsError> {
+    fn enumerable_keys(&mut self, value: JsValue) -> Result<Vec<PropertyKey>, JsError> {
         let mut current = value.object();
         let mut seen = HashSet::new();
         let mut keys = BTreeSet::new();
@@ -2201,6 +2752,7 @@ impl Vm {
             JsValue::Null => "object",
             JsValue::Bool(_) => "boolean",
             JsValue::Number(_) => "number",
+            JsValue::BigInt(_) => "bigint",
             JsValue::String(_) => "string",
             JsValue::Symbol(..) => "symbol",
             JsValue::Object(_) => {
@@ -2217,6 +2769,15 @@ impl Vm {
             .object()
             .ok_or_else(|| JsError::new(ErrorKind::TypeError, "new target is not constructor"))?;
         let kind = self.heap.get(id)?.kind.clone();
+        if let ObjectKind::Proxy(data) = &kind {
+            if !data.constructible {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "Proxy target is not a constructor",
+                ));
+            }
+            return self.proxy_call(id, JsValue::Undefined, args, true);
+        }
         if let ObjectKind::Function(f) = &kind {
             if !f.constructable {
                 return Err(JsError::new(
@@ -2267,6 +2828,26 @@ impl Vm {
         let kind = self.heap.get(id)?.kind.clone();
         self.depth += 1;
         let result = (|| match kind {
+            ObjectKind::Proxy(_) => self.proxy_call(id, this, args, construct),
+            ObjectKind::ProxyRevoker(proxy) => {
+                if let Ok(Object {
+                    kind: ObjectKind::Proxy(data),
+                    ..
+                }) = self.heap.get_mut(proxy)
+                {
+                    data.handler = None;
+                }
+                Ok(JsValue::Undefined)
+            }
+            ObjectKind::PromiseClosure(closure) => {
+                if construct {
+                    return Err(JsError::new(
+                        ErrorKind::TypeError,
+                        "promise callback is not a constructor",
+                    ));
+                }
+                self.call_promise_closure(*closure, args)
+            }
             ObjectKind::Native(name) => {
                 if name.starts_with("host:") {
                     let large = args
@@ -2274,6 +2855,7 @@ impl Vm {
                         .any(|v| matches!(v, JsValue::String(s) if s.len() > 4096));
                     let outcome = self
                         .with_host(|host, vm| host.call(vm, &name[5..], this, args.as_slice()))?;
+                    self.with_host(|host, vm| host.after_operation(vm))?;
                     self.checkpoint()?;
                     if large
                         || name.starts_with("host:web:")
@@ -2333,6 +2915,9 @@ impl Vm {
                     Err(JsError::new(ErrorKind::TypeError, "class requires new"))
                 } else {
                     let old = self.strict;
+                    let source = std::mem::replace(&mut self.source_url, f.source_url.clone());
+                    let module = self.current_module;
+                    self.current_module = f.module;
                     let active_before = self.active.len();
                     self.strict = f.strict;
                     let result = (|| {
@@ -2402,6 +2987,9 @@ impl Vm {
                                 self.call_inner(JsValue::Object(super_id), this, args, true, None)?;
                             }
                         }
+                        if !self.ast_reference {
+                            return self.execute_function(&f, env);
+                        }
                         self.hoist(&f.function.body, env, true)?;
                         let result = match self.statements(&f.function.body, env) {
                             Ok(Completion::Return(v)) => Ok(v),
@@ -2420,7 +3008,25 @@ impl Vm {
                     })();
                     self.active.truncate(active_before);
                     self.strict = old;
-                    result
+                    self.source_url = source;
+                    self.current_module = module;
+                    match result {
+                        Err(error)
+                            if f.function.asynchronous
+                                && !f.function.generator
+                                && !error.is_resource_limit() =>
+                        {
+                            let promise = self.promise()?;
+                            let reason = if let Some(value) = error.thrown {
+                                value
+                            } else {
+                                self.error_value(error)?
+                            };
+                            self.reject_promise(promise.clone(), reason)?;
+                            Ok(promise)
+                        }
+                        result => result,
+                    }
                 }
             }
             _ => Err(JsError::new(ErrorKind::TypeError, "value is not callable")),
@@ -2492,6 +3098,11 @@ impl Vm {
         Ok(JsValue::Object(id))
     }
     pub fn error_value(&mut self, error: JsError) -> Result<JsValue, JsError> {
+        let stack = if error.stack.is_empty() {
+            self.current_stack()
+        } else {
+            error.stack.clone()
+        };
         let id = self.allocate(ObjectKind::Error, Some(self.error_proto))?;
         self.define(
             id,
@@ -2506,7 +3117,10 @@ impl Vm {
         self.define(
             id,
             "stack".into(),
-            Property::data(JsValue::string(error.stack.join("\n"))),
+            Property {
+                enumerable: false,
+                ..Property::data(JsValue::string(stack.join("\n")))
+            },
         )?;
         Ok(JsValue::Object(id))
     }
@@ -2524,16 +3138,94 @@ impl Vm {
         self.heap.live()
     }
     pub fn gc_collect(&mut self) {
+        // Rust locals of an executing host/activation are not arena roots. Honor
+        // reentrant requests at the next checkpoint after the JS stack empties.
+        if self.depth != 0 || !self.call_stack.is_empty() {
+            self.gc_requested = true;
+            return;
+        }
+        self.gc_requested = false;
         enum Mark {
             Value(JsValue),
             Env(usize),
         }
+        #[derive(PartialEq, Eq, Hash)]
+        enum WeakKey {
+            Object(ObjectId),
+            Symbol(u64),
+        }
+        let mut ephemerons: HashMap<WeakKey, Vec<JsValue>> = HashMap::new();
         let mut marked = HashSet::new();
         let mut envs = HashSet::new();
         let mut hosts = HashSet::new();
+        let candidates = self.host_objects.keys().copied().collect::<HashSet<_>>();
+        let mut symbols = HashSet::new();
+        symbols.extend(1..=crate::symbols::ASYNC_ITERATOR);
         let mut work = vec![Mark::Env(0), Mark::Value(self.last.clone())];
+        for job in &self.microtasks {
+            if let promises::Job::Host(token) = job {
+                hosts.insert(*token);
+            }
+        }
         work.extend(self.pins.iter().cloned().map(Mark::Value));
+        work.extend(
+            self.async_errors
+                .iter()
+                .filter_map(|error| error.thrown.clone())
+                .map(Mark::Value),
+        );
         work.extend(self.active.iter().copied().map(Mark::Env));
+        work.extend(
+            self.modules
+                .iter()
+                .map(|module| Mark::Env(module.environment)),
+        );
+        work.extend(self.module_roots().into_iter().map(Mark::Value));
+        work.extend(self.module_loads.values().cloned().map(Mark::Value));
+        work.extend(
+            self.collection_protos
+                .into_iter()
+                .map(|id| Mark::Value(JsValue::Object(id))),
+        );
+        for id in [
+            self.object_proto,
+            self.function_proto,
+            self.array_proto,
+            self.string_proto,
+            self.number_proto,
+            self.boolean_proto,
+            self.date_proto,
+            self.regexp_proto,
+            self.error_proto,
+            self.promise_proto,
+            self.promise_ctor,
+            self.aggregate_error_proto,
+            self.iterator_proto,
+            self.bigint_proto,
+            self.generator_proto,
+            self.async_generator_proto,
+            self.symbol_proto,
+        ] {
+            work.push(Mark::Value(JsValue::Object(id)));
+        }
+        work.extend(
+            self.microtasks
+                .iter()
+                .flat_map(promises::Job::roots)
+                .map(Mark::Value),
+        );
+        work.extend(
+            self.rejected_promises
+                .iter()
+                .copied()
+                .map(|id| Mark::Value(JsValue::Object(id))),
+        );
+        work.extend(
+            self.promise_notifications
+                .iter()
+                .flat_map(|n| [n.promise.clone(), n.reason.clone()])
+                .map(Mark::Value),
+        );
         loop {
             while let Some(item) = work.pop() {
                 match item {
@@ -2546,6 +3238,7 @@ impl Vm {
                                 work.push(Mark::Env(parent));
                             }
                             work.push(Mark::Value(e.this.clone()));
+                            work.extend(e.aliases.values().map(|(env, _)| Mark::Env(*env)));
                             work.extend(e.bindings.values().map(|b| Mark::Value(b.value.clone())));
                         }
                     }
@@ -2553,11 +3246,19 @@ impl Vm {
                         if !marked.insert(id) {
                             continue;
                         }
+                        if let Some(values) = ephemerons.remove(&WeakKey::Object(id)) {
+                            work.extend(values.into_iter().map(Mark::Value));
+                        }
                         let Ok(object) = self.heap.get(id) else {
                             continue;
                         };
                         if let Some(p) = object.prototype {
                             work.push(Mark::Value(JsValue::Object(p)));
+                        }
+                        for key in object.properties.keys() {
+                            if let PropertyKey::Symbol(id) = key {
+                                work.push(Mark::Value(JsValue::Symbol(*id, "".into())));
+                            }
                         }
                         for p in object.properties.values() {
                             match &p.value {
@@ -2569,6 +3270,64 @@ impl Vm {
                             }
                         }
                         match &object.kind {
+                            ObjectKind::Proxy(data) => {
+                                if let Some(handler) = &data.handler {
+                                    work.push(Mark::Value(handler.clone()));
+                                    work.push(Mark::Value(JsValue::Object(data.target)));
+                                }
+                            }
+                            ObjectKind::ProxyRevoker(id) => {
+                                work.push(Mark::Value(JsValue::Object(*id)))
+                            }
+                            ObjectKind::Collection(data) => {
+                                if data.kind == collections::CollectionKind::WeakMap {
+                                    // Index suspended ephemeron edges by their key; each
+                                    // newly marked key activates its edges only once.
+                                    for (key, value) in data.entries.values() {
+                                        if value.object().is_none()
+                                            && !matches!(value, JsValue::Symbol(..))
+                                        {
+                                            continue;
+                                        }
+                                        let (key, live) = match key {
+                                            JsValue::Object(id) => {
+                                                (WeakKey::Object(*id), marked.contains(id))
+                                            }
+                                            JsValue::Symbol(id, _) => {
+                                                (WeakKey::Symbol(*id), symbols.contains(id))
+                                            }
+                                            _ => continue,
+                                        };
+                                        if live {
+                                            work.push(Mark::Value(value.clone()));
+                                        } else {
+                                            ephemerons.entry(key).or_default().push(value.clone());
+                                        }
+                                    }
+                                } else {
+                                    work.extend(data.roots().into_iter().map(Mark::Value));
+                                }
+                            }
+                            ObjectKind::AsyncTask(data) => {
+                                work.extend(data.roots().into_iter().map(Mark::Value));
+                                work.extend(data.environments().into_iter().map(Mark::Env));
+                            }
+                            ObjectKind::Generator(data) => {
+                                work.extend(data.roots().into_iter().map(Mark::Value));
+                                work.extend(data.environments().into_iter().map(Mark::Env));
+                            }
+                            ObjectKind::Promise(data) => {
+                                work.extend(data.roots().into_iter().map(Mark::Value))
+                            }
+                            ObjectKind::PromiseClosure(data) => {
+                                work.extend(data.roots().into_iter().map(Mark::Value))
+                            }
+                            ObjectKind::PromiseInternal(data) => {
+                                work.extend(data.roots().into_iter().map(Mark::Value))
+                            }
+                            ObjectKind::Iterator(data) => {
+                                work.extend(data.roots().into_iter().map(Mark::Value))
+                            }
                             ObjectKind::Function(f) => {
                                 work.push(Mark::Env(f.environment));
                                 if let Some(v) = &f.lexical_this {
@@ -2597,13 +3356,20 @@ impl Vm {
                             _ => {}
                         }
                     }
+                    Mark::Value(JsValue::Symbol(id, _)) if symbols.insert(id) => {
+                        if let Some(values) = ephemerons.remove(&WeakKey::Symbol(id)) {
+                            work.extend(values.into_iter().map(Mark::Value));
+                        }
+                    }
                     _ => {}
                 }
             }
-            let references = self
-                .host
-                .as_ref()
-                .map_or_else(Vec::new, |h| h.host_references(&hosts));
+            let references = self.host.as_ref().map_or_else(Vec::new, |h| {
+                h.host_references(&hosts)
+                    .into_iter()
+                    .chain(h.trace_native_edges(&hosts, &candidates))
+                    .collect::<Vec<_>>()
+            });
             let mut added = false;
             for reference in references {
                 if hosts.insert(reference) {
@@ -2618,7 +3384,11 @@ impl Vm {
                 .as_ref()
                 .map_or_else(Vec::new, |h| h.roots(&hosts));
             for value in extra {
-                if value.object().is_some_and(|id| !marked.contains(&id)) {
+                if match &value {
+                    JsValue::Object(id) => !marked.contains(id),
+                    JsValue::Symbol(id, _) => !symbols.contains(id),
+                    _ => false,
+                } {
                     work.push(Mark::Value(value));
                     added = true;
                 }
@@ -2628,6 +3398,13 @@ impl Vm {
             }
         }
         for (i, slot) in self.heap.slots.iter_mut().enumerate() {
+            if let Some(Object {
+                kind: ObjectKind::Collection(data),
+                ..
+            }) = &mut slot.object
+            {
+                data.sweep_weak(&marked, &symbols);
+            }
             let id = ObjectId {
                 index: i,
                 generation: slot.generation,
@@ -2643,6 +3420,13 @@ impl Vm {
                 self.free_env.push(i);
             }
         }
+        for value in self.symbol_registry.values() {
+            if let JsValue::Symbol(id, _) = value {
+                symbols.insert(*id);
+            }
+        }
+        self.symbol_descriptions
+            .retain(|id, _| symbols.contains(id));
         self.host_objects.retain(|_, id| marked.contains(id));
         if let Some(host) = &mut self.host {
             host.sweep(&hosts);
@@ -2657,12 +3441,66 @@ impl Vm {
             self.memory_bytes = self
                 .memory_bytes
                 .saturating_add(256 + env.this.retained_bytes());
+            self.memory_bytes = self.memory_bytes.saturating_add(
+                env.aliases
+                    .iter()
+                    .map(|(key, (_, name))| key.len() + name.len() + 128)
+                    .sum::<usize>(),
+            );
             for (name, binding) in &env.bindings {
                 self.memory_bytes = self
                     .memory_bytes
                     .saturating_add(192 + name.len() + binding.value.retained_bytes());
             }
         }
+        self.memory_bytes = self.memory_bytes.saturating_add(
+            self.microtasks
+                .iter()
+                .map(promises::Job::retained_bytes)
+                .sum::<usize>(),
+        );
+        self.memory_bytes = self.memory_bytes.saturating_add(
+            self.modules
+                .iter()
+                .map(|module| module.bytes)
+                .sum::<usize>(),
+        );
+        self.memory_bytes = self
+            .memory_bytes
+            .saturating_add(
+                self.symbol_descriptions
+                    .values()
+                    .map(|s| 64 + s.as_ref().map_or(0, String::len))
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.symbol_registry
+                    .keys()
+                    .map(|s| s.len() + 96)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.module_urls
+                    .keys()
+                    .chain(self.module_loads.keys())
+                    .map(|s| s.len() + 64)
+                    .sum::<usize>(),
+            );
+    }
+    pub(crate) fn current_stack(&self) -> Vec<String> {
+        self.call_stack
+            .iter()
+            .rev()
+            .map(|(name, url, span)| {
+                format!(
+                    "at {} ({}:{}:{})",
+                    if name.is_empty() { "<script>" } else { name },
+                    url,
+                    span.line,
+                    span.column
+                )
+            })
+            .collect()
     }
 }
 pub(crate) fn strict_equal(a: &JsValue, b: &JsValue) -> bool {

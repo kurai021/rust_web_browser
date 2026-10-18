@@ -11,6 +11,7 @@ pub struct ObjectId {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsValue {
+    BigInt(Arc<crate::bigint::BigInt>),
     Undefined,
     Null,
     Bool(bool),
@@ -25,6 +26,7 @@ impl JsValue {
     }
     pub fn truthy(&self) -> bool {
         match self {
+            Self::BigInt(value) => !value.is_zero(),
             Self::Undefined | Self::Null => false,
             Self::Bool(b) => *b,
             Self::Number(n) => *n != 0.0 && !n.is_nan(),
@@ -41,6 +43,7 @@ impl JsValue {
     }
     pub(crate) fn retained_bytes(&self) -> usize {
         match self {
+            Self::BigInt(value) => value.retained_bytes(),
             Self::String(s) | Self::Symbol(_, s) => s.len().saturating_add(32),
             _ => 0,
         }
@@ -99,6 +102,9 @@ impl Property {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct UserFunction {
+    pub module: Option<usize>,
+    pub source_url: String,
+    pub code: Arc<crate::bytecode::Chunk>,
     pub function: Arc<Function>,
     pub environment: usize,
     pub lexical_this: Option<JsValue>,
@@ -110,6 +116,16 @@ pub(crate) struct UserFunction {
 }
 #[derive(Debug, Clone)]
 pub(crate) enum ObjectKind {
+    ModuleNamespace(usize),
+    Proxy(Box<crate::vm::proxy::ProxyData>),
+    ProxyRevoker(ObjectId),
+    Collection(Box<crate::vm::collections::CollectionData>),
+    AsyncTask(Box<crate::vm::execution::AsyncData>),
+    Generator(Box<crate::vm::execution::GeneratorData>),
+    Promise(Box<crate::vm::promises::PromiseData>),
+    PromiseClosure(Box<crate::vm::promises::PromiseClosure>),
+    PromiseInternal(Box<crate::vm::promises::Internal>),
+    Iterator(Box<crate::vm::iterators::IteratorData>),
     Ordinary,
     Array,
     Function(UserFunction),
@@ -136,6 +152,7 @@ pub(crate) enum ObjectKind {
 pub(crate) struct Object {
     pub prototype: Option<ObjectId>,
     pub properties: BTreeMap<PropertyKey, Property>,
+    pub property_order: Vec<PropertyKey>,
     pub kind: ObjectKind,
     pub extensible: bool,
 }
@@ -145,12 +162,23 @@ impl Object {
             prototype,
             kind,
             properties: BTreeMap::new(),
+            property_order: Vec::new(),
             extensible: true,
         }
     }
     pub(crate) fn retained_bytes(&self) -> usize {
         let kind = match &self.kind {
-            ObjectKind::Function(f) => f.function.retained_bytes,
+            ObjectKind::Collection(data) => data.retained_bytes(),
+            ObjectKind::AsyncTask(data) => data.retained_bytes(),
+            ObjectKind::Generator(data) => data.retained_bytes(),
+            ObjectKind::Promise(data) => data.retained_bytes(),
+            ObjectKind::PromiseClosure(data) => data.retained_bytes(),
+            ObjectKind::PromiseInternal(data) => data.retained_bytes(),
+            ObjectKind::Iterator(data) => data.retained_bytes(),
+            ObjectKind::Function(f) => f
+                .function
+                .retained_bytes
+                .saturating_add(f.code.retained_bytes()),
             ObjectKind::Native(s) | ObjectKind::Host { class: s, .. } => s.len(),
             ObjectKind::Bound { args, this, .. } => args.iter().fold(
                 this.retained_bytes()
@@ -165,11 +193,20 @@ impl Object {
                 .saturating_add(flags.len()),
             _ => 0,
         };
-        self.properties
-            .iter()
-            .fold(256usize.saturating_add(kind), |n, (k, p)| {
-                n.saturating_add(p.retained_bytes(k))
-            })
+        self.properties.iter().fold(
+            256usize.saturating_add(kind).saturating_add(
+                self.property_order
+                    .iter()
+                    .map(|k| {
+                        48 + match k {
+                            PropertyKey::String(s) => s.len(),
+                            _ => 0,
+                        }
+                    })
+                    .sum::<usize>(),
+            ),
+            |n, (k, p)| n.saturating_add(p.retained_bytes(k)),
+        )
     }
 }
 pub(crate) struct Slot {

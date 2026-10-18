@@ -3,6 +3,7 @@ use crate::{ParseError, Span};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
+    BigInt(String),
     Name(String),
     Number(f64),
     String(String),
@@ -300,7 +301,13 @@ impl<'a> Lexer<'a> {
                 if count == 0 {
                     return Err(self.error("missing radix digits"));
                 }
-                Kind::Number(n)
+                if self.peek() == Some('n') {
+                    let literal = self.src[start..self.pos].to_owned();
+                    self.bump();
+                    Kind::BigInt(literal)
+                } else {
+                    Kind::Number(n)
+                }
             } else {
                 while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                     self.bump();
@@ -324,11 +331,22 @@ impl<'a> Lexer<'a> {
                         return Err(self.error("invalid exponent"));
                     }
                 }
-                Kind::Number(
-                    self.src[start..self.pos]
-                        .parse()
-                        .map_err(|_| self.error("invalid number"))?,
-                )
+                if self.peek() == Some('n') {
+                    let literal = self.src[start..self.pos].to_owned();
+                    if literal.contains(['.', 'e', 'E'])
+                        || literal.len() > 1 && literal.starts_with('0')
+                    {
+                        return Err(self.error("invalid BigInt literal"));
+                    }
+                    self.bump();
+                    Kind::BigInt(literal)
+                } else {
+                    Kind::Number(
+                        self.src[start..self.pos]
+                            .parse()
+                            .map_err(|_| self.error("invalid number"))?,
+                    )
+                }
             }
         } else if ch == '\'' || ch == '"' {
             Kind::String(self.quoted(ch)?)
@@ -410,6 +428,7 @@ impl<'a> Lexer<'a> {
                         | "instanceof"
                         | "else"
                         | "yield"
+                        | "await"
                 );
             }
             Kind::Punct(s) if s == "(" => {

@@ -41,6 +41,13 @@ const STORAGE_MANAGER: u64 = WEB_BASE + 9;
 const INDEXED_DB: u64 = WEB_BASE + 10;
 #[derive(Debug, Clone)]
 pub enum Command {
+    ModuleLoad {
+        known: Vec<String>,
+        id: u64,
+        url: Url,
+        document: Url,
+        policy: Csp,
+    },
     Fetch {
         id: u64,
         request: Request,
@@ -120,6 +127,10 @@ pub enum Command {
 }
 #[derive(Debug, Clone)]
 pub enum Completion {
+    Module {
+        id: u64,
+        result: Result<crate::modules::ModuleGraph>,
+    },
     WorkerClosed {
         id: u64,
     },
@@ -211,17 +222,9 @@ impl Default for Config {
     }
 }
 #[derive(Clone)]
-pub(super) struct Reaction {
-    continuation: Option<(bool, JsValue)>,
-    child: u64,
-    success: JsValue,
-    failure: JsValue,
-    finally: bool,
-}
-#[derive(Clone)]
 pub(super) struct Promise {
+    native: JsValue,
     result: Option<(bool, JsValue)>,
-    reactions: Vec<Reaction>,
 }
 #[derive(Clone)]
 pub(super) struct Xhr {
@@ -316,6 +319,11 @@ pub(super) struct Object {
     listeners: Vec<(String, JsValue, bool)>,
 }
 pub(super) enum Job {
+    Settle {
+        id: u64,
+        ok: bool,
+        value: JsValue,
+    },
     Observer {
         id: u64,
     },
@@ -328,11 +336,6 @@ pub(super) enum Job {
     ReaderComplete {
         id: u64,
         value: JsValue,
-    },
-    Reaction {
-        ok: bool,
-        value: JsValue,
-        reaction: Reaction,
     },
     Callback {
         function: JsValue,
@@ -458,6 +461,7 @@ impl State {
         {
             match &command {
                 Command::Fetch { id, .. }
+                | Command::ModuleLoad { id, .. }
                 | Command::Permission { id, .. }
                 | Command::Clipboard { id, .. }
                 | Command::WorkerStart { id, .. }
@@ -497,6 +501,12 @@ impl Command {
                     + policy(p)
             }
             Self::WorkerMessage { data, .. } => data.retained_bytes(),
+            Self::ModuleLoad {
+                url,
+                known,
+                policy: p,
+                ..
+            } => url.as_str().len() + known.iter().map(|s| s.len() + 32).sum::<usize>() + policy(p),
             Self::SocketSend { data, .. } => data.len(),
             Self::Clipboard { text, .. } => text.as_ref().map_or(0, String::len),
             Self::Notice(s) => s.len(),
@@ -569,11 +579,23 @@ impl PageRuntime {
             fullscreen_requests: HashMap::new(),
         }));
         let mut runtime = Self { dom, state };
+        runtime
+            .dom
+            .vm
+            .set_source_url(runtime.state.borrow().dom.url().as_str());
         install(&mut runtime)?;
         Ok(runtime)
     }
     pub fn eval(&mut self, source: &str) -> std::result::Result<JsValue, JsError> {
         let result = self.dom.eval(source);
+        self.finish_web_task(result)
+    }
+    pub fn eval_module_graph(
+        &mut self,
+        graph: &crate::modules::ModuleGraph,
+    ) -> std::result::Result<JsValue, JsError> {
+        self.dom.vm.begin_task();
+        let result = self.install_module_graph(graph);
         self.finish_web_task(result)
     }
     pub fn dispatch(
@@ -585,9 +607,23 @@ impl PageRuntime {
         let result = self.dom.dispatch(node, name, key);
         self.finish_web_task(result)
     }
-    pub fn poll_timers(&mut self) -> std::result::Result<(), JsError> {
-        let result = self.dom.poll_timers();
+    pub fn input(&mut self, node: usize, value: String) -> std::result::Result<(), JsError> {
+        let result = self.dom.input(node, value);
         self.finish_web_task(result)
+    }
+    pub fn focus(&mut self, node: Option<usize>) -> std::result::Result<(), JsError> {
+        let result = self.dom.focus(node);
+        self.finish_web_task(result)
+    }
+    pub fn poll_timers(&mut self) -> std::result::Result<(), JsError> {
+        for _ in 0..100 {
+            let result = self.dom.poll_one_timer();
+            if !self.finish_web_task(result)? {
+                break;
+            }
+        }
+        self.dom.gc_collect();
+        Ok(())
     }
     pub fn begin_gesture(&mut self) {
         self.state.borrow_mut().gesture = true;

@@ -44,22 +44,22 @@ impl Worker {
                 vm.set_global_host(1,"DedicatedWorkerGlobalScope")?;let global=vm.global_value();vm.set_global("self",global)?;
                 vm.set_global("onmessage",JsValue::Undefined)?;
                 for name in ["postMessage","close","addEventListener","removeEventListener","setTimeout","clearTimeout"]{let function=vm.native(&format!("host:{name}"))?;state.borrow_mut().functions.insert(name.into(),function.clone());vm.set_global(name,function)?;}
-                vm.eval_source(&String::from_utf8_lossy(&fetched.bytes))?;
+                 vm.set_source_url(fetched.url.as_str());vm.eval_source(&String::from_utf8_lossy(&fetched.bytes))?;vm.drain_microtasks()?;
                 loop {
                     if token.load(Ordering::Relaxed)!=0{return Ok(());}
                     for data in std::mem::take(&mut state.borrow_mut().out){events.try_send(Completion::Message{id,data}).map_err(|_|JsError::new(ErrorKind::MemoryLimit,"worker output queue"))?;}
                     if state.borrow().closed{return Ok(());}
                     let due=Instant::now();let mut callbacks=Vec::new();state.borrow_mut().timers.retain(|(_,at,callback)|{if *at<=due{callbacks.push(callback.clone());false}else{true}});
-                    for callback in callbacks{vm.call(callback,JsValue::Undefined,Vec::new())?;}
+                     for callback in callbacks{vm.call(callback,JsValue::Undefined,Vec::new())?;vm.drain_microtasks()?;}
                     match rx.recv_timeout(Duration::from_millis(10)){
                         Ok(Input::Close)|Err(sync::RecvTimeoutError::Disconnected)=>return Ok(()),
                         Err(sync::RecvTimeoutError::Timeout)=>{},
                         Ok(Input::Message(data))=>{vm.begin_task();let data=vm.deserialize_clone(&data)?;let event=vm.object()?;vm.set(event.clone(),"data",data)?;
                             let mut callbacks=state.borrow().listeners.clone();let callback=state.borrow().callback.clone();if vm.callable(&callback){callbacks.insert(0,callback);}
-                            for callback in callbacks{let global=vm.global_value();vm.call(callback,global,vec![event.clone()])?;}
+                             for callback in callbacks{let global=vm.global_value();vm.call_in_task(callback,global,vec![event.clone()])?;}
                         }
                     }
-                    vm.gc_collect();
+                    vm.drain_microtasks()?;vm.gc_collect();
                 }
             })();
             if let Err(error)=result{if error.kind!=ErrorKind::Cancelled{let _=events.try_send(Completion::Error{id,error:network(error)});}}

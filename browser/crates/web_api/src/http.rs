@@ -127,7 +127,17 @@ pub async fn fetch(
     client: &Client,
     document: &Url,
     policy: &Csp,
+    request: Request,
+) -> Result<Response> {
+    fetch_resource(client, document, policy, request, "connect-src", None).await
+}
+pub async fn fetch_resource(
+    client: &Client,
+    document: &Url,
+    policy: &Csp,
     mut request: Request,
+    directive: &str,
+    nonce: Option<&str>,
 ) -> Result<Response> {
     request.validate()?;
     let source = origin(document)?;
@@ -138,7 +148,7 @@ pub async fn fetch(
         request.url = client
             .resource_url(&request.url)
             .map_err(|e| ApiError::new("TypeError", e.to_string()))?;
-        if !policy.allows("connect-src", document, &request.url, None) {
+        if !policy.allows(directive, document, &request.url, nonce) {
             return Err(ApiError::new(
                 "TypeError",
                 "CSP or active mixed content blocked request",

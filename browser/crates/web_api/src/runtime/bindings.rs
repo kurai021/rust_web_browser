@@ -81,9 +81,6 @@ const METHODS: &[&str] = &[
     "db:delete",
     "db:clear",
     "db:count",
-    "promise:then",
-    "promise:catch",
-    "promise:finally",
     "headers:append",
     "headers:set",
     "headers:get",
@@ -459,6 +456,52 @@ fn request(
     Ok(result)
 }
 impl WebHost {
+    pub(super) fn new_promise(&self, vm: &mut Vm) -> std::result::Result<u64, JsError> {
+        let native = vm.promise()?;
+        let id = self
+            .state
+            .borrow_mut()
+            .promise()
+            .map_err(|e| error(vm, e))?;
+        if let Some(Object {
+            kind: Kind::Promise(p),
+            ..
+        }) = self.state.borrow_mut().objects.get_mut(&id)
+        {
+            p.native = native;
+        }
+        Ok(id)
+    }
+    pub(super) fn promise_value(&self, id: u64) -> JsValue {
+        self.state
+            .borrow()
+            .objects
+            .get(&id)
+            .and_then(|o| match &o.kind {
+                Kind::Promise(p) => Some(p.native.clone()),
+                _ => None,
+            })
+            .unwrap_or(JsValue::Undefined)
+    }
+    pub(super) fn promise_token(&self, value: &JsValue) -> Option<u64> {
+        self.state.borrow().objects.iter().find_map(|(id, o)| {
+            matches!(&o.kind,Kind::Promise(p)if p.native==*value).then_some(*id)
+        })
+    }
+    fn settle_now(
+        &self,
+        vm: &mut Vm,
+        id: u64,
+        ok: bool,
+        value: JsValue,
+    ) -> std::result::Result<(), JsError> {
+        let native = self.promise_value(id);
+        if ok {
+            vm.resolve_promise(native, value)
+        } else {
+            vm.reject_promise(native, value)
+        }
+    }
     pub(super) fn allocate(
         &self,
         vm: &mut Vm,
@@ -487,11 +530,7 @@ impl WebHost {
         if let Ok(JsValue::String(text)) = &result {
             vm.check_string_bytes(text.len())?;
         }
-        let id = self
-            .state
-            .borrow_mut()
-            .promise()
-            .map_err(|e| error(vm, e))?;
+        let native = vm.promise()?;
         let (ok, value) = match result {
             Ok(v) => (true, v),
             Err(e) => {
@@ -508,8 +547,12 @@ impl WebHost {
                 )
             }
         };
-        self.state.borrow_mut().settle(id, ok, value);
-        wrap(vm, id, "Promise")
+        if ok {
+            vm.resolve_promise(native.clone(), value)?;
+        } else {
+            vm.reject_promise(native.clone(), value)?;
+        }
+        Ok(native)
     }
     pub(super) fn command(
         &self,
@@ -530,11 +573,7 @@ impl WebHost {
             let s = self.state.borrow();
             (s.dom.url(), s.config.profile.clone(), s.gesture)
         };
-        let id = self
-            .state
-            .borrow_mut()
-            .promise()
-            .map_err(|e| error(vm, e))?;
+        let id = self.new_promise(vm)?;
         let decision = if self.state.borrow().grants.contains(name) {
             Some("granted".into())
         } else {
@@ -562,16 +601,86 @@ impl WebHost {
                 },
             )?;
         }
-        wrap(vm, id, "Promise")
+        Ok(self.promise_value(id))
     }
 }
 impl HostHooks for WebHost {
+    fn import_module(
+        &mut self,
+        vm: &mut Vm,
+        url: &str,
+        _referrer: &str,
+    ) -> std::result::Result<JsValue, JsError> {
+        let document = self.state.borrow().dom.url();
+        let url = web_url(&document, url).map_err(|e| error(vm, e))?;
+        let policy = Csp {
+            inner: self.state.borrow().dom.policy(),
+        };
+        if !policy.allows("script-src", &document, &url, None) {
+            let e = error(vm, ApiError::new("SecurityError", "module script policy"));
+            return self.ready(vm, Err(e));
+        }
+        if self.state.borrow().pending.len() >= 128 {
+            return Err(error(
+                vm,
+                ApiError::new("QuotaExceededError", "page pending service quota"),
+            ));
+        }
+        let id = self.new_promise(vm)?;
+        self.state.borrow_mut().pending.insert(id);
+        self.command(
+            vm,
+            Command::ModuleLoad {
+                known: vm.loaded_module_urls(),
+                id,
+                url,
+                document,
+                policy,
+            },
+        )?;
+        Ok(self.promise_value(id))
+    }
+    fn after_operation(&mut self, vm: &mut Vm) -> std::result::Result<(), JsError> {
+        self.collect_mutations(vm)
+    }
+    fn microtask(&mut self, vm: &mut Vm, token: u64) -> std::result::Result<HostResult, JsError> {
+        self.observer_microtask(vm, token)
+    }
     fn fork(&self) -> Option<Box<dyn HostHooks>> {
         Some(Box::new(self.clone()))
     }
     fn retained_bytes(&self) -> usize {
         let s = self.state.borrow();
         let mut bytes = s.objects.len() * 256;
+        bytes = bytes.saturating_add(s.jobs.len() * 256);
+        for job in &s.jobs {
+            let values = match job {
+                Job::Callback {
+                    function,
+                    this,
+                    args,
+                } => vec![function.clone(), this.clone()]
+                    .into_iter()
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>(),
+                Job::Settle { value, .. } | Job::ReaderComplete { value, .. } => {
+                    vec![value.clone()]
+                }
+                Job::Event { data, .. }
+                | Job::DomEvent { data, .. }
+                | Job::XhrEvent { data, .. } => vec![data.clone()],
+                _ => Vec::new(),
+            };
+            bytes = bytes.saturating_add(
+                values
+                    .iter()
+                    .map(|v| match v {
+                        JsValue::String(s) => s.len(),
+                        _ => 0,
+                    })
+                    .sum::<usize>(),
+            );
+        }
         bytes = bytes.saturating_add(s.geometry.len() * 128).saturating_add(
             s.commands
                 .iter()
@@ -637,13 +746,10 @@ impl HostHooks for WebHost {
                     x.request.as_ref().map_or(0, |r| r.body.len())
                         + x.response.as_ref().map_or(0, |r| r.body.len())
                 }
-                Kind::Promise(p) => {
-                    p.reactions.len() * 192
-                        + p.result.as_ref().map_or(0, |(_, v)| match v {
-                            JsValue::String(s) => s.len(),
-                            _ => 0,
-                        })
-                }
+                Kind::Promise(p) => p.result.as_ref().map_or(0, |(_, v)| match v {
+                    JsValue::String(s) => s.len(),
+                    _ => 0,
+                }),
                 _ => 0,
             });
         }
@@ -674,6 +780,7 @@ impl HostHooks for WebHost {
         }
         if id == 0 {
             match key {
+                "location" => return wrap(vm, LOCATION, "Location").map(Some),
                 "fullscreenElement" => {
                     let s = self.state.borrow();
                     return Ok(Some(
@@ -821,12 +928,7 @@ impl HostHooks for WebHost {
                 "values" => function("headers:values"),
                 _ => None,
             },
-            Kind::Promise(_) => match key {
-                "then" => function("promise:then"),
-                "catch" => function("promise:catch"),
-                "finally" => function("promise:finally"),
-                _ => None,
-            },
+            Kind::Promise(_) => None,
             Kind::Request(r) => match key {
                 "bodyUsed" => Some(JsValue::Bool(s.used_bodies.contains(&id))),
                 "url" => Some(JsValue::string(r.url.as_str())),
@@ -1098,7 +1200,7 @@ impl HostHooks for WebHost {
             s.config.cookies.set(&url, &url, &value, true);
             return Ok(true);
         }
-        if id == WINDOW && key == "location"
+        if matches!(id, WINDOW | 0) && key == "location"
             || id == LOCATION && matches!(key, "href" | "hash" | "search" | "pathname")
         {
             let value = vm.to_string(value)?;
@@ -1305,14 +1407,9 @@ impl HostHooks for WebHost {
                 roots.extend(o.listeners.iter().map(|(_, f, _)| f.clone()));
                 match &o.kind {
                     Kind::Promise(p) => {
+                        roots.push(p.native.clone());
                         if let Some((_, v)) = &p.result {
                             roots.push(v.clone());
-                        }
-                        for r in &p.reactions {
-                            roots.extend([r.success.clone(), r.failure.clone()]);
-                            if let Some((_, value)) = &r.continuation {
-                                roots.push(value.clone());
-                            }
                         }
                     }
                     Kind::FileReader { result, error, .. } => {
@@ -1329,18 +1426,6 @@ impl HostHooks for WebHost {
         }
         for job in &s.jobs {
             match job {
-                Job::Reaction {
-                    value, reaction, ..
-                } => {
-                    roots.extend([
-                        value.clone(),
-                        reaction.success.clone(),
-                        reaction.failure.clone(),
-                    ]);
-                    if let Some((_, value)) = &reaction.continuation {
-                        roots.push(value.clone());
-                    }
-                }
                 Job::Callback {
                     function,
                     this,
@@ -1351,6 +1436,7 @@ impl HostHooks for WebHost {
                 }
                 Job::Event { data, .. } | Job::DomEvent { data, .. } => roots.push(data.clone()),
                 Job::ReaderComplete { value, .. } => roots.push(value.clone()),
+                Job::Settle { value, .. } => roots.push(value.clone()),
                 Job::XhrEvent { data, .. } => roots.push(data.clone()),
                 _ => {}
             }
@@ -1388,9 +1474,6 @@ impl HostHooks for WebHost {
                 }
             }
             if live.contains(id) {
-                if let Kind::Promise(p) = &o.kind {
-                    refs.extend(p.reactions.iter().map(|r| r.child));
-                }
                 if let Kind::Params {
                     owner: Some(owner), ..
                 } = &o.kind
@@ -1416,12 +1499,12 @@ impl HostHooks for WebHost {
         }
         for job in &s.jobs {
             match job {
-                Job::Reaction { reaction, .. } => refs.push(reaction.child),
                 Job::Event { target, .. } => refs.push(*target),
                 Job::XhrState { id, operation, .. } | Job::XhrEvent { id, operation, .. } => {
                     refs.extend([*id, *operation])
                 }
                 Job::ReaderComplete { id, .. } => refs.push(*id),
+                Job::Settle { id, .. } => refs.push(*id),
                 Job::Permission { id, .. } => refs.push(*id),
                 Job::Database(task) => refs.extend(task.references()),
                 Job::Observer { id } => refs.push(*id),
@@ -1590,11 +1673,7 @@ impl WebHost {
                 );
             }
             "fetch" => {
-                let promise = self
-                    .state
-                    .borrow_mut()
-                    .promise()
-                    .map_err(|e| error(vm, e))?;
+                let promise = self.new_promise(vm)?;
                 let request = request(vm, arg(args, 0), arg(args, 1), &self.state);
                 match request {
                     Ok(request) => {
@@ -1611,7 +1690,7 @@ impl WebHost {
                             let e =
                                 error(vm, ApiError::new("QuotaExceededError", "pending requests"));
                             let value = e.thrown.unwrap_or(JsValue::Undefined);
-                            self.state.borrow_mut().settle(promise, false, value);
+                            self.settle_now(vm, promise, false, value)?;
                         } else {
                             self.state.borrow_mut().pending.insert(promise);
                             self.command(
@@ -1630,39 +1709,10 @@ impl WebHost {
                             return Err(e);
                         }
                         let value = e.thrown.clone().unwrap_or(vm.error_value(e)?);
-                        self.state.borrow_mut().settle(promise, false, value);
+                        self.settle_now(vm, promise, false, value)?;
                     }
                 }
-                return wrap(vm, promise, "Promise");
-            }
-            "promise:then" | "promise:catch" | "promise:finally" => {
-                let mut s = self.state.borrow_mut();
-                if !matches!(s.objects.get(&id).map(|o| &o.kind), Some(Kind::Promise(_))) {
-                    return Err(error(vm, ApiError::new("TypeError", "Promise receiver")));
-                }
-                let child = s.promise().map_err(|e| error(vm, e))?;
-                let success = if name == "promise:catch" {
-                    JsValue::Undefined
-                } else {
-                    arg(args, 0)
-                };
-                let failure = if name == "promise:then" {
-                    arg(args, 1)
-                } else {
-                    arg(args, 0)
-                };
-                s.react(
-                    id,
-                    Reaction {
-                        continuation: None,
-                        child,
-                        success,
-                        failure,
-                        finally: name == "promise:finally",
-                    },
-                );
-                drop(s);
-                return wrap(vm, child, "Promise");
+                return Ok(self.promise_value(promise));
             }
             "body:text" | "body:json" | "body:blob" | "body:clone" => {
                 let used = matches!(
@@ -2139,11 +2189,7 @@ impl WebHost {
                 } else {
                     None
                 };
-                let id = self
-                    .state
-                    .borrow_mut()
-                    .promise()
-                    .map_err(|e| error(vm, e))?;
+                let id = self.new_promise(vm)?;
                 let gesture = self.state.borrow().gesture;
                 if !gesture || !secure_context(&self.state.borrow().dom.url()) {
                     let e = error(
@@ -2154,8 +2200,8 @@ impl WebHost {
                         ),
                     );
                     let value = e.thrown.unwrap_or(JsValue::Undefined);
-                    self.state.borrow_mut().settle(id, false, value);
-                    return wrap(vm, id, "Promise");
+                    self.settle_now(vm, id, false, value)?;
+                    return Ok(self.promise_value(id));
                 }
                 self.state.borrow_mut().pending.insert(id);
                 let permission = {
@@ -2175,7 +2221,7 @@ impl WebHost {
                         permission,
                     },
                 )?;
-                return wrap(vm, id, "Promise");
+                return Ok(self.promise_value(id));
             }
             "notification:requestPermission" => return self.permission(vm, "notifications"),
             "permissions:query" => {

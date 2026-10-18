@@ -1,5 +1,6 @@
 //! Per-page Level 1 host bindings. No network/files/other contexts are exposed.
 mod host;
+mod modern_dom;
 pub mod policy;
 pub use css;
 pub use html;
@@ -17,6 +18,10 @@ use url::Url;
 pub(crate) const EVENT_BASE: u64 = 1 << 56;
 pub(crate) const EVENT_TARGET_BASE: u64 = 1 << 55;
 pub(crate) const WINDOW: u64 = u64::MAX - 1;
+// Keep native parser identities below web_api's extension namespace (1 << 57)
+// and disjoint from event/event-target tokens and real arena Node IDs.
+pub(crate) const PARSER_BASE: u64 = EVENT_BASE + (1 << 54);
+pub(crate) const PARSER_END: u64 = EVENT_BASE + (1 << 55);
 pub(crate) fn node_host(node: NodeId, kind: u64) -> u64 {
     node as u64 * 8 + kind
 }
@@ -25,6 +30,7 @@ pub(crate) fn node_id(host: u64) -> Option<NodeId> {
 }
 #[derive(Clone)]
 pub(crate) struct Listener {
+    handler: bool,
     node: NodeId,
     event: String,
     callback: JsValue,
@@ -59,6 +65,8 @@ pub(crate) struct Timer {
     animation_frame: bool,
 }
 pub(crate) struct State {
+    pub owners: HashMap<NodeId, NodeId>,
+    pub inert_documents: HashSet<NodeId>,
     pub document: Document,
     pub url: Url,
     pub stylesheets: Vec<Stylesheet>,
@@ -83,6 +91,36 @@ pub(crate) struct State {
     pub started: Instant,
 }
 impl State {
+    fn owner(&self, node: NodeId) -> NodeId {
+        let mut current = Some(node);
+        for _ in 0..=html::DEFAULT_MAX_DEPTH {
+            let Some(id) = current else {
+                break;
+            };
+            let Some(value) = self.document.try_get(id) else {
+                break;
+            };
+            if matches!(value.data, html::NodeData::Document) {
+                return id;
+            }
+            current = value.parent;
+        }
+        self.owners.get(&node).copied().unwrap_or(0)
+    }
+    fn adopt(&mut self, node: NodeId, parent: NodeId) {
+        let owner = self.owner(parent);
+        let mut work = vec![node];
+        while let Some(node) = work.pop() {
+            if owner == 0 {
+                self.owners.remove(&node);
+            } else {
+                self.owners.insert(node, owner);
+            }
+            if let Some(node) = self.document.try_get(node) {
+                work.extend(node.children.iter().copied());
+            }
+        }
+    }
     fn changed(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.computed = None;
@@ -207,6 +245,8 @@ impl DomRuntime {
         policy: policy::Policy,
     ) -> Result<Self, JsError> {
         let state = Rc::new(RefCell::new(State {
+            owners: HashMap::new(),
+            inert_documents: HashSet::new(),
             document,
             url,
             stylesheets,
@@ -301,6 +341,17 @@ impl DomRuntime {
         let result = result.and_then(|v| self.drain_queued().map(|()| v));
         self.finish_task(result)
     }
+    /// Reentrant callbacks and listeners share the surrounding task's budget.
+    pub fn call_in_task(
+        &mut self,
+        function: JsValue,
+        this: JsValue,
+        args: Vec<JsValue>,
+    ) -> Result<JsValue, JsError> {
+        let result = self.vm.call_in_task(function, this, args);
+        let result = result.and_then(|v| self.drain_queued().map(|()| v));
+        self.finish_task(result)
+    }
     pub fn stop(&mut self, error: JsError) -> Result<(), JsError> {
         self.finish_task(Err(error))
     }
@@ -324,12 +375,22 @@ impl DomRuntime {
         }
     }
     pub fn dispatch(&mut self, target: NodeId, name: &str, key: &str) -> Result<bool, JsError> {
+        self.vm.begin_task();
         let result = self
             .dispatch_one(target, name, key)
             .and_then(|allowed| self.drain_queued().map(|()| allowed));
         self.finish_task(result)
     }
     pub fn dispatch_detail(
+        &mut self,
+        target: NodeId,
+        name: &str,
+        detail: JsValue,
+    ) -> Result<bool, JsError> {
+        self.vm.begin_task();
+        self.dispatch_detail_in_task(target, name, detail)
+    }
+    pub fn dispatch_detail_in_task(
         &mut self,
         target: NodeId,
         name: &str,
@@ -342,7 +403,7 @@ impl DomRuntime {
             name.into(),
             target,
             false,
-            false,
+            name == "unhandledrejection",
             detail,
             String::new(),
         );
@@ -351,7 +412,7 @@ impl DomRuntime {
         let function = self.vm.native("host:dispatchEvent")?;
         let result = self
             .vm
-            .call(function, this, vec![event])
+            .call_in_task(function, this, vec![event])
             .map(|v| v.truthy());
         self.finish_task(result)
     }
@@ -370,7 +431,7 @@ impl DomRuntime {
         let event = self.vm.host_object(event, "Event")?;
         let this = self.vm.host_object(node_host(target, 0), "Element")?;
         let function = self.vm.native("host:dispatchEvent")?;
-        let value = self.vm.call(function, this, vec![event])?;
+        let value = self.vm.call_in_task(function, this, vec![event])?;
         Ok(value.truthy())
     }
     pub fn input(&mut self, target: NodeId, value: String) -> Result<(), JsError> {
@@ -432,8 +493,22 @@ impl DomRuntime {
         self.finish_task(result)
     }
     fn poll_timers_inner(&mut self) -> Result<(), JsError> {
+        for _ in 0..100 {
+            if !self.poll_one_timer()? {
+                break;
+            }
+        }
+        self.drain_queued()?;
+        self.vm.gc_collect();
+        Ok(())
+    }
+    pub fn poll_one_timer(&mut self) -> Result<bool, JsError> {
+        let result = self.poll_one_timer_inner();
+        self.finish_task(result)
+    }
+    fn poll_one_timer_inner(&mut self) -> Result<bool, JsError> {
         if self.state.borrow().disabled {
-            return Ok(());
+            return Ok(false);
         }
         let now = Instant::now();
         let mut ids = self
@@ -445,7 +520,7 @@ impl DomRuntime {
             .map(|(&id, timer)| (timer.due, id))
             .collect::<Vec<_>>();
         ids.sort_unstable();
-        for (_, id) in ids.into_iter().take(100) {
+        for (_, id) in ids.into_iter().take(1) {
             let timer = self.state.borrow_mut().timers.remove(&id);
             let Some(mut timer) = timer else {
                 continue;
@@ -467,7 +542,7 @@ impl DomRuntime {
                 )
             };
             if result.as_ref().is_err_and(JsError::is_resource_limit) {
-                return result.map(|_| ());
+                return result.map(|_| true);
             }
             let cancelled = self.state.borrow().cancel_running_timer;
             self.state.borrow_mut().running_timer = None;
@@ -478,10 +553,14 @@ impl DomRuntime {
             if let Err(error) = result {
                 self.state.borrow_mut().console.push(error.to_string());
             }
+            self.drain_queued()?;
+            self.vm.drain_microtasks()?;
+            for error in self.vm.take_async_errors() {
+                self.handle().console(error.to_string());
+            }
+            return Ok(true);
         }
-        self.drain_queued()?;
-        self.vm.gc_collect();
-        Ok(())
+        Ok(false)
     }
     pub fn gc_collect(&mut self) {
         self.vm.gc_collect();

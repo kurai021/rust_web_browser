@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CloneValue {
+    BigInt(String),
     Undefined,
     Null,
     Bool(bool),
@@ -13,6 +14,16 @@ pub enum CloneValue {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloneNode {
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub entries: Vec<(CloneValue, CloneValue)>,
+    #[serde(default)]
+    pub regexp: Option<(String, String)>,
+    #[serde(default)]
+    pub boxed: Option<CloneValue>,
+    #[serde(default)]
+    pub error: bool,
     pub array: bool,
     pub length: usize,
     pub date: Option<u64>,
@@ -27,7 +38,7 @@ impl CloneData {
     pub fn retained_bytes(&self) -> usize {
         fn value(v: &CloneValue) -> usize {
             match v {
-                CloneValue::String(s) => s.len() + 32,
+                CloneValue::String(s) | CloneValue::BigInt(s) => s.len() + 32,
                 _ => 32,
             }
         }
@@ -36,11 +47,22 @@ impl CloneData {
                 .nodes
                 .iter()
                 .map(|node| {
-                    64 + node
-                        .properties
-                        .iter()
-                        .map(|(key, v)| key.len() + 64 + value(v))
-                        .sum::<usize>()
+                    192 + node.collection.as_ref().map_or(0, String::len)
+                        + node
+                            .regexp
+                            .as_ref()
+                            .map_or(0, |(source, flags)| source.len() + flags.len())
+                        + node.boxed.as_ref().map_or(0, value)
+                        + node
+                            .entries
+                            .iter()
+                            .map(|(key, v)| 64 + value(key) + value(v))
+                            .sum::<usize>()
+                        + node
+                            .properties
+                            .iter()
+                            .map(|(key, v)| key.len() + 64 + value(v))
+                            .sum::<usize>()
                 })
                 .sum::<usize>()
     }
@@ -57,6 +79,12 @@ impl Vm {
         ) -> Result<CloneValue, JsError> {
             vm.checkpoint()?;
             Ok(match v {
+                JsValue::BigInt(value) => {
+                    let value = value.to_radix(10)?;
+                    *bytes = bytes.saturating_add(value.len());
+                    vm.check_string_bytes(*bytes)?;
+                    CloneValue::BigInt(value)
+                }
                 JsValue::Undefined => CloneValue::Undefined,
                 JsValue::Null => CloneValue::Null,
                 JsValue::Bool(b) => CloneValue::Bool(b),
@@ -78,6 +106,12 @@ impl Vm {
                         ObjectKind::Ordinary | ObjectKind::Error => (false, None),
                         ObjectKind::Array => (true, None),
                         ObjectKind::Date(n) => (false, Some(n.to_bits())),
+                        ObjectKind::RegExp { .. } | ObjectKind::Boxed(_) => (false, None),
+                        ObjectKind::Collection(data)
+                            if data.kind != crate::vm::collections::CollectionKind::WeakMap =>
+                        {
+                            (false, None)
+                        }
                         _ => {
                             return Err(JsError::new(
                                 ErrorKind::TypeError,
@@ -91,6 +125,11 @@ impl Vm {
                     let index = nodes.len();
                     map.insert(id, index);
                     nodes.push(CloneNode {
+                        collection: None,
+                        entries: Vec::new(),
+                        regexp: None,
+                        boxed: None,
+                        error: false,
                         array,
                         length: 0,
                         date,
@@ -108,6 +147,54 @@ impl Vm {
         let root = value(self, input, &mut map, &mut nodes, &mut work, &mut bytes)?;
         while let Some(id) = work.pop() {
             let index = map[&id];
+            match self.heap.get(id)?.kind.clone() {
+                ObjectKind::Collection(data) => {
+                    nodes[index].collection = Some(
+                        if data.kind == crate::vm::collections::CollectionKind::Map {
+                            "Map"
+                        } else {
+                            "Set"
+                        }
+                        .into(),
+                    );
+                    let mut entries = Vec::new();
+                    for (k, v) in data.entries.values() {
+                        let k =
+                            value(self, k.clone(), &mut map, &mut nodes, &mut work, &mut bytes)?;
+                        let v =
+                            value(self, v.clone(), &mut map, &mut nodes, &mut work, &mut bytes)?;
+                        entries.push((k, v));
+                    }
+                    nodes[index].entries = entries;
+                    continue;
+                }
+                ObjectKind::RegExp { source, flags, .. } => {
+                    bytes = bytes.saturating_add(source.len() + flags.len());
+                    self.check_string_bytes(bytes)?;
+                    nodes[index].regexp = Some((source, flags));
+                    continue;
+                }
+                ObjectKind::Boxed(boxed) => {
+                    let boxed = value(self, boxed, &mut map, &mut nodes, &mut work, &mut bytes)?;
+                    nodes[index].boxed = Some(boxed);
+                    continue;
+                }
+                ObjectKind::Error => {
+                    nodes[index].error = true;
+                    let mut properties = Vec::new();
+                    for key in ["name", "message", "stack", "cause"] {
+                        let property = self.get(JsValue::Object(id), key)?;
+                        if property != JsValue::Undefined {
+                            let property =
+                                value(self, property, &mut map, &mut nodes, &mut work, &mut bytes)?;
+                            properties.push((key.into(), property));
+                        }
+                    }
+                    nodes[index].properties = properties;
+                    continue;
+                }
+                _ => {}
+            }
             let mut properties = Vec::new();
             for key in self.keys(&JsValue::Object(id), true)? {
                 let PropertyKey::String(name) = key else {
@@ -136,7 +223,9 @@ impl Vm {
         let mut bytes = 0usize;
         fn validate(value: &CloneValue, count: usize, bytes: &mut usize) -> Result<(), JsError> {
             match value {
-                CloneValue::String(s) => *bytes = bytes.saturating_add(s.len()),
+                CloneValue::String(s) | CloneValue::BigInt(s) => {
+                    *bytes = bytes.saturating_add(s.len())
+                }
                 CloneValue::Ref(i) if *i >= count => {
                     return Err(JsError::new(
                         ErrorKind::TypeError,
@@ -150,6 +239,38 @@ impl Vm {
         validate(&data.root, data.nodes.len(), &mut bytes)?;
         for node in &data.nodes {
             self.checkpoint()?;
+            if node
+                .collection
+                .as_ref()
+                .is_some_and(|kind| kind != "Map" && kind != "Set")
+                || node.boxed.as_ref().is_some_and(|value| {
+                    !matches!(
+                        value,
+                        CloneValue::Bool(_)
+                            | CloneValue::String(_)
+                            | CloneValue::Number(_)
+                            | CloneValue::BigInt(_)
+                    )
+                })
+                || node.entries.len() > 100_000
+            {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "DataCloneError: invalid built-in payload",
+                ));
+            }
+            let tags = usize::from(node.array)
+                + usize::from(node.date.is_some())
+                + usize::from(node.collection.is_some())
+                + usize::from(node.regexp.is_some())
+                + usize::from(node.boxed.is_some())
+                + usize::from(node.error);
+            if tags > 1 || node.collection.is_none() && !node.entries.is_empty() {
+                return Err(JsError::new(
+                    ErrorKind::TypeError,
+                    "DataCloneError: conflicting node tags",
+                ));
+            }
             if node.length > u32::MAX as usize {
                 return Err(JsError::new(ErrorKind::MemoryLimit, "clone array length"));
             }
@@ -158,11 +279,31 @@ impl Vm {
                 validate(value, data.nodes.len(), &mut bytes)?;
                 self.check_string_bytes(bytes)?;
             }
+            for (k, v) in &node.entries {
+                bytes = bytes.saturating_add(128);
+                validate(k, data.nodes.len(), &mut bytes)?;
+                validate(v, data.nodes.len(), &mut bytes)?;
+            }
+            if let Some(value) = &node.boxed {
+                validate(value, data.nodes.len(), &mut bytes)?;
+            }
+            if let Some((source, flags)) = &node.regexp {
+                bytes = bytes.saturating_add(source.len() + flags.len());
+            }
+            self.check_string_bytes(bytes)?;
         }
         self.check_string_bytes(bytes)?;
         let mut objects = Vec::new();
         for node in &data.nodes {
-            let object = if let Some(bits) = node.date {
+            let object = if let Some(collection) = &node.collection {
+                self.collection_for_clone(collection)?
+            } else if let Some((source, flags)) = &node.regexp {
+                self.regexp_for_clone(source, flags)?
+            } else if node.boxed.is_some() {
+                self.box_for_clone(JsValue::Undefined)?
+            } else if node.error {
+                self.error_value(JsError::new(ErrorKind::Error, ""))?
+            } else if let Some(bits) = node.date {
                 JsValue::Object(self.allocate(
                     ObjectKind::Date(f64::from_bits(bits)),
                     Some(self.date_proto),
@@ -176,6 +317,9 @@ impl Vm {
         }
         fn value(v: &CloneValue, objects: &[JsValue]) -> Result<JsValue, JsError> {
             Ok(match v {
+                CloneValue::BigInt(value) => {
+                    JsValue::BigInt(std::sync::Arc::new(crate::bigint::BigInt::parse(value)?))
+                }
                 CloneValue::Undefined => JsValue::Undefined,
                 CloneValue::Null => JsValue::Null,
                 CloneValue::Bool(b) => JsValue::Bool(*b),
@@ -187,6 +331,23 @@ impl Vm {
             })
         }
         for (i, node) in data.nodes.iter().enumerate() {
+            if node.collection.is_some() {
+                for (k, v) in &node.entries {
+                    self.collection_insert(
+                        objects[i].object().ok_or_else(|| {
+                            JsError::new(ErrorKind::TypeError, "clone collection")
+                        })?,
+                        value(k, &objects)?,
+                        value(v, &objects)?,
+                    )?;
+                }
+                continue;
+            }
+            if let Some(boxed) = &node.boxed {
+                let boxed = value(boxed, &objects)?;
+                self.fill_box_for_clone(&objects[i], boxed)?;
+                continue;
+            }
             for (name, v) in &node.properties {
                 self.checkpoint()?;
                 self.define(

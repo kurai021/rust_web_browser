@@ -1,0 +1,1 @@
+var key=Symbol('weak');var weak=new WeakMap([[key,{value:42}]]);var map=new Map([[NaN,-0],[2n**100n,new Set([1,2])]]);map.set(map,map);var copy=structuredClone(map);var iterator=copy.entries();iterator.next();map.delete(NaN);weak.get(key);

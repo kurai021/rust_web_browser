@@ -438,7 +438,7 @@ impl WebHost {
         }
         Ok(Some(JsValue::Undefined))
     }
-    fn collect_mutations(&self, vm: &mut Vm) -> std::result::Result<(), JsError> {
+    pub(super) fn collect_mutations(&self, vm: &mut Vm) -> std::result::Result<(), JsError> {
         let handle = self.state.borrow().dom.clone();
         let mutations = handle
             .take_mutations()
@@ -524,7 +524,57 @@ impl WebHost {
                 }
             }
         }
+        let mut queue = Vec::new();
+        for (&id, object) in &mut s.objects {
+            if let Kind::Observer(observer) = &mut object.kind {
+                if observer.mode == Mode::Mutation
+                    && !observer.records.is_empty()
+                    && !observer.queued
+                {
+                    observer.queued = true;
+                    queue.push(id);
+                }
+            }
+        }
+        drop(s);
+        for id in queue {
+            vm.queue_host_microtask(id)?;
+        }
         Ok(())
+    }
+    pub(super) fn observer_microtask(
+        &self,
+        vm: &mut Vm,
+        id: u64,
+    ) -> std::result::Result<HostResult, JsError> {
+        let (callback, records, handle) = {
+            let mut s = self.state.borrow_mut();
+            let handle = s.dom.clone();
+            let Some(Object {
+                kind: Kind::Observer(observer),
+                ..
+            }) = s.objects.get_mut(&id)
+            else {
+                return Ok(HostResult::value(JsValue::Undefined));
+            };
+            observer.queued = false;
+            (
+                observer.callback.clone(),
+                std::mem::take(&mut observer.records),
+                handle,
+            )
+        };
+        if records.is_empty() {
+            return Ok(HostResult::value(JsValue::Undefined));
+        }
+        let records = records_js(vm, &handle, records)?;
+        let observer = wrap(vm, id, "Observer")?;
+        let mut result = HostResult::value(JsValue::Undefined);
+        result
+            .calls
+            .push((callback, observer.clone(), vec![records, observer]));
+        result.catch_callback_errors = true;
+        Ok(result)
     }
     fn collect_geometry(&self, vm: &mut Vm) -> std::result::Result<(), JsError> {
         let mut s = self.state.borrow_mut();
@@ -730,9 +780,9 @@ impl PageRuntime {
         }
         let records = records_js(&mut self.dom.vm, &handle, records)?;
         let observer = wrap(&mut self.dom.vm, id, "Observer")?;
-        if let Err(error) = self
-            .dom
-            .call(callback, observer.clone(), vec![records, observer])
+        if let Err(error) =
+            self.dom
+                .call_in_task(callback, observer.clone(), vec![records, observer])
         {
             if error.is_resource_limit() {
                 return Err(error);

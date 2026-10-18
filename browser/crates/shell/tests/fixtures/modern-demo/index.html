@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Async project board · Phase 8</title><link rel="stylesheet" href="/modern/style.css"></head>
+<body>
+<header><div class="wrap"><p class="eyebrow">IN-HOUSE JAVASCRIPT · PHASE 8</p><h1>Async project board</h1><p>Modules, live state and an event loop you can see.</p><nav><a href="/modern/" data-route="all">All tasks</a><a href="/modern/completed" data-route="completed">Completed</a><a href="/modern/about" data-route="about">About</a></nav></div></header>
+<main class="wrap">
+<section class="card summary"><p class="eyebrow">LIVE APPLICATION</p><h2 id="route-title">All tasks</h2><p id="status">Loading modules and fetching tasks…</p><p id="summary">Waiting for the first snapshot</p><p id="worker-state" class="small">Starting isolated worker</p></section>
+<section class="card"><h2>Add a task</h2><form id="task-form"><label for="task-title">Task title</label><input id="task-title" name="title" placeholder="What should we build next?" required><button type="submit">Add task</button></form><button id="refresh" type="button">Refresh from server</button><p id="revision" class="small">Revision 0</p></section>
+<section class="card task-card"><h2>Project tasks</h2><ul id="tasks" class="tasks"></ul><p id="about" class="small"></p></section>
+<section class="card"><h2>FIFO checkpoint</h2><p>Promise reactions, mutations and microtasks finish before the next timer.</p><button id="check-order" type="button">Run event loop check</button><span id="order-target" class="small">ready</span><p id="order-state" class="result">Waiting</p><p id="frame-state" class="small">Waiting for animation frame</p></section>
+<section class="card"><h2>Modern values, real boundaries</h2><p>Map-backed state, Proxy/Reflect updates, generator iteration, weak DOM metadata, BigInt revisions and structured-cloned worker messages.</p><p id="module-state" class="small">Static modules linked; details load on demand.</p><p class="small">The network and worker use explicit page services. All JavaScript runs in the owned VM.</p></section>
+</main><footer class="wrap">Loopback test application · no external assets or tracking</footer>
+<script type="module" src="/modern/app.js"></script><script nomodule>throw new Error('nomodule must not run');</script>
+</body></html>
